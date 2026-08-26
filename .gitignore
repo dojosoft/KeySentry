@@ -1,0 +1,20 @@
+# 构建产物
+build/
+release/
+*.obj
+*.exe
+*.pdb
+*.dbg
+
+# 运行时生成的恢复文件
+*.recover
+
+# IDE / 编辑器
+.trae/
+.vs/
+.vscode/
+*.user
+
+# 系统文件
+Thumbs.db
+Desktop.ini

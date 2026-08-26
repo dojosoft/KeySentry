@@ -1,0 +1,49 @@
+#pragma code_page(65001)
+
+#include "Resource.h"
+
+#ifndef VS_FFI_FILEFLAGSMASK
+#define VS_FFI_FILEFLAGSMASK 0x3F
+#endif
+#ifndef VOS_NT_WINDOWS32
+#define VOS_NT_WINDOWS32 0x00040004
+#endif
+#ifndef VFT_APP
+#define VFT_APP 0x00000001
+#endif
+#ifndef VFT2_UNKNOWN
+#define VFT2_UNKNOWN 0x00000000
+#endif
+
+IDI_APP ICON "KeySentry.ico"
+
+1 RT_MANIFEST "KeySentry.manifest"
+
+1 VERSIONINFO
+FILEVERSION 1,7,0,827
+PRODUCTVERSION 1,7,0,827
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName", "Marvin"
+            VALUE "FileDescription", "Key Sentry 键客"
+            VALUE "FileVersion", "1.7.0.0827"
+            VALUE "InternalName", "KeySentry"
+            VALUE "LegalCopyright", "Copyright 2026 Marvin 翁敏峰"
+            VALUE "OriginalFilename", "KeySentry.exe"
+            VALUE "ProductName", "Key Sentry 键客"
+            VALUE "ProductVersion", "1.7.0.0827"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
