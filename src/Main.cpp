@@ -793,17 +793,37 @@ static LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             DestroyWindow(hwnd);  // 点击确定或取消，销毁对话框
             return 0;
         }
+        // GitHub发布页链接点击
+        if (HIWORD(wp) == STN_CLICKED && LOWORD(wp) == 1001) {
+            ShellExecuteW(hwnd, L"open", L"https://github.com/dojosoft/KeySentry", nullptr, nullptr, SW_SHOW);
+            return 0;
+        }
         break;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
-    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wp;
+        SetBkMode(hdc, TRANSPARENT);
+        // GitHub链接文本设为蓝色
+        HWND ctrl = (HWND)lp;
+        if (GetDlgCtrlID(ctrl) == 1001) {
+            SetTextColor(hdc, RGB(0, 102, 204));
+        }
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
     case WM_CTLCOLORBTN: {
-        // 设置静态控件和按钮的背景为透明
         HDC hdc = (HDC)wp;
         SetBkMode(hdc, TRANSPARENT);
         return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
+    case WM_SETCURSOR:
+        // 在GitHub链接上显示手型光标
+        if ((HWND)wp == GetDlgItem(hwnd, 1001)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -875,21 +895,49 @@ void ShowAboutDialog(HWND parent) {
                                       20, 88, 320, 2,
                                       hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
-    // 应用描述
+    // 应用描述（横向居中）
     HWND descCtrl = CreateWindowExW(0, L"STATIC",
                                       L"一款掌控你的键盘和窗口的轻量工具。",
-                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                      WS_CHILD | WS_VISIBLE | SS_CENTER,
                                       20, 100, 320, 24,
                                       hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(descCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
 
-    // 版权信息
-    HWND copyCtrl = CreateWindowExW(0, L"STATIC",
-                                      L"© 2026 Marvin 翁敏峰",
+    // 版权信息 + 分隔符 + GitHub链接（同一行，动态测量文本宽度后整体居中）
+    const wchar_t* copyText = L"© 2026 Marvin 翁敏峰";
+    const wchar_t* sepText = L"|";
+    const wchar_t* gitText = L"GitHub";
+    HDC hdcMeasure = GetDC(hwnd);
+    HGDIOBJ oldFont = SelectObject(hdcMeasure, fontSmall.get());
+    SIZE szCopy = {}, szSep = {}, szGit = {};
+    GetTextExtentPoint32W(hdcMeasure, copyText, (int)wcslen(copyText), &szCopy);
+    GetTextExtentPoint32W(hdcMeasure, sepText, (int)wcslen(sepText), &szSep);
+    GetTextExtentPoint32W(hdcMeasure, gitText, (int)wcslen(gitText), &szGit);
+    SelectObject(hdcMeasure, oldFont);
+    ReleaseDC(hwnd, hdcMeasure);
+    const int gap = 6;  // 元素间距
+    int rowY = 128;
+    int totalW = szCopy.cx + gap + szSep.cx + gap + szGit.cx;
+    int startX = (360 - totalW) / 2;
+
+    HWND copyCtrl = CreateWindowExW(0, L"STATIC", copyText,
                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                      20, 128, 320, 24,
+                                      startX, rowY, szCopy.cx + 4, 24,
                                       hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(copyCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
+
+    HWND sepCtrl = CreateWindowExW(0, L"STATIC", sepText,
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     startX + szCopy.cx + gap, rowY, szSep.cx + 4, 24,
+                                     hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(sepCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
+
+    // GitHub链接
+    HWND githubCtrl = CreateWindowExW(0, L"STATIC", gitText,
+                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
+                                        startX + szCopy.cx + gap + szSep.cx + gap, rowY, szGit.cx + 4, 24,
+                                        hwnd, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(githubCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
 
     // 确定按钮
     HWND okBtn = CreateWindowExW(0, L"BUTTON", L"确定",
