@@ -50,6 +50,8 @@ public:
     void CloseBoundProcesses(DWORD timeoutMs = PROCESS_CLOSE_TIMEOUT_MS);
     // 恢复上次异常退出时被隐藏的窗口（启动时调用），返回恢复的窗口数
     int RecoverOrphanedWindows();
+    // 将当前被隐藏窗口的信息持久化到恢复文件（关机前调用）
+    void SaveRecoverFile();
 
     // 安装鼠标低级钩子（用于中键/侧键触发）
     bool InstallMouseHook(HWND notifyWnd);
@@ -75,8 +77,6 @@ private:
 
     // 获取恢复文件路径（exe 同目录下 KeySentry.recover）
     static std::wstring GetRecoverFilePath();
-    // 将当前被隐藏窗口的信息持久化到恢复文件（隐藏后调用）
-    void SaveRecoverFile();
     // 删除恢复文件（窗口恢复/进程关闭后调用）
     void ClearRecoverFile();
 

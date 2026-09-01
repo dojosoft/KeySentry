@@ -42,7 +42,7 @@
 
 ## 下载使用
 
-前往 [Releases](../../releases) 页面下载最新版 `KeySentry.exe`，解压后直接运行。
+前往 [Releases](../../releases) 页面下载最新版 `KeySentry.exe`（当前版本 **v1.8.0.0901**），解压后直接运行。
 
 ## 从源码构建
 

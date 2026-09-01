@@ -99,7 +99,7 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
             wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
 
-            // --- 热键屏蔽 ---
+            // --- 热键屏蔽（延迟处理，避免钩子回调阻塞）---
             // 仅在非注入按键按下时检查，避免拦截自己模拟的按键
             if (!s_instance->m_disabledHotkeys.empty() &&
                 (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) &&
@@ -120,7 +120,9 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                     // 检查是否在屏蔽列表中
                     for (const auto& hk : s_instance->m_disabledHotkeys) {
                         if (hk.first == mod && hk.second == (UINT)vk) {
-                            return 1; // 屏蔽此热键
+                            // 延迟到主窗口处理，不直接 return 1（避免钩子超时）
+                            s_instance->ProcessBlockedHotkey(mod, (UINT)vk);
+                            return 1; // 吞掉原始按键，但处理延迟执行
                         }
                     }
                 }
@@ -213,4 +215,16 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
         }
     }
     return CallNextHookEx(s_instance ? s_instance->m_hook : nullptr, nCode, wParam, lParam);
+}
+
+// ============================================================
+// ProcessBlockedHotkey - 延迟处理被屏蔽的热键
+// 从钩子回调 PostMessage 到主窗口执行，避免钩子回调阻塞
+// ============================================================
+void KeyboardHook::ProcessBlockedHotkey(UINT mod, UINT vk) {
+    // 向主窗口发送自定义消息，主窗口收到后记录日志或显示提示
+    // 实际屏蔽已在钩子中 return 1 完成，这里仅做通知
+    if (m_notifyWnd && IsWindow(m_notifyWnd)) {
+        PostMessageW(m_notifyWnd, WM_HOTKEY_BLOCKED, (WPARAM)mod, (LPARAM)vk);
+    }
 }

@@ -49,6 +49,9 @@ private:
     // 低级键盘钩子回调函数
     static LRESULT CALLBACK LowLevelProc(int nCode, WPARAM wParam, LPARAM lParam);
 
+    // 延迟处理热键屏蔽（从钩子回调 PostMessage 到主窗口执行）
+    void ProcessBlockedHotkey(UINT mod, UINT vk);
+
     HHOOK m_hook = nullptr;            // 钩子句柄
     HWND m_notifyWnd = nullptr;        // 通知窗口句柄
     std::vector<int> m_disabledKeys;   // 被禁用的按键虚拟码列表

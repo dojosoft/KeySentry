@@ -13,6 +13,7 @@
 #define WM_SETTINGS_APPLY   (WM_USER + 103)
 #define WM_BOSS_MOUSE_TOGGLE (WM_USER + 105)
 #define WM_MUTE_NOTIFY       (WM_USER + 107)
+#define WM_HOTKEY_BLOCKED    (WM_USER + 108)
 
 #define IDC_TAB_MAIN        3001
 

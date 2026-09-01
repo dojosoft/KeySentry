@@ -205,7 +205,7 @@ static void ApplyExplorerSettings() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
                       0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
-        return;
+        return;  // 静默失败，不阻塞启动
     }
 
     bool changed = false;
@@ -883,7 +883,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.7.0.0827",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.8.0.0901",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1020,6 +1020,19 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    // --- 热键被屏蔽通知 ---
+    // 来自 KeyboardHook 的延迟通知，wParam=修饰键，lParam=虚拟键码
+    case WM_HOTKEY_BLOCKED: {
+#ifdef _DEBUG
+        // 调试模式下记录被屏蔽的热键
+        wchar_t buf[64];
+        swprintf_s(buf, L"[KeySentry] Hotkey blocked: mod=0x%X, vk=0x%X\n",
+                   (UINT)wParam, (UINT)lParam);
+        OutputDebugStringW(buf);
+#endif
+        return 0;
+    }
+
     // --- 定时器回调 ---
     case WM_TIMER:
         if (wp == TIMER_WIND_CHECK) {
@@ -1150,7 +1163,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // 关机路径用短超时（500ms），避免阻塞系统关机
                     g_bossKey.CloseBoundProcesses(500);
                 } else {
-                    g_bossKey.Deactivate();  // 退出时恢复隐藏的窗口
+                    // Deactivate() 内部已调用 SaveRecoverFile()，无需重复
+                    g_bossKey.Deactivate();
                 }
             }
             g_winDGuard.Cleanup();
@@ -1176,7 +1190,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_config.bossKeyCloseOnExit) {
                 g_bossKey.CloseBoundProcesses();  // 配置了退出时关闭关联进程
             } else {
-                g_bossKey.Deactivate();  // 恢复隐藏的窗口
+                g_bossKey.Deactivate();  // Deactivate() 内部已调用 SaveRecoverFile()，无需重复
             }
         }
         g_winDGuard.Cleanup();

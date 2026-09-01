@@ -444,6 +444,18 @@ static bool IsSafeHotkeyToSimulate(UINT mod, UINT vk) {
 static std::wstring IdentifyHotkeyOwner(UINT mod, UINT vk) {
     if (!IsSafeHotkeyToSimulate(mod, vk)) return L"";
 
+    // 检查是否为可能触发数据丢失的热键（如 Alt+F4、Ctrl+W 等关闭类热键）
+    // 同时检查是否为系统保护热键（如 Ctrl+Alt+Del、Win+L 等）
+    bool isDangerousClose = (mod & MOD_ALT) && vk == VK_F4;
+    bool isDangerousTabClose = (mod & MOD_CONTROL) && (vk == 'W' || vk == VK_F4);
+    bool isSystemProtected = !IsSafeHotkeyToSimulate(mod, vk);
+    if (isDangerousClose || isDangerousTabClose || isSystemProtected) {
+        int result = MessageBoxW(g_mainWnd,
+            L"该热键可能触发程序关闭、标签页关闭或系统功能，导致未保存数据丢失或系统不稳定。\n\n是否继续探测？",
+            L"安全确认", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (result != IDYES) return L"";
+    }
+
     // 记录当前前台窗口信息
     HWND prevFG = GetForegroundWindow();
     DWORD prevPid = 0;
