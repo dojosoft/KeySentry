@@ -1,4 +1,4 @@
-# 键客 KeySentry
+﻿# 键客 KeySentry
 
 一款掌控你的键盘和窗口的轻量 Windows 工具，纯 C++17 / Win32 API 实现，无任何第三方依赖。
 
@@ -42,7 +42,7 @@
 
 ## 下载使用
 
-前往 [Releases](../../releases) 页面下载最新版 `KeySentry.exe`（当前版本 **v1.8.0.0901**），解压后直接运行。
+前往 [Releases](../../releases) 页面下载最新版 `KeySentry.exe`（当前版本 **v1.9.0.0902**），解压后直接运行。
 
 ## 从源码构建
 

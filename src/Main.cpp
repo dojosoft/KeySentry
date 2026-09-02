@@ -1,4 +1,4 @@
-// ===== 键客 KeySentry 主入口文件 =====
+﻿// ===== 键客 KeySentry 主入口文件 =====
 // 功能：Windows 桌面应用主入口，负责窗口创建、消息循环、
 //       系统托盘、热键注册、配置应用等核心逻辑
 
@@ -883,7 +883,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.8.0.0901",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.9.0.0902",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
