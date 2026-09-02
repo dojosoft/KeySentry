@@ -43,6 +43,8 @@ target_compile_definitions(KeySentry PRIVATE
 
 if(MSVC)
     target_compile_options(KeySentry PRIVATE /utf-8)
+    # 静态链接 VC++ 运行库，目标机器无需安装 VC++ Redistributable
+    set_property(TARGET KeySentry PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 else()
     target_link_options(KeySentry PRIVATE -municode -s)
 endif()
