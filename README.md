@@ -46,10 +46,10 @@
 
 | 文件 | 适用系统 |
 |------|---------|
-| `KeySentry.exe`（x64） | Windows 10/11（64 位） |
-| `KeySentry-x86.exe`（32 位） | Windows 7 SP1 及更高（32/64 位通用） |
+| `KeySentry.exe`（32 位，366KB）**推荐** | Windows 7 SP1 及更高（32/64 位通用） |
+| `KeySentry-x64.exe`（64 位，453KB） | Windows 10/11（64 位） |
 
-两版本功能完全一致，均无需安装任何运行库。
+两版本功能完全一致，均无需安装任何运行库。不确定选哪个？直接下载 `KeySentry.exe` 即可。
 
 ## 从源码构建
 

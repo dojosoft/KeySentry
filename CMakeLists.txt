@@ -41,6 +41,11 @@ target_compile_definitions(KeySentry PRIVATE
     _WIN32_WINNT=0x0601
 )
 
+# 32 位为主输出（KeySentry.exe，Win7 SP1+ 全兼容）；64 位另名 KeySentry-x64.exe
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(KeySentry PROPERTIES OUTPUT_NAME "KeySentry-x64")
+endif()
+
 if(MSVC)
     target_compile_options(KeySentry PRIVATE /utf-8)
     # 静态链接 VC++ 运行库，目标机器无需安装 VC++ Redistributable
