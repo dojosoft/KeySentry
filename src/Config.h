@@ -259,6 +259,17 @@ namespace WindowEnum {
 }
 
 // ============================================================
+// KeyMapping: 按键映射规则
+// 支持组合键双向映射（如 WIN+6 → F6，或 F6 → WIN+6）
+// ============================================================
+struct KeyMapping {
+    UINT srcMod = 0;   // 源修饰键（MOD_CONTROL/MOD_SHIFT/MOD_ALT/MOD_WIN 之组合，0=无）
+    UINT srcVk = 0;    // 源主键虚拟键码
+    UINT dstMod = 0;   // 目标修饰键（0=无）
+    UINT dstVk = 0;    // 目标主键虚拟键码
+};
+
+// ============================================================
 // AppConfig: 应用全局配置
 // 包含所有功能模块的配置项，支持 INI 文件读写
 // ============================================================
@@ -281,7 +292,7 @@ struct AppConfig {
 
     // --- 按键重映射 ---
     bool keyRemapEnabled = false;         // 启用按键重映射
-    std::vector<std::pair<int, int>> keyRemappings; // 重映射对：{源键, 目标键}
+    std::vector<KeyMapping> keyRemappings; // 重映射规则（支持组合键）
 
     // --- 热键屏蔽与自定义热键 ---
     std::vector<std::pair<UINT, UINT>> disabledHotkeys; // 被屏蔽的系统热键：{修饰键, 虚拟键}

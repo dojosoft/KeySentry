@@ -13,6 +13,8 @@
 #define WM_SETTINGS_APPLY   (WM_USER + 103)
 #define WM_BOSS_MOUSE_TOGGLE (WM_USER + 105)
 #define WM_MUTE_NOTIFY       (WM_USER + 107)
+#define WM_LISTENED_KEY      (WM_USER + 109)  // 侦听模式捕获到组合键（wParam=mod lParam=vk）
+#define WM_LISTEN_UPDATE     (WM_USER + 110)  // 侦听记录已更新（通知设置对话框刷新列表）
 #define WM_HOTKEY_BLOCKED    (WM_USER + 108)
 
 #define IDC_TAB_MAIN        3001
@@ -113,10 +115,16 @@
 #define IDC_BTN_DEL_BINDING     3103
 #define IDC_BTN_REFRESH_WINS    3104
 #define IDC_BTN_ADD_PROC_BINDING 3105
-#define IDC_BTN_ADD_WIN_BINDING  3106
+#define IDC_BTN_ADD_WIN_BINDING 3106
 #define IDC_BTN_ADD_BOSS_BINDING 3107
 #define IDC_BTN_SETCLOSEHOTKEY   3108
 #define IDC_BTN_RESETCLOSEHOTKEY 3109
+
+// 热键侦听模式（热键管理页）
+#define IDC_BTN_LISTEN          3110    // 开始/停止侦听切换按钮
+#define IDC_LV_LISTENED         3111    // 侦听到的组合键列表
+#define IDC_BTN_LISTEN_ADD      3112    // 将选中组合加入屏蔽列表
+#define IDC_BTN_LISTEN_CLEAR    3113    // 清空侦听记录
 
 #define IDC_CHK_WINDGUARD   3040
 #define IDC_LST_WINDWINS    3041
