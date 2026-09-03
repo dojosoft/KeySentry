@@ -13,8 +13,6 @@
 #define WM_SETTINGS_APPLY   (WM_USER + 103)
 #define WM_BOSS_MOUSE_TOGGLE (WM_USER + 105)
 #define WM_MUTE_NOTIFY       (WM_USER + 107)
-#define WM_LISTENED_KEY      (WM_USER + 109)  // 侦听模式捕获到组合键（wParam=mod lParam=vk）
-#define WM_LISTEN_UPDATE     (WM_USER + 110)  // 侦听记录已更新（通知设置对话框刷新列表）
 #define WM_HOTKEY_BLOCKED    (WM_USER + 108)
 
 #define IDC_TAB_MAIN        3001
@@ -61,6 +59,13 @@
 #define IDC_BTN_EDIT_CUSTOMHK   3143
 #define IDC_CHK_CUSTOM_HK_ENABLE 3144
 #define IDC_BTN_FIX_ZORDER       3145
+
+// 自定义热键对话框：触发动作模式（运行命令/模拟按键）
+#define IDC_RADIO_HK_CMD         3146
+#define IDC_RADIO_HK_SIMKEY      3147
+#define IDC_BTN_HK_PICKKEY       3148
+#define IDC_EDT_HK_SIMKEY        3149
+#define IDC_LBL_HK_CMDLABEL      3153
 
 #define IDC_CHK_HK_CTRL         3110
 #define IDC_CHK_HK_SHIFT        3111
@@ -115,16 +120,10 @@
 #define IDC_BTN_DEL_BINDING     3103
 #define IDC_BTN_REFRESH_WINS    3104
 #define IDC_BTN_ADD_PROC_BINDING 3105
-#define IDC_BTN_ADD_WIN_BINDING 3106
+#define IDC_BTN_ADD_WIN_BINDING  3106
 #define IDC_BTN_ADD_BOSS_BINDING 3107
 #define IDC_BTN_SETCLOSEHOTKEY   3108
 #define IDC_BTN_RESETCLOSEHOTKEY 3109
-
-// 热键侦听模式（热键管理页）
-#define IDC_BTN_LISTEN          3110    // 开始/停止侦听切换按钮
-#define IDC_LV_LISTENED         3111    // 侦听到的组合键列表
-#define IDC_BTN_LISTEN_ADD      3112    // 将选中组合加入屏蔽列表
-#define IDC_BTN_LISTEN_CLEAR    3113    // 清空侦听记录
 
 #define IDC_CHK_WINDGUARD   3040
 #define IDC_LST_WINDWINS    3041

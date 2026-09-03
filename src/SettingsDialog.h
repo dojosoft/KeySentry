@@ -32,9 +32,6 @@ public:
     static void SetCaptureModeCallback(void (*callback)(bool));
     static void (*s_captureModeCallback)(bool);
 
-    // 当前设置对话框句柄（模态期间有效，供侦听记录转发刷新），无对话框时为 nullptr
-    static HWND s_dialogHwnd;
-
     // 添加一个禁用按键（弹出按键捕获对话框）
     static void AddDisabledKey(HWND hwnd, AppConfig& config);
     // 从禁用按键列表中删除选中项
@@ -85,8 +82,7 @@ public:
     static void UpdateRemapState(HWND hwnd, bool enabled);
 
     // 显示虚拟键盘选择器对话框，返回选中的虚拟键码，0 表示取消
-    // showModifiers: 显示修饰键复选框（组合键映射）；modOut: 输出修饰键组合
-    static int ShowKeyboardPicker(HWND parent, bool showModifiers = false, UINT* modOut = nullptr);
+    static int ShowKeyboardPicker(HWND parent);
 
     // 扫描系统中已被注册的全局热键，结果存入 scannedHotkeys
     static void ScanHotkeys(HWND hwnd, AppConfig& config);
@@ -130,36 +126,6 @@ public:
         std::wstring ownerName;     // 归属程序名称（探测后填充）
     };
 
-    // 侦听到的组合键记录（侦听模式下用户实际按下的组合键及其归属）
-    struct ListenedHotkey {
-        UINT mod;                   // 修饰键标志
-        UINT vk;                    // 虚拟键码
-        std::wstring processName;   // 按下时前台进程名
-        std::wstring windowTitle;   // 按下时前台窗口标题
-        int count;                  // 按下次数
-    };
-
-    // 记录一条侦听到的组合键（供主窗口 WM_LISTENED_KEY 调用）：
-    // 查询当前前台窗口的进程名与标题，去重合并后通知对话框刷新
-    static void RecordListenedKey(UINT mod, UINT vk);
-    // 获取/清空侦听记录（供对话框刷新与清空）
-    static std::vector<ListenedHotkey>& GetListenedKeys() { return s_listenedKeys; }
-    // 侦听模式回调（进入/退出侦听模式时通知钩子模块）
-    static void SetListenModeCallback(void (*callback)(bool));
-    static void (*s_listenModeCallback)(bool);
-
-private:
-    static std::vector<ListenedHotkey> s_listenedKeys; // 侦听记录缓冲
-
-public:
-
-    // 刷新侦听记录列表视图
-    static void RefreshListenList(HWND hwnd);
-    // 将侦听记录中选中的组合键加入热键屏蔽列表
-    static void AddListenedToDisabled(HWND hwnd, AppConfig& config);
-    // 显示热键侦听对话框（独立弹出窗口：开始/停止侦听、查看记录、一键加入屏蔽）
-    static void ShowListenDialog(HWND parent, AppConfig& config);
-
     // 对话框运行时数据结构体，存储在窗口的 GWLP_USERDATA 中
     struct DialogData {
         AppConfig* config;          // 指向原始配置的指针（用于取消时恢复）
@@ -174,6 +140,5 @@ public:
         UINT captureCloseVK;        // 捕获到的一键关闭热键虚拟键码
         std::vector<ScannedHotkey> scannedHotkeys;  // 扫描到的系统热键列表
         std::vector<BoundWindowInfo> allWindowsCache; // 所有可选窗口的缓存
-        bool listening = false;     // 热键侦听模式是否进行中
     };
 };

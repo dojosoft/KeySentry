@@ -15,15 +15,9 @@ extern void ShowAboutDialog(HWND parent);   // 显示关于对话框
 extern void SetHookSimulating(bool sim);    // 设置钩子模拟标志，防止模拟按键被自身钩子拦截
 extern void SetSettingsWnd(HWND wnd);       // 设置设置窗口句柄到全局，供主窗口消息处理使用
 
-// 前向声明（定义在下方）：按进程 ID 获取进程名
-static std::wstring GetProcessNameFromPid(DWORD pid);
-
 // ===== 静态回调指针初始化 =====
 void (*SettingsDialog::s_applyCallback)() = nullptr;
 void (*SettingsDialog::s_captureModeCallback)(bool) = nullptr;
-void (*SettingsDialog::s_listenModeCallback)(bool) = nullptr;
-HWND SettingsDialog::s_dialogHwnd = nullptr;
-std::vector<SettingsDialog::ListenedHotkey> SettingsDialog::s_listenedKeys;
 
 // ===== 设置按键捕获模式回调 =====
 // 在进入/退出按键捕获模式时通知外部模块（如钩子模块暂停/恢复）
@@ -35,50 +29,6 @@ void SettingsDialog::SetCaptureModeCallback(void (*callback)(bool)) {
 // 在配置被应用后调用，通知外部模块重新加载配置
 void SettingsDialog::SetApplyCallback(void (*callback)()) {
     s_applyCallback = callback;
-}
-
-// ===== 设置侦听模式回调 =====
-// 在进入/退出热键侦听模式时通知钩子模块
-void SettingsDialog::SetListenModeCallback(void (*callback)(bool)) {
-    s_listenModeCallback = callback;
-}
-
-// ===== 记录一条侦听到的组合键 =====
-// 由主窗口 WM_LISTENED_KEY 调用：查询当前前台窗口的进程名与标题，
-// 相同组合+相同进程的记录仅累加次数，否则新增；随后通知对话框刷新
-void SettingsDialog::RecordListenedKey(UINT mod, UINT vk) {
-    // 查询前台窗口归属
-    std::wstring procName, title;
-    HWND fg = GetForegroundWindow();
-    if (fg) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(fg, &pid);
-        procName = GetProcessNameFromPid(pid);
-        wchar_t buf[256] = {};
-        GetWindowTextW(fg, buf, 256);
-        title = buf;
-    }
-    // 去重合并：同组合键同进程仅计数
-    for (auto& k : s_listenedKeys) {
-        if (k.mod == mod && k.vk == vk && k.processName == procName) {
-            k.count++;
-            k.windowTitle = title;  // 更新为最近一次的窗口标题
-            if (s_dialogHwnd && IsWindow(s_dialogHwnd)) {
-                PostMessageW(s_dialogHwnd, WM_LISTEN_UPDATE, 0, 0);
-            }
-            return;
-        }
-    }
-    ListenedHotkey k;
-    k.mod = mod;
-    k.vk = vk;
-    k.processName = procName;
-    k.windowTitle = title;
-    k.count = 1;
-    s_listenedKeys.push_back(k);
-    if (s_dialogHwnd && IsWindow(s_dialogHwnd)) {
-        PostMessageW(s_dialogHwnd, WM_LISTEN_UPDATE, 0, 0);
-    }
 }
 
 // ===== 对话框布局常量 =====
@@ -328,7 +278,6 @@ static const wchar_t* KB_PICKER_CLASS = L"KeySentryKeyboardPicker";
 // 虚拟键盘选择器数据
 struct KbPickerData {
     int selectedVK;     // 用户选中的虚拟键码，0 表示取消
-    UINT mod;           // 选中的修饰键组合（Ctrl/Shift/Alt/Win 复选框）
     bool done;          // 对话框完成标志
 };
 
@@ -341,21 +290,8 @@ static LRESULT CALLBACK KbPickerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         int id = LOWORD(wp);
         // 按键按钮的 ID 范围为 10000 ~ 10000+KB_KEY_COUNT
         if (id >= 10000 && id < 10000 + KB_KEY_COUNT) {
-            if (pd) {
-                pd->selectedVK = KB_KEYS[id - 10000].vk;
-                // 汇总修饰键复选框状态（普通模式下复选框不存在，全部视为未勾选）
-                UINT mod = 0;
-                auto chk = [&](int id2, UINT flag) {
-                    HWND c = GetDlgItem(hwnd, id2);
-                    if (c && SendMessageW(c, BM_GETCHECK, 0, 0) == BST_CHECKED) mod |= flag;
-                };
-                chk(IDC_CHK_HK_CTRL, MOD_CONTROL);
-                chk(IDC_CHK_HK_SHIFT, MOD_SHIFT);
-                chk(IDC_CHK_HK_ALT, MOD_ALT);
-                chk(IDC_CHK_HK_WIN, MOD_WIN);
-                pd->mod = mod;
-                pd->done = true;
-            }
+            if (pd) pd->selectedVK = KB_KEYS[id - 10000].vk;
+            if (pd) pd->done = true;
             DestroyWindow(hwnd);
             return 0;
         }
@@ -384,9 +320,7 @@ static LRESULT CALLBACK KbPickerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 // ===== 显示虚拟键盘选择器 =====
 // 创建一个模态对话框，显示标准键盘布局供用户点击选择目标按键
 // 返回选中的虚拟键码，0 表示用户取消
-// showModifiers: 是否显示修饰键复选框（组合键映射模式）；
-// modOut: 输出选中的修饰键组合（可为 nullptr）
-int SettingsDialog::ShowKeyboardPicker(HWND parent, bool showModifiers, UINT* modOut) {
+int SettingsDialog::ShowKeyboardPicker(HWND parent) {
     static bool registered = false;
     if (!registered) {
         // 注册键盘选择器窗口类
@@ -400,19 +334,18 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent, bool showModifiers, UINT* mo
         registered = true;
     }
 
-    // 计算窗口尺寸并居中显示（修饰键模式额外加高 36）
-    int extraH = showModifiers ? 36 : 0;
-    RECT rc = { 0, 0, 710, 260 + extraH };
+    // 计算窗口尺寸并居中显示
+    RECT rc = { 0, 0, 710, 260 };
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    KbPickerData pd = { 0, 0, false };
+    KbPickerData pd = { 0, false };
 
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, KB_PICKER_CLASS,
-                                 showModifiers ? L"选择目标组合键" : L"选择映射按键",
+                                 L"选择映射按键",
                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                  (screenW - winW) / 2, (screenH - winH) / 2,
                                  winW, winH,
@@ -421,35 +354,11 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent, bool showModifiers, UINT* mo
 
     GdiObjectGuard keyFont(CreateUiFont(12, FW_NORMAL));
 
-    // 修饰键复选框行（组合键映射模式）
-    if (showModifiers) {
-        GdiObjectGuard chkFont(CreateUiFont(13, FW_NORMAL));
-        struct { int id; const wchar_t* text; } mods[] = {
-            { IDC_CHK_HK_CTRL, L"Ctrl" }, { IDC_CHK_HK_SHIFT, L"Shift" },
-            { IDC_CHK_HK_ALT, L"Alt" }, { IDC_CHK_HK_WIN, L"Win" },
-        };
-        int mx = 12;
-        for (const auto& m : mods) {
-            HWND chk = CreateWindowExW(0, L"BUTTON", m.text,
-                                       WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                       mx, 8, 70, 24,
-                                       hwnd, (HMENU)(LONG_PTR)m.id, GetModuleHandleW(nullptr), nullptr);
-            SendMessageW(chk, WM_SETFONT, (WPARAM)chkFont.get(), TRUE);
-            mx += 78;
-        }
-        HWND lbl = CreateWindowExW(0, L"STATIC",
-                                   L"可选修饰键（目标为组合键时勾选，如 Win+6）",
-                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                                   mx + 4, 8, 700 - mx, 24,
-                                   hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(lbl, WM_SETFONT, (WPARAM)chkFont.get(), TRUE);
-    }
-
-    // 为每个键盘按键创建按钮控件（修饰键模式下移 extraH）
+    // 为每个键盘按键创建按钮控件
     for (int i = 0; i < KB_KEY_COUNT; i++) {
         CreateWindowExW(0, L"BUTTON", KB_KEYS[i].label,
                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                         KB_KEYS[i].x + 8, KB_KEYS[i].y + 8 + extraH, KB_KEYS[i].w, KB_KEYS[i].h,
+                         KB_KEYS[i].x + 8, KB_KEYS[i].y + 8, KB_KEYS[i].w, KB_KEYS[i].h,
                          hwnd, (HMENU)(LONG_PTR)(10000 + i), GetModuleHandleW(nullptr), nullptr);
         HWND btn = GetDlgItem(hwnd, 10000 + i);
         SendMessageW(btn, WM_SETFONT, (WPARAM)keyFont.get(), TRUE);
@@ -474,7 +383,6 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent, bool showModifiers, UINT* mo
 
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
 
-    if (modOut) *modOut = pd.mod;  // 输出修饰键组合
     return pd.selectedVK;
 }
 
@@ -1402,11 +1310,10 @@ void SettingsDialog::SwitchTab(HWND hwnd, int tabIndex, AppConfig& config) {
 
     case 3: { // ===== 热键管理页面 =====
         makeButton(IDC_BTN_SCANHOTKEYS, L"扫描系统热键", PAGE_X, y, smallBtnW + 20, btnH);
-        makeButton(IDC_BTN_LISTEN, L"侦听热键", PAGE_X + smallBtnW + 28, y, smallBtnW + 12, btnH);
-        makeLabel(L"过滤:", PAGE_X + smallBtnW + 132, y, 40, btnH);
+        makeLabel(L"过滤:", PAGE_X + smallBtnW + 30, y, 40, btnH);
         CreateWindowExW(0, L"COMBOBOX", L"",
                          WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                         PAGE_X + smallBtnW + 174, y, 90, 200,
+                         PAGE_X + smallBtnW + 72, y, 100, 200,
                          hwnd, (HMENU)IDC_CBO_HKFILTER, GetModuleHandleW(nullptr), nullptr);
         {
             HWND cbo = GetDlgItem(hwnd, IDC_CBO_HKFILTER);
@@ -1420,7 +1327,7 @@ void SettingsDialog::SwitchTab(HWND hwnd, int tabIndex, AppConfig& config) {
 
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                         PAGE_X + smallBtnW + 272, y, PAGE_W - smallBtnW - 282, lineH - 2,
+                         PAGE_X + smallBtnW + 180, y, PAGE_W - smallBtnW - 190, lineH - 2,
                          hwnd, (HMENU)IDC_EDT_HKSEARCH, GetModuleHandleW(nullptr), nullptr);
         SetControlFont(GetDlgItem(hwnd, IDC_EDT_HKSEARCH), font);
         y += btnH + 6;
@@ -1915,15 +1822,14 @@ void SettingsDialog::RefreshRemapList(HWND hwnd, AppConfig& config) {
     ListView_DeleteAllItems(lv);
     for (size_t i = 0; i < config.keyRemappings.size(); i++) {
         const auto& r = config.keyRemappings[i];
-        // 无修饰键时 FormatHotKey 只显示键名，兼容旧的单键映射显示
-        std::wstring src = FormatHotKey(r.srcMod, r.srcVk);
+        std::wstring src = AppConfig::VKToName(r.first);
         LVITEMW item = {};
         item.mask = LVIF_TEXT;
         item.iItem = (int)i;
         item.iSubItem = 0;
         item.pszText = const_cast<LPWSTR>(src.c_str());
         ListView_InsertItem(lv, &item);
-        std::wstring dst = FormatHotKey(r.dstMod, r.dstVk);
+        std::wstring dst = AppConfig::VKToName(r.second);
         ListView_SetItemText(lv, (int)i, 1, const_cast<LPWSTR>(dst.c_str()));
     }
 }
@@ -1938,7 +1844,6 @@ static const UINT WM_CAPTURE_CANCEL = WM_USER + 301;     // 自定义消息：�
 // 按键捕获对话框数据
 struct CaptureKeyData {
     int capturedVK;     // 捕获到的虚拟键码，0 表示取消
-    UINT capturedMod;   // 捕获时的修饰键组合（仅组合捕获模式使用）
     bool done;          // 对话框完成标志
 };
 
@@ -1946,7 +1851,7 @@ static HHOOK s_captureKeyHook = nullptr; // 全局键盘钩子句柄
 static HWND s_captureKeyDlg = nullptr;   // 捕获对话框窗口句柄
 
 // ===== 按键捕获低级键盘钩子过程 =====
-// 拦截键盘输入，将非注入的按键事件转发给捕获对话框（lParam 携带修饰键组合）
+// 拦截键盘输入，将非注入的按键事件转发给捕获对话框
 static LRESULT CALLBACK CaptureKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && s_captureKeyDlg) {
         auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
@@ -1955,13 +1860,7 @@ static LRESULT CALLBACK CaptureKeyHookProc(int nCode, WPARAM wParam, LPARAM lPar
             return CallNextHookEx(s_captureKeyHook, nCode, wParam, lParam);
         }
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-            // 组装修饰键组合（与钩子主模块一致的判定方式）
-            UINT mod = 0;
-            if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mod |= MOD_CONTROL;
-            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mod |= MOD_SHIFT;
-            if (kb->flags & LLKHF_ALTDOWN) mod |= MOD_ALT;
-            if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) mod |= MOD_WIN;
-            PostMessageW(s_captureKeyDlg, WM_CAPTURE_KEY_MSG, (WPARAM)kb->vkCode, (LPARAM)mod);
+            PostMessageW(s_captureKeyDlg, WM_CAPTURE_KEY_MSG, (WPARAM)kb->vkCode, 0);
         }
         return 1; // 拦截按键，不传递给其他应用
     }
@@ -1992,7 +1891,6 @@ static LRESULT CALLBACK CaptureKeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
             vk = (GetKeyState(VK_LMENU) & 0x8000) ? VK_LMENU : VK_RMENU;
         }
         data->capturedVK = vk;
-        data->capturedMod = (UINT)lp;   // 记录捕获时的修饰键组合
         data->done = true;
         DestroyWindow(hwnd);
         return 0;
@@ -2014,10 +1912,8 @@ static LRESULT CALLBACK CaptureKeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 // ===== 显示按键捕获对话框（通用版） =====
 // 创建一个置顶的模态对话框，安装低级键盘钩子捕获用户按键
 // title: 对话框标题，line1/line2: 提示文字
-// capturedMod: 输出捕获时的修饰键组合（可为 nullptr，忽略修饰键）
 // 返回捕获到的虚拟键码，0 表示取消
-static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar_t* line1,
-                                  const wchar_t* line2, UINT* capturedMod = nullptr) {
+static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar_t* line1, const wchar_t* line2) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW wc = {};
@@ -2037,7 +1933,7 @@ static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    CaptureKeyData data = { 0, 0, false };
+    CaptureKeyData data = { 0, false };
 
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, CAPTURE_KEY_CLASS,
                                  title,
@@ -2099,7 +1995,6 @@ static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar
 
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
 
-    if (capturedMod) *capturedMod = data.capturedMod;  // 输出修饰键组合
     return data.capturedVK;
 }
 
@@ -2139,53 +2034,42 @@ void SettingsDialog::RemoveDisabledKey(HWND hwnd, AppConfig& config) {
 }
 
 // ===== 添加按键映射规则 =====
-// 先捕获源按键（支持组合键，如按住 Win 再按 6），再通过虚拟键盘选择目标
-// 按键（可选修饰键组合），实现 WIN+6=F6 或 F6=WIN+6 等双向组合映射
+// 先捕获源按键，再通过虚拟键盘选择目标按键，检查循环映射后添加规则
 void SettingsDialog::AddRemapEntry(HWND hwnd, AppConfig& config) {
-    UINT srcMod = 0;
     int sourceVK = ShowCaptureKeyDialogEx(hwnd,
         L"按键映射 - 源按键",
-        L"请按下要映射的源按键（可按住修饰键组合）...",
-        L"如按住 Win 按 6 即捕获 Win+6；Fn键无法捕获",
-        &srcMod);
+        L"请按下要映射的源按键...",
+        L"(Fn键无法捕获)");
     if (sourceVK == 0) return;
 
-    // 源不能是纯修饰键（捕获对话框已区分左右，检查全部修饰键码）
-    if (sourceVK == VK_LCONTROL || sourceVK == VK_RCONTROL ||
-        sourceVK == VK_LSHIFT || sourceVK == VK_RSHIFT ||
-        sourceVK == VK_LMENU || sourceVK == VK_RMENU ||
-        sourceVK == VK_LWIN || sourceVK == VK_RWIN) {
-        MessageBoxW(hwnd, L"源按键不能是修饰键本身，请按住修饰键后再按其他键",
+    bool exists = false;
+    for (auto& r : config.keyRemappings) {
+        if (r.first == sourceVK) { exists = true; break; }
+    }
+    if (exists) {
+        MessageBoxW(hwnd, L"该源按键已存在映射规则",
                      L"提示", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    // 检查同源组合是否已存在映射规则
-    for (const auto& r : config.keyRemappings) {
-        if (r.srcMod == srcMod && r.srcVk == (UINT)sourceVK) {
-            MessageBoxW(hwnd, (L"该源按键组合已存在映射规则:\n" + FormatHotKey(srcMod, (UINT)sourceVK)).c_str(),
-                         L"提示", MB_OK | MB_ICONINFORMATION);
-            return;
-        }
-    }
-
-    UINT dstMod = 0;
-    int targetVK = ShowKeyboardPicker(hwnd, true, &dstMod);
+    int targetVK = ShowKeyboardPicker(hwnd);
     if (targetVK == 0) return;
 
-    // 完全相同的源/目标组合无意义
-    if (sourceVK == targetVK && srcMod == dstMod) {
-        MessageBoxW(hwnd, L"源和目标组合不能相同",
+    if (sourceVK == targetVK) {
+        MessageBoxW(hwnd, L"源按键和目标按键不能相同",
                      L"提示", MB_OK | MB_ICONWARNING);
         return;
     }
 
-    KeyMapping m;
-    m.srcMod = srcMod;
-    m.srcVk = (UINT)sourceVK;
-    m.dstMod = dstMod;
-    m.dstVk = (UINT)targetVK;
-    config.keyRemappings.push_back(m);
+    for (const auto& r : config.keyRemappings) {
+        if (r.second == sourceVK) {
+            MessageBoxW(hwnd, L"该目标按键已被其他按键映射为源按键，这会导致循环映射问题。\n请先删除相关映射后再试。",
+                         L"提示", MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
+    config.keyRemappings.push_back({sourceVK, targetVK});
     RefreshRemapList(hwnd, config);
 }
 
@@ -2482,284 +2366,6 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
     }
 }
 
-// ============================================================
-// ===== 热键侦听对话框 =====
-// 独立弹出窗口：开启侦听后用户正常使用其他软件，实际按下的
-// 组合键被记录（含归属进程），供用户挑选加入屏蔽列表。
-// 这是发现"应用内热键"（如微信 Alt+A，不经系统注册）的唯一可靠途径。
-// ============================================================
-
-static const wchar_t* LISTEN_DLG_CLASS = L"KeySentryListenDlg";
-
-// 侦听对话框运行时数据
-struct ListenDlgData {
-    AppConfig* workingCopy;   // 设置对话框的工作副本（加入屏蔽时写入）
-    bool listening;           // 当前是否侦听中
-    HWND statusLbl;           // 状态提示标签
-};
-
-// ===== 刷新侦听记录列表视图 =====
-void SettingsDialog::RefreshListenList(HWND hwnd) {
-    HWND lv = GetDlgItem(hwnd, IDC_LV_LISTENED);
-    if (!lv) return;
-    ListView_DeleteAllItems(lv);
-    auto& keys = GetListenedKeys();
-    for (size_t i = 0; i < keys.size(); i++) {
-        std::wstring combo = FormatHotKey(keys[i].mod, keys[i].vk);
-        LVITEMW item = {};
-        item.mask = LVIF_TEXT | LVIF_PARAM;
-        item.iItem = (int)i;
-        item.iSubItem = 0;
-        item.pszText = const_cast<LPWSTR>(combo.c_str());
-        item.lParam = (LPARAM)i;
-        ListView_InsertItem(lv, &item);
-        ListView_SetItemText(lv, (int)i, 1, const_cast<LPWSTR>(keys[i].processName.c_str()));
-        ListView_SetItemText(lv, (int)i, 2, const_cast<LPWSTR>(keys[i].windowTitle.c_str()));
-        wchar_t cnt[16] = {};
-        swprintf_s(cnt, L"%d", keys[i].count);
-        ListView_SetItemText(lv, (int)i, 3, cnt);
-    }
-}
-
-// ===== 将侦听记录中选中的组合键加入热键屏蔽列表 =====
-void SettingsDialog::AddListenedToDisabled(HWND hwnd, AppConfig& config) {
-    HWND lv = GetDlgItem(hwnd, IDC_LV_LISTENED);
-    if (!lv) return;
-    int sel = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
-    auto& keys = GetListenedKeys();
-    if (sel < 0) {
-        MessageBoxW(hwnd, L"请先从侦听记录中选择一个组合键",
-                     L"提示", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-    // 经 LVIF_PARAM 取真实下标（与扫描列表同思路，防错位）
-    LVITEMW item = {};
-    item.mask = LVIF_PARAM;
-    item.iItem = sel;
-    if (!SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&item)) return;
-    int idx = (int)item.lParam;
-    if (idx < 0 || idx >= (int)keys.size()) return;
-
-    auto& k = keys[idx];
-    // 检查是否已在屏蔽列表
-    for (const auto& h : config.disabledHotkeys) {
-        if (h.first == k.mod && h.second == k.vk) {
-            MessageBoxW(hwnd, (L"该组合键已在屏蔽列表中:\n" + FormatHotKey(k.mod, k.vk)).c_str(),
-                         L"提示", MB_OK | MB_ICONINFORMATION);
-            return;
-        }
-    }
-    config.disabledHotkeys.push_back({ k.mod, k.vk });
-    // 从侦听记录中移除已加入项并刷新
-    std::wstring added = FormatHotKey(k.mod, k.vk) + L"  (" + k.processName + L")";
-    keys.erase(keys.begin() + idx);
-    RefreshListenList(hwnd);
-    MessageBoxW(hwnd, (L"已加入屏蔽列表:\n" + added +
-                       L"\n\n点击「应用」或「确定」后生效").c_str(),
-                 L"添加成功", MB_OK | MB_ICONINFORMATION);
-}
-
-// ===== 侦听对话框窗口过程 =====
-static LRESULT CALLBACK ListenDlgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    auto* ld = reinterpret_cast<ListenDlgData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    switch (msg) {
-    case WM_LISTEN_UPDATE:
-        // 侦听记录有更新（主窗口 RecordListenedKey 转发）
-        SettingsDialog::RefreshListenList(hwnd);
-        return 0;
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_BTN_LISTEN: {
-            // 开始/停止侦听切换
-            if (!ld) return 0;
-            ld->listening = !ld->listening;
-            if (SettingsDialog::s_listenModeCallback) {
-                SettingsDialog::s_listenModeCallback(ld->listening);
-            }
-            SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_LISTEN),
-                           ld->listening ? L"停止侦听" : L"开始侦听");
-            SetWindowTextW(ld->statusLbl,
-                           ld->listening ? L"侦听中… 请去目标软件按下想管理的快捷键（本窗口可最小化）"
-                                         : L"未侦听");
-            return 0;
-        }
-        case IDC_BTN_LISTEN_CLEAR:
-            SettingsDialog::GetListenedKeys().clear();
-            SettingsDialog::RefreshListenList(hwnd);
-            return 0;
-        case IDC_BTN_LISTEN_ADD:
-            if (ld) SettingsDialog::AddListenedToDisabled(hwnd, *ld->workingCopy);
-            return 0;
-        case IDCANCEL:
-        case WM_CLOSE:
-            // 关闭时若仍在侦听则自动停止
-            if (ld && ld->listening) {
-                ld->listening = false;
-                if (SettingsDialog::s_listenModeCallback) {
-                    SettingsDialog::s_listenModeCallback(false);
-                }
-            }
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        break;
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLORBTN: {
-        HDC hdc = (HDC)wp;
-        SetBkMode(hdc, TRANSPARENT);
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-    }
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-// ===== 显示热键侦听对话框 =====
-void SettingsDialog::ShowListenDialog(HWND parent, AppConfig& config) {
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSW wc = {};
-        wc.lpfnWndProc = ListenDlgWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = LISTEN_DLG_CLASS;
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
-        registered = true;
-    }
-
-    ListenDlgData ld;
-    ld.workingCopy = &config;
-    ld.listening = false;
-    ld.statusLbl = nullptr;
-
-    RECT rc = { 0, 0, 620, 460 };
-    AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
-    int winW = rc.right - rc.left;
-    int winH = rc.bottom - rc.top;
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, LISTEN_DLG_CLASS,
-                               L"热键侦听 - 发现应用内快捷键",
-                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                               (screenW - winW) / 2, (screenH - winH) / 2,
-                               winW, winH,
-                               parent, nullptr, GetModuleHandleW(nullptr), nullptr);
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&ld));
-
-    HFONT font = GetDlgFont();
-    HFONT smallFont = GetSmallFont();
-    int cx = 14;
-    int cw = 592;
-    int y = 10;
-
-    // 说明文字
-    HWND lblDesc = CreateWindowExW(0, L"STATIC",
-        L"许多软件的快捷键（如微信 Alt+A 截图）不经过系统注册，无法被\"扫描\"发现。\n"
-        L"侦听模式通过记录你实际按下的组合键来发现它们：",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
-        cx, y, cw, 40, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(lblDesc, WM_SETFONT, (WPARAM)smallFont, TRUE);
-    y += 46;
-
-    // 使用步骤
-    HWND lblSteps = CreateWindowExW(0, L"STATIC",
-        L"1. 点击「开始侦听」   2. 切换到目标软件，实际按下想管理的快捷键\n"
-        L"3. 回到本窗口，选中记录并点击「加入屏蔽列表」   4. 点击设置窗口的「应用」生效",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
-        cx, y, cw, 40, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(lblSteps, WM_SETFONT, (WPARAM)smallFont, TRUE);
-    y += 48;
-
-    // 控制行：开始/停止按钮 + 状态提示
-    HWND btnToggle = CreateWindowExW(0, L"BUTTON", L"开始侦听",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     cx, y, 110, 30,
-                                     dlg, (HMENU)IDC_BTN_LISTEN, GetModuleHandleW(nullptr), nullptr);
-    SetControlFont(btnToggle, font);
-    HWND statusLbl = CreateWindowExW(0, L"STATIC", L"未侦听",
-                                     WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                                     cx + 120, y, cw - 120, 30,
-                                     dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-    SetControlFont(statusLbl, font);
-    ld.statusLbl = statusLbl;
-    HWND btnClear = CreateWindowExW(0, L"BUTTON", L"清空记录",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    cx + cw - 90, y, 90, 30,
-                                    dlg, (HMENU)IDC_BTN_LISTEN_CLEAR, GetModuleHandleW(nullptr), nullptr);
-    SetControlFont(btnClear, font);
-    y += 38;
-
-    // 侦听记录列表
-    HWND lv = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                              WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER,
-                              cx, y, cw, 270,
-                              dlg, (HMENU)IDC_LV_LISTENED, GetModuleHandleW(nullptr), nullptr);
-    SetControlFont(lv, font);
-    SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    ListView_SetBkColor(lv, RGB(255, 255, 255));
-    ListView_SetTextColor(lv, GetSysColor(COLOR_WINDOWTEXT));
-    ListView_SetTextBkColor(lv, RGB(255, 255, 255));
-    {
-        LVCOLUMNW col = {};
-        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
-        col.fmt = LVCFMT_LEFT;
-        col.cx = 150; col.pszText = const_cast<LPWSTR>(L"组合键");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
-        col.cx = 110; col.pszText = const_cast<LPWSTR>(L"归属进程");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
-        col.cx = 250; col.pszText = const_cast<LPWSTR>(L"窗口标题");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
-        col.cx = 60; col.pszText = const_cast<LPWSTR>(L"次数");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 3, (LPARAM)&col);
-    }
-    y += 278;
-
-    // 底部按钮：加入屏蔽 + 关闭
-    HWND btnAdd = CreateWindowExW(0, L"BUTTON", L"加入屏蔽列表",
-                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  cx, y, 140, 30,
-                                  dlg, (HMENU)IDC_BTN_LISTEN_ADD, GetModuleHandleW(nullptr), nullptr);
-    SetControlFont(btnAdd, font);
-    HWND btnClose = CreateWindowExW(0, L"BUTTON", L"关闭",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                    cx + cw - 90, y, 90, 30,
-                                    dlg, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
-    SetControlFont(btnClose, font);
-
-    RefreshListenList(dlg);
-
-    // 侦听记录转发目标切换为本对话框（结束后恢复）
-    HWND prevDlg = s_dialogHwnd;
-    s_dialogHwnd = dlg;
-
-    {
-        ModalGuard guard(parent);
-        ShowWindow(dlg, SW_SHOW);
-        UpdateWindow(dlg);
-
-        MSG msg;
-        while (IsWindow(dlg)) {
-            BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
-            if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
-            if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-
-        // 兜底：异常退出路径下销毁窗口，避免 GWLP_USERDATA 指向已失效的栈对象 ld
-        if (IsWindow(dlg)) DestroyWindow(dlg);
-    }
-
-    s_dialogHwnd = prevDlg;
-
-    // 兜底：对话框销毁后若侦听仍开启（理论上 WndProc 已处理），确保停止
-    if (ld.listening) {
-        ld.listening = false;
-        if (s_listenModeCallback) s_listenModeCallback(false);
-    }
-}
-
 // ===== 删除窗口隐藏绑定 =====
 void SettingsDialog::RemoveBossWindow(HWND hwnd, AppConfig& config) {
     HWND lv = GetDlgItem(hwnd, IDC_LST_BOUND_WINDOWS);
@@ -2816,7 +2422,37 @@ struct AddHotkeyData {
     bool confirmed;             // 用户是否确认
     bool isEdit;                // 是否为编辑模式
     int editIndex;              // 编辑模式下对应的配置索引
+    bool simMode = false;       // 触发动作模式：true=模拟按键，false=运行命令
+    UINT simVK = 0;             // 模拟按键模式下选中的被模拟键
 };
+
+// ===== 切换自定义热键对话框的触发动作模式 =====
+// 运行命令模式：命令/程序行显示可用，其余命令相关选项启用
+// 模拟按键模式：命令行位置切换为按键选择行，参数/工作目录/窗口状态等选项置灰
+static void UpdateAddHotkeyMode(HWND hwnd, bool simMode) {
+    auto* ahd = reinterpret_cast<AddHotkeyData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (ahd) ahd->simMode = simMode;
+
+    // 动态标签："命令/程序:" <-> "模拟按键:"
+    HWND lbl = GetDlgItem(hwnd, IDC_LBL_HK_CMDLABEL);
+    if (lbl) SetWindowTextW(lbl, simMode ? L"模拟按键:" : L"命令/程序:");
+
+    // 命令行控件与模拟行控件同位置互斥显示
+    ShowWindow(GetDlgItem(hwnd, IDC_EDT_HK_CMD), simMode ? SW_HIDE : SW_SHOW);
+    ShowWindow(GetDlgItem(hwnd, IDC_BTN_HK_BROWSE), simMode ? SW_HIDE : SW_SHOW);
+    ShowWindow(GetDlgItem(hwnd, IDC_EDT_HK_SIMKEY), simMode ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd, IDC_BTN_HK_PICKKEY), simMode ? SW_SHOW : SW_HIDE);
+
+    // 仅命令模式有意义的选项：模拟模式下置灰
+    const int cmdOnlyCtrls[] = {
+        IDC_EDT_HK_PARAMS, IDC_EDT_HK_WORKDIR, IDC_BTN_HK_WORKDIR_BROWSE,
+        IDC_CBO_HK_WINSTATE, IDC_CHK_HK_CONFIRM, IDC_CHK_HK_ADMIN
+    };
+    for (int id : cmdOnlyCtrls) {
+        HWND h = GetDlgItem(hwnd, id);
+        if (h) EnableWindow(h, !simMode);
+    }
+}
 
 // ===== 自定义热键对话框窗口过程 =====
 static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2863,8 +2499,14 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             HWND edtCmd = GetDlgItem(hwnd, IDC_EDT_HK_CMD);
             wchar_t cmdText[MAX_PATH] = {};
             GetWindowTextW(edtCmd, cmdText, MAX_PATH);
-            if (wcslen(cmdText) == 0) {
+            if (!ahd->simMode && wcslen(cmdText) == 0) {
                 MessageBoxW(hwnd, L"请输入命令或程序路径", L"提示", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+
+            // 模拟按键模式：必须已选择被模拟的按键
+            if (ahd->simMode && ahd->simVK == 0) {
+                MessageBoxW(hwnd, L"请点击\"选择按键\"按钮设置要模拟的按键", L"提示", MB_OK | MB_ICONWARNING);
                 return 0;
             }
 
@@ -2875,15 +2517,18 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             hk.mod = hotkeyMod;
             hk.vk = ahd->captureVK;
 
-            hk.command = cmdText;
+            hk.simulateKey = ahd->simMode;
+            hk.targetVK = ahd->simMode ? ahd->simVK : 0;
+
+            hk.command = ahd->simMode ? L"" : cmdText;
 
             wchar_t paramsText[512] = {};
             GetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_PARAMS), paramsText, 512);
-            hk.parameters = paramsText;
+            hk.parameters = ahd->simMode ? L"" : paramsText;
 
             wchar_t workDirText[MAX_PATH] = {};
             GetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_WORKDIR), workDirText, MAX_PATH);
-            hk.workDir = workDirText;
+            hk.workDir = ahd->simMode ? L"" : workDirText;
 
             wchar_t descText[256] = {};
             GetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_DESC), descText, 256);
@@ -2891,10 +2536,10 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 
             HWND cboWinState = GetDlgItem(hwnd, IDC_CBO_HK_WINSTATE);
             int wsSel = (int)SendMessageW(cboWinState, CB_GETCURSEL, 0, 0);
-            hk.windowState = ConfigUtils::ClampWindowState(wsSel);
+            hk.windowState = ahd->simMode ? HotkeyWindowState::Normal : ConfigUtils::ClampWindowState(wsSel);
 
-            hk.confirmBeforeRun = SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_CONFIRM), BM_GETCHECK, 0, 0) == BST_CHECKED;
-            hk.runAsAdmin = SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_ADMIN), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            hk.confirmBeforeRun = !ahd->simMode && SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_CONFIRM), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            hk.runAsAdmin = !ahd->simMode && SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_ADMIN), BM_GETCHECK, 0, 0) == BST_CHECKED;
 
             // 检查热键是否已存在（编辑模式下跳过自身）
             for (size_t i = 0; i < ahd->workingCopy->customHotkeys.size(); i++) {
@@ -2925,6 +2570,29 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HK_CAPTURE), L"请按下快捷键...");
             SetFocus(hwnd);
             return 0;
+        case IDC_RADIO_HK_CMD:
+            UpdateAddHotkeyMode(hwnd, false);
+            return 0;
+        case IDC_RADIO_HK_SIMKEY:
+            UpdateAddHotkeyMode(hwnd, true);
+            // 首次切入模拟模式且尚未选键时，直接弹出键盘选择界面
+            if (ahd->simVK == 0) {
+                int picked = SettingsDialog::ShowKeyboardPicker(hwnd);
+                if (picked > 0) {
+                    ahd->simVK = (UINT)picked;
+                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_SIMKEY), AppConfig::VKToName(picked).c_str());
+                }
+            }
+            return 0;
+        case IDC_BTN_HK_PICKKEY: {
+            // 重新选择被模拟的按键（与按键映射一致的虚拟键盘界面）
+            int picked = SettingsDialog::ShowKeyboardPicker(hwnd);
+            if (picked > 0) {
+                ahd->simVK = (UINT)picked;
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_SIMKEY), AppConfig::VKToName(picked).c_str());
+            }
+            return 0;
+        }
         case IDC_BTN_HK_BROWSE: {
             // 浏览选择可执行文件
             OPENFILENAMEW ofn = {};
@@ -3007,9 +2675,11 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         const auto& existing = config.customHotkeys[editIndex];
         ahd.captureMod = existing.mod;
         ahd.captureVK = existing.vk;
+        ahd.simMode = existing.simulateKey;
+        ahd.simVK = existing.targetVK;
     }
 
-    RECT rc = { 0, 0, 480, 400 };
+    RECT rc = { 0, 0, 480, 440 };
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
@@ -3064,6 +2734,15 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         SetControlFont(h, font);
     };
 
+    // 单选按钮（用于触发动作模式选择），group 参数标记单选组起始
+    auto dlgRadio = [&](int id, const wchar_t* text, int px, int py, int w, bool group) {
+        HWND h = CreateWindowExW(0, L"BUTTON", text,
+                                   WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | (group ? WS_GROUP : 0),
+                                   px, py, w, lineH,
+                                   dlg, (HMENU)(LONG_PTR)id, GetModuleHandleW(nullptr), nullptr);
+        SetControlFont(h, font);
+    };
+
     dlgLabel(L"修饰键:", cx, y, labelW, btnH);
     dlgChk(IDC_CHK_HK_CTRL, L"Ctrl", editX, y, 55);
     dlgChk(IDC_CHK_HK_SHIFT, L"Shift", editX + 60, y, 60);
@@ -3092,7 +2771,27 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     }
     y += btnH + 6;
 
-    dlgLabel(L"命令/程序:", cx, y, labelW, btnH);
+    // 触发动作：运行命令（默认）/ 模拟按键
+    dlgLabel(L"触发动作:", cx, y, labelW, btnH);
+    dlgRadio(IDC_RADIO_HK_CMD, L"运行命令", editX, y + 5, 90, true);
+    dlgRadio(IDC_RADIO_HK_SIMKEY, L"模拟按键", editX + 100, y + 5, 90, false);
+    if (isEdit) {
+        const auto& existing = config.customHotkeys[editIndex];
+        SendMessageW(GetDlgItem(dlg, IDC_RADIO_HK_CMD), BM_SETCHECK, existing.simulateKey ? BST_UNCHECKED : BST_CHECKED, 0);
+        SendMessageW(GetDlgItem(dlg, IDC_RADIO_HK_SIMKEY), BM_SETCHECK, existing.simulateKey ? BST_CHECKED : BST_UNCHECKED, 0);
+    } else {
+        SendMessageW(GetDlgItem(dlg, IDC_RADIO_HK_CMD), BM_SETCHECK, BST_CHECKED, 0);
+    }
+    y += btnH + 6;
+
+    // 命令/程序行 与 模拟按键选择行同位置，按触发动作模式互斥显示
+    {
+        HWND lblCmd = CreateWindowExW(0, L"STATIC", L"命令/程序:",
+                                       WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                                       cx, y, labelW, btnH,
+                                       dlg, (HMENU)(LONG_PTR)IDC_LBL_HK_CMDLABEL, GetModuleHandleW(nullptr), nullptr);
+        SetControlFont(lblCmd, font);
+    }
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                      WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
                      editX, y, cw - labelW - 5 - 80, btnH,
@@ -3100,9 +2799,23 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     SetControlFont(GetDlgItem(dlg, IDC_EDT_HK_CMD), font);
     dlgButton(IDC_BTN_HK_BROWSE, L"浏览", cx + cw - 75, y, 75, btnH);
 
+    // 模拟按键行：只读编辑框显示选中按键 + 选择按键按钮（初始不显示，由模式切换控制）
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                     WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
+                     editX, y, 100, btnH,
+                     dlg, (HMENU)(LONG_PTR)IDC_EDT_HK_SIMKEY, GetModuleHandleW(nullptr), nullptr);
+    SetControlFont(GetDlgItem(dlg, IDC_EDT_HK_SIMKEY), font);
+    dlgButton(IDC_BTN_HK_PICKKEY, L"选择按键", editX + 108, y, 115, btnH);
+
     if (isEdit) {
-        SetWindowTextW(GetDlgItem(dlg, IDC_EDT_HK_CMD), config.customHotkeys[editIndex].command.c_str());
+        const auto& existing = config.customHotkeys[editIndex];
+        SetWindowTextW(GetDlgItem(dlg, IDC_EDT_HK_CMD), existing.command.c_str());
+        if (existing.simulateKey && existing.targetVK != 0) {
+            SetWindowTextW(GetDlgItem(dlg, IDC_EDT_HK_SIMKEY), AppConfig::VKToName(existing.targetVK).c_str());
+        }
     }
+    // 按当前模式（新增默认命令模式，编辑恢复原模式）应用控件显示/启用状态
+    UpdateAddHotkeyMode(dlg, ahd.simMode);
     y += btnH + 6;
 
     dlgLabel(L"运行参数:", cx, y, labelW, btnH);
@@ -3261,7 +2974,10 @@ void SettingsDialog::RefreshCustomHotkeyList(HWND hwnd, AppConfig& config) {
         const auto& hk = config.customHotkeys[i];
         if (hk.mod == 0 && hk.vk == 0) continue;
         std::wstring keyName = FormatHotKey(hk.mod, hk.vk);
-        std::wstring cmd = hk.command.empty() ? L"" : hk.command;
+        // 模拟按键模式显示被模拟的按键，命令模式显示命令路径
+        std::wstring cmd = hk.simulateKey
+            ? (L"模拟按键: " + AppConfig::VKToName(hk.targetVK))
+            : (hk.command.empty() ? L"" : hk.command);
         std::wstring desc = hk.description.empty() ? L"" : hk.description;
 
         LVITEMW item = {};
@@ -3649,10 +3365,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             return 0;
         case IDC_BTN_SCANHOTKEYS:
             SettingsDialog::ScanHotkeys(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_LISTEN:
-            // 打开热键侦听对话框（发现微信 Alt+A 等应用内快捷键）
-            SettingsDialog::ShowListenDialog(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_PROBEHOTKEY:
             SettingsDialog::ProbeHotkey(hwnd, data->workingCopy);

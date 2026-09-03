@@ -136,36 +136,11 @@ void AppConfig::Load(const std::wstring& iniPath) {
 
     // --- 按键重映射 ---
     keyRemapEnabled = GetPrivateProfileIntW(L"KeyRemap", L"Enabled", 0, iniPath.c_str()) != 0;
-    {
-        auto remapStr = IniUtils::Read(iniPath, L"KeyRemap", L"Mappings");
-        keyRemappings.clear();
-        if (remapStr.find(L':') != std::wstring::npos) {
-            // 新格式：每条规则 "srcMod:srcVk:dstMod:dstVk"，规则间逗号分隔
-            auto parts = ParseEntryList(remapStr);
-            for (const auto& p : parts) {
-                if (p.empty()) continue;
-                wchar_t* end = nullptr;
-                unsigned long f[4] = {};
-                const wchar_t* q = p.c_str();
-                bool ok = true;
-                for (int i = 0; i < 4; i++) {
-                    f[i] = wcstoul(q, &end, 10);
-                    if (end == q || (i < 3 && *end != L':')) { ok = false; break; }
-                    q = end + 1;
-                }
-                if (ok && f[1] != 0 && f[3] != 0) {
-                    keyRemappings.push_back({(UINT)f[0], (UINT)f[1], (UINT)f[2], (UINT)f[3]});
-                }
-            }
-        } else {
-            // 旧格式：{源键, 目标键} 平铺 CSV，迁移为无修饰键映射
-            auto remapInts = ParseCSVInts(remapStr);
-            for (size_t i = 0; i + 1 < remapInts.size(); i += 2) {
-                if (remapInts[i] != 0 && remapInts[i + 1] != 0) {
-                    keyRemappings.push_back({0, (UINT)remapInts[i], 0, (UINT)remapInts[i + 1]});
-                }
-            }
-        }
+    auto remapStr = IniUtils::Read(iniPath, L"KeyRemap", L"Mappings");
+    auto remapInts = ParseCSVInts(remapStr);
+    // 重映射以成对形式存储：{源键, 目标键}
+    for (size_t i = 0; i + 1 < remapInts.size(); i += 2) {
+        keyRemappings.push_back({remapInts[i], remapInts[i + 1]});
     }
 
     // --- 热键屏蔽 ---
@@ -286,21 +261,11 @@ void AppConfig::Save(const std::wstring& iniPath) const {
     IniUtils::Write(iniPath, L"Keys", L"ForceInsertMode", IniUtils::BoolToStr(forceInsertMode));
     IniUtils::Write(iniPath, L"Keys", L"DisabledKeyCodes", IntsToCSV(disabledKeyCodes));
 
-    // 按键重映射：每条规则 "srcMod:srcVk:dstMod:dstVk"，规则间逗号分隔
+    // 按键重映射：将成对映射展平为逗号分隔的整数序列
     IniUtils::Write(iniPath, L"KeyRemap", L"Enabled", IniUtils::BoolToStr(keyRemapEnabled));
-    {
-        std::vector<std::wstring> parts;
-        for (auto& m : keyRemappings) {
-            parts.push_back(std::to_wstring(m.srcMod) + L":" + std::to_wstring(m.srcVk) + L":" +
-                            std::to_wstring(m.dstMod) + L":" + std::to_wstring(m.dstVk));
-        }
-        std::wstring joined;
-        for (size_t i = 0; i < parts.size(); i++) {
-            if (i) joined += L",";
-            joined += parts[i];
-        }
-        IniUtils::Write(iniPath, L"KeyRemap", L"Mappings", joined);
-    }
+    std::vector<int> remapFlat;
+    for (auto& p : keyRemappings) { remapFlat.push_back(p.first); remapFlat.push_back(p.second); }
+    IniUtils::Write(iniPath, L"KeyRemap", L"Mappings", IntsToCSV(remapFlat));
 
     // 热键屏蔽
     std::vector<int> hkFlat;

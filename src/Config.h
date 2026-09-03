@@ -100,9 +100,11 @@ struct CustomHotkey {
     std::wstring description;           // 热键描述/显示名称
     HotkeyWindowState windowState = HotkeyWindowState::Normal; // 启动后窗口状态
     int opacity = -1;                   // 窗口透明度（-1 表示不设置）
-    bool autoStart = false;             // 是否随程序启动自动执行
-    bool confirmBeforeRun = false;      // 执行前是否需要确认
-    bool runAsAdmin = false;            // 是否以管理员权限运行
+    bool autoStart = false;              // 是否随程序启动自动执行
+    bool confirmBeforeRun = false;       // 执行前是否需要确认
+    bool runAsAdmin = false;             // 是否以管理员权限运行
+    bool simulateKey = false;            // 触发动作类型：true=模拟按键（targetVK 为被模拟键），false=运行命令
+    UINT targetVK = 0;                   // 模拟按键模式下被模拟的按键虚拟键码
 
     // 将自定义热键序列化为管道分隔的字符串
     std::wstring Serialize() const {
@@ -114,7 +116,9 @@ struct CustomHotkey {
                std::to_wstring(opacity) + L"|" +
                IniUtils::BoolToStr(autoStart) + L"|" +
                IniUtils::BoolToStr(confirmBeforeRun) + L"|" +
-               IniUtils::BoolToStr(runAsAdmin);
+               IniUtils::BoolToStr(runAsAdmin) + L"|" +
+               IniUtils::BoolToStr(simulateKey) + L"|" +
+               std::to_wstring(targetVK);
     }
 
     // 从管道分隔的字符串反序列化自定义热键
@@ -136,7 +140,14 @@ struct CustomHotkey {
         hk.opacity = ConfigUtils::SafeParseInt(str.substr(pipes[7] + 1, pipes[8] - pipes[7] - 1), -1);
         hk.autoStart = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1)) != 0;
         hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[9] + 1, pipes[10] - pipes[9] - 1)) != 0;
-        hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[10] + 1)) != 0;
+        // runAsAdmin：新格式（含模拟按键字段）需截断到第 12 个管道，旧格式取到结尾
+        hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[10] + 1,
+            (pipes.size() >= 12 ? pipes[11] : str.size()) - pipes[10] - 1)) != 0;
+        // 新增字段（模拟按键模式）：兼容旧版 12 字段格式，仅当存在第 13/14 字段时解析
+        if (pipes.size() >= 13) {
+            hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[11] + 1, pipes[12] - pipes[11] - 1)) != 0;
+            hk.targetVK = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[12] + 1));
+        }
         return hk;
     }
 
@@ -259,17 +270,6 @@ namespace WindowEnum {
 }
 
 // ============================================================
-// KeyMapping: 按键映射规则
-// 支持组合键双向映射（如 WIN+6 → F6，或 F6 → WIN+6）
-// ============================================================
-struct KeyMapping {
-    UINT srcMod = 0;   // 源修饰键（MOD_CONTROL/MOD_SHIFT/MOD_ALT/MOD_WIN 之组合，0=无）
-    UINT srcVk = 0;    // 源主键虚拟键码
-    UINT dstMod = 0;   // 目标修饰键（0=无）
-    UINT dstVk = 0;    // 目标主键虚拟键码
-};
-
-// ============================================================
 // AppConfig: 应用全局配置
 // 包含所有功能模块的配置项，支持 INI 文件读写
 // ============================================================
@@ -292,7 +292,7 @@ struct AppConfig {
 
     // --- 按键重映射 ---
     bool keyRemapEnabled = false;         // 启用按键重映射
-    std::vector<KeyMapping> keyRemappings; // 重映射规则（支持组合键）
+    std::vector<std::pair<int, int>> keyRemappings; // 重映射对：{源键, 目标键}
 
     // --- 热键屏蔽与自定义热键 ---
     std::vector<std::pair<UINT, UINT>> disabledHotkeys; // 被屏蔽的系统热键：{修饰键, 虚拟键}

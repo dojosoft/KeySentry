@@ -1,4 +1,4 @@
-﻿// ===== 键客 KeySentry 主入口文件 =====
+// ===== 键客 KeySentry 主入口文件 =====
 // 功能：Windows 桌面应用主入口，负责窗口创建、消息循环、
 //       系统托盘、热键注册、配置应用等核心逻辑
 
@@ -62,6 +62,68 @@ void SetSettingsWnd(HWND wnd) {
 // 功能：设置键盘钩子的模拟输入标志，避免钩子拦截自身发送的按键
 void SetHookSimulating(bool sim) {
     g_hook.SetSimulatingInput(sim);
+}
+
+// ===== SimulateTargetKeyPress =====
+// 功能：模拟单次按键（自定义热键的"模拟按键"模式）
+// 流程：
+//   1. 释放当前物理按住的修饰键——热键触发瞬间用户通常还按着 Ctrl/Alt 等，
+//      不释放会导致目标程序收到"修饰键+目标键"的组合而非纯净单键
+//   2. 发送目标键 down+up（扩展键自动附加 KEYEVENTF_EXTENDEDKEY）
+//   3. 恢复 Ctrl/Shift——用户仍物理按住时保持修饰键有效
+//      注意：Alt 不恢复（单独恢复会激活程序菜单栏），
+//            Win 不恢复（恢复后用户物理释放会误开开始菜单）
+static void SimulateTargetKeyPress(UINT vk) {
+    if (vk == 0) return;
+
+    // 记录热键触发瞬间的物理修饰键状态（注入按键前检查才准确）
+    const UINT aggMods[3] = { VK_CONTROL, VK_SHIFT, VK_MENU }; // 聚合修饰键（不区分左右）
+    bool heldAgg[3] = {};
+    for (int i = 0; i < 3; i++) {
+        heldAgg[i] = (GetAsyncKeyState(aggMods[i]) & 0x8000) != 0;
+    }
+    bool heldLWin = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0;
+    bool heldRWin = (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+
+    SetHookSimulating(true);
+
+    // 第一步：释放按住的修饰键
+    INPUT rel[5] = {};
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (heldAgg[i]) {
+            rel[n].type = INPUT_KEYBOARD;
+            rel[n].ki.wVk = (WORD)aggMods[i];
+            rel[n].ki.dwFlags = KEYEVENTF_KEYUP;
+            n++;
+        }
+    }
+    if (heldLWin) { rel[n].type = INPUT_KEYBOARD; rel[n].ki.wVk = VK_LWIN; rel[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    if (heldRWin) { rel[n].type = INPUT_KEYBOARD; rel[n].ki.wVk = VK_RWIN; rel[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    if (n > 0) {
+        SendInput((UINT)n, rel, sizeof(INPUT));
+        Sleep(30);
+    }
+
+    // 第二步：发送目标键 down+up
+    INPUT key[2] = {};
+    key[0].type = INPUT_KEYBOARD;
+    key[0].ki.wVk = (WORD)vk;
+    key[0].ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    if (NeedsExtendedKeyFlag(vk)) key[0].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    key[1] = key[0];
+    key[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+    SendInput(2, key, sizeof(INPUT));
+    Sleep(30);
+
+    // 第三步：恢复 Ctrl/Shift（仅限仍需保持的聚合修饰键，Alt/Win 见函数头注释）
+    INPUT re[2] = {};
+    int m = 0;
+    if (heldAgg[0]) { re[m].type = INPUT_KEYBOARD; re[m].ki.wVk = VK_CONTROL; m++; }
+    if (heldAgg[1]) { re[m].type = INPUT_KEYBOARD; re[m].ki.wVk = VK_SHIFT; m++; }
+    if (m > 0) SendInput((UINT)m, re, sizeof(INPUT));
+
+    SetHookSimulating(false);
 }
 
 // ===== GetIniPath =====
@@ -883,7 +945,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.9.0.0902",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.10.0.0904",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1065,6 +1127,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int idx = (int)wp - CUSTOM_HOTKEY_ID_START;
             if (idx >= 0 && idx < (int)g_config.customHotkeys.size()) {
                 const auto& hk = g_config.customHotkeys[idx];
+                // 模拟按键模式：释放修饰键后发送被模拟的按键
+                if (hk.simulateKey && hk.targetVK != 0) {
+                    SimulateTargetKeyPress(hk.targetVK);
+                    return 0;
+                }
                 if (!hk.command.empty()) {
                     // 若配置了运行前确认，弹出确认对话框
                     if (hk.confirmBeforeRun) {
