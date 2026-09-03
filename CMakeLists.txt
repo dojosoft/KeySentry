@@ -46,5 +46,6 @@ if(MSVC)
     # 静态链接 VC++ 运行库，目标机器无需安装 VC++ Redistributable
     set_property(TARGET KeySentry PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 else()
-    target_link_options(KeySentry PRIVATE -municode -s)
+    # -static: 全静态链接 libgcc/libstdc++/winpthread，产物仅依赖系统自带 DLL
+    target_link_options(KeySentry PRIVATE -municode -static -s)
 endif()

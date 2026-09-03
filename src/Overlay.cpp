@@ -36,6 +36,24 @@ HWND OverlayWindow::CreateOverlayWnd() {
 // 如果 primaryOnly 为 true，仅返回主显示器
 // 否则返回所有显示器
 // ============================================================
+// 枚举回调：32 位下 GCC 的 lambda 无法隐式转换为 stdcall 的 MONITORENUMPROC，
+// 故用显式 CALLBACK 约定的命名函数
+static BOOL CALLBACK CollectPrimaryMonitorProc(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) {
+    auto* pMons = reinterpret_cast<std::vector<HMONITOR>*>(lParam);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(hMon, &mi);
+    if (mi.dwFlags & MONITORINFOF_PRIMARY) {
+        pMons->push_back(hMon);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK CollectAllMonitorsProc(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) {
+    reinterpret_cast<std::vector<HMONITOR>*>(lParam)->push_back(hMon);
+    return TRUE;
+}
+
 std::vector<HMONITOR> OverlayWindow::GetTargetMonitors() {
     std::vector<HMONITOR> monitors;
 
@@ -49,27 +67,16 @@ std::vector<HMONITOR> OverlayWindow::GetTargetMonitors() {
             monitors.push_back(hPrimary);
         } else {
             // 回退：枚举查找主显示器
-            EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMon, HDC, LPRECT, LPARAM lParam) -> BOOL {
-                auto* pMons = reinterpret_cast<std::vector<HMONITOR>*>(lParam);
-                MONITORINFO mi2 = { sizeof(mi2) };
-                GetMonitorInfoW(hMon, &mi2);
-                if (mi2.dwFlags & MONITORINFOF_PRIMARY) {
-                    pMons->push_back(hMon);
-                    return FALSE;
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&monitors));
+            EnumDisplayMonitors(nullptr, nullptr, CollectPrimaryMonitorProc,
+                                reinterpret_cast<LPARAM>(&monitors));
             if (monitors.empty()) {
                 monitors.push_back(hPrimary);
             }
         }
     } else {
         // 枚举所有显示器
-        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMon, HDC, LPRECT, LPARAM lParam) -> BOOL {
-            auto* pMons = reinterpret_cast<std::vector<HMONITOR>*>(lParam);
-            pMons->push_back(hMon);
-            return TRUE;
-        }, reinterpret_cast<LPARAM>(&monitors));
+        EnumDisplayMonitors(nullptr, nullptr, CollectAllMonitorsProc,
+                            reinterpret_cast<LPARAM>(&monitors));
     }
 
     return monitors;

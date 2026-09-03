@@ -1677,6 +1677,88 @@ void SettingsDialog::RefreshBossWindowList(HWND hwnd, AppConfig& config) {
     }
 }
 
+// 枚举回调上下文：所有窗口列表
+struct AllWindowsEnumCtx {
+    std::vector<BoundWindowInfo>* cache;
+    std::vector<BoundWindowInfo>* bound;
+    HWND lstAll;
+};
+
+// 枚举回调：32 位下 GCC 的 lambda 无法隐式转换为 stdcall 的 WNDENUMPROC，
+// 故用显式 CALLBACK 约定的命名函数
+static BOOL CALLBACK CollectAllWindowsProc(HWND hwnd, LPARAM lParam) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    wchar_t title[512] = {};
+    GetWindowTextW(hwnd, title, 512);
+    if (wcslen(title) == 0) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
+
+    std::wstring processName;
+    std::wstring processPath;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProc) {
+        wchar_t path[MAX_PATH] = {};
+        DWORD sz = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, path, &sz)) {
+            processPath = path;
+            std::wstring fp(path);
+            size_t pos = fp.find_last_of(L"\\/");
+            processName = (pos != std::wstring::npos) ? fp.substr(pos + 1) : fp;
+        }
+        CloseHandle(hProc);
+    }
+
+    auto* ctx = reinterpret_cast<AllWindowsEnumCtx*>(lParam);
+    bool alreadyBound = false;
+    for (const auto& b : *ctx->bound) {
+        if (b.pid == pid || (!b.processName.empty() && _wcsicmp(b.processName.c_str(), processName.c_str()) == 0)) {
+            alreadyBound = true;
+            break;
+        }
+    }
+    if (!alreadyBound) {
+        BoundWindowInfo info{ title, processName, pid, processPath };
+        ctx->cache->push_back(info);
+        SendMessageW(ctx->lstAll, LB_ADDSTRING, 0, (LPARAM)info.DisplayName().c_str());
+    }
+    return TRUE;
+}
+
+// 枚举回调上下文：异常置顶窗口收集
+struct TopmostEnumData {
+    std::vector<HWND>* windows;
+};
+
+// 枚举回调：收集异常置顶窗口（排除系统窗口），见 IDC_BTN_FIX_ZORDER
+static BOOL CALLBACK CollectTopmostWindowsProc(HWND hwnd, LPARAM lParam) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD) return TRUE;
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (!(exStyle & WS_EX_TOPMOST)) return TRUE;
+    if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) {
+        if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_POPUP) return TRUE;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return TRUE;
+    wchar_t className[256] = {};
+    GetClassNameW(hwnd, className, 256);
+    // 排除系统窗口类（任务栏、桌面等）
+    static const wchar_t* sysClasses[] = {
+        L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
+        L"NotifyIconOverflowWindow", L"TaskListOverlayWnd",
+        L"Windows.UI.Core.CoreWindow", L"ApplicationFrameWindow",
+        L"Progman", L"WorkerW",
+    };
+    for (auto sc : sysClasses) {
+        if (_wcsicmp(className, sc) == 0) return TRUE;
+    }
+    reinterpret_cast<TopmostEnumData*>(lParam)->windows->push_back(hwnd);
+    return TRUE;
+}
+
 // ===== 刷新所有窗口列表 =====
 // 枚举当前系统中所有可见窗口，排除已绑定的窗口，填充到列表框中
 void SettingsDialog::RefreshAllWindowsList(HWND hwnd, AppConfig& config) {
@@ -1689,53 +1771,8 @@ void SettingsDialog::RefreshAllWindowsList(HWND hwnd, AppConfig& config) {
     data->allWindowsCache.clear();
     SendMessageW(lstAll, LB_RESETCONTENT, 0, 0);
 
-    struct EnumCtx {
-        std::vector<BoundWindowInfo>* cache;
-        std::vector<BoundWindowInfo>* bound;
-        HWND lstAll;
-    };
-
-    EnumCtx ctx{ &data->allWindowsCache, &config.bossKeyWindows, lstAll };
-
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-        if (!IsWindowVisible(hwnd)) return TRUE;
-        wchar_t title[512] = {};
-        GetWindowTextW(hwnd, title, 512);
-        if (wcslen(title) == 0) return TRUE;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
-
-        std::wstring processName;
-        std::wstring processPath;
-        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (hProc) {
-            wchar_t path[MAX_PATH] = {};
-            DWORD sz = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProc, 0, path, &sz)) {
-                processPath = path;
-                std::wstring fp(path);
-                size_t pos = fp.find_last_of(L"\\/");
-                processName = (pos != std::wstring::npos) ? fp.substr(pos + 1) : fp;
-            }
-            CloseHandle(hProc);
-        }
-
-        auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
-        bool alreadyBound = false;
-        for (const auto& b : *ctx->bound) {
-            if (b.pid == pid || (!b.processName.empty() && _wcsicmp(b.processName.c_str(), processName.c_str()) == 0)) {
-                alreadyBound = true;
-                break;
-            }
-        }
-        if (!alreadyBound) {
-            BoundWindowInfo info{ title, processName, pid, processPath };
-            ctx->cache->push_back(info);
-            SendMessageW(ctx->lstAll, LB_ADDSTRING, 0, (LPARAM)info.DisplayName().c_str());
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&ctx));
+    AllWindowsEnumCtx ctx{ &data->allWindowsCache, &config.bossKeyWindows, lstAll };
+    EnumWindows(CollectAllWindowsProc, reinterpret_cast<LPARAM>(&ctx));
 }
 
 // 从所有窗口列表添加绑定（预留接口，当前未实现）
@@ -3047,38 +3084,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (confirm != IDYES) return 0;
 
             // 枚举所有置顶窗口，排除系统窗口后取消其置顶状态
-            struct EnumData {
-                std::vector<HWND>* windows;
-            };
             std::vector<HWND> topmostWindows;
-            EnumData ed{ &topmostWindows };
-            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-                if (!IsWindowVisible(hwnd)) return TRUE;
-                if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD) return TRUE;
-                LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                if (!(exStyle & WS_EX_TOPMOST)) return TRUE;
-                if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) {
-                    if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_POPUP) return TRUE;
-                }
-                DWORD pid = 0;
-                GetWindowThreadProcessId(hwnd, &pid);
-                if (pid == 0) return TRUE;
-                wchar_t className[256] = {};
-                GetClassNameW(hwnd, className, 256);
-                // 排除系统窗口类（任务栏、桌面等）
-                static const wchar_t* sysClasses[] = {
-                    L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
-                    L"NotifyIconOverflowWindow", L"TaskListOverlayWnd",
-                    L"Windows.UI.Core.CoreWindow", L"ApplicationFrameWindow",
-                    L"Progman", L"WorkerW",
-                };
-                for (auto sc : sysClasses) {
-                    if (_wcsicmp(className, sc) == 0) return TRUE;
-                }
-                auto* data = reinterpret_cast<EnumData*>(lParam);
-                data->windows->push_back(hwnd);
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&ed));
+            TopmostEnumData ed{ &topmostWindows };
+            EnumWindows(CollectTopmostWindowsProc, reinterpret_cast<LPARAM>(&ed));
 
             // 将所有异常置顶窗口设置为非置顶
             for (HWND w : topmostWindows) {

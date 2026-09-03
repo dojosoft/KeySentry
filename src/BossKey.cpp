@@ -352,6 +352,30 @@ void BossKey::ClearRecoverFile() {
     DeleteFileW(GetRecoverFilePath().c_str());
 }
 
+// 枚举回调上下文：按进程 ID + 标题子串查找窗口
+struct RecoverFindCtx {
+    DWORD pid;
+    const std::wstring* title;
+    bool found;
+};
+
+// 枚举回调：32 位下 GCC 的 lambda 无法隐式转换为 stdcall 的 WNDENUMPROC，
+// 故用显式 CALLBACK 约定的命名函数
+static BOOL CALLBACK RecoverFindWindowProc(HWND h, LPARAM lp) {
+    auto* ctx = reinterpret_cast<RecoverFindCtx*>(lp);
+    DWORD p = 0;
+    GetWindowThreadProcessId(h, &p);
+    if (p != ctx->pid) return TRUE;
+    wchar_t t[512] = {};
+    if (GetWindowTextW(h, t, 512) == 0) return TRUE;
+    if (wcsstr(t, ctx->title->c_str()) != nullptr) {
+        if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOWNORMAL);
+        ctx->found = true;
+        return FALSE;  // 找到即停止枚举
+    }
+    return TRUE;
+}
+
 // 恢复上次异常退出时被隐藏的窗口，返回成功恢复的窗口数
 // 优先用记录的窗口句柄（同一次会话内仍有效），失效则按进程 ID + 标题匹配
 int BossKey::RecoverOrphanedWindows() {
@@ -414,26 +438,8 @@ int BossKey::RecoverOrphanedWindows() {
 
         // 路径 2：句柄失效（跨会话/句柄被复用），按进程 ID + 标题子串匹配
         if (!done && !title.empty()) {
-            struct FindCtx {
-                DWORD pid;
-                const std::wstring* title;
-                bool found;
-            };
-            FindCtx fctx{ pid, &title, false };
-            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-                auto* ctx = reinterpret_cast<FindCtx*>(lp);
-                DWORD p = 0;
-                GetWindowThreadProcessId(h, &p);
-                if (p != ctx->pid) return TRUE;
-                wchar_t t[512] = {};
-                if (GetWindowTextW(h, t, 512) == 0) return TRUE;
-                if (wcsstr(t, ctx->title->c_str()) != nullptr) {
-                    if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOWNORMAL);
-                    ctx->found = true;
-                    return FALSE;  // 找到即停止枚举
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&fctx));
+            RecoverFindCtx fctx{ pid, &title, false };
+            EnumWindows(RecoverFindWindowProc, reinterpret_cast<LPARAM>(&fctx));
             done = fctx.found;
         }
 

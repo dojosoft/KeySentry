@@ -212,12 +212,9 @@ namespace WindowEnum {
         HWND lstAll;                            // 列表框控件句柄
     };
 
-    // 枚举所有可见的未绑定顶层窗口，结果存入 ctx.cache 和列表框
-    inline void EnumerateUnboundWindows(EnumWindowCtx& ctx) {
-        ctx.cache->clear();
-        if (ctx.lstAll) SendMessageW(ctx.lstAll, LB_RESETCONTENT, 0, 0);
-
-        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+    // 枚举回调：32 位下 GCC 的 lambda 无法隐式转换为 stdcall 的 WNDENUMPROC，
+    // 故用显式 CALLBACK 约定的命名函数
+    inline BOOL CALLBACK EnumUnboundProc(HWND hwnd, LPARAM lParam) {
             if (!IsWindowVisible(hwnd)) return TRUE;
             wchar_t title[512] = {};
             GetWindowTextW(hwnd, title, 512);
@@ -251,7 +248,13 @@ namespace WindowEnum {
                 }
             }
             return TRUE;
-        }, reinterpret_cast<LPARAM>(&ctx));
+    }
+
+    // 枚举所有可见的未绑定顶层窗口，结果存入 ctx.cache 和列表框
+    inline void EnumerateUnboundWindows(EnumWindowCtx& ctx) {
+        ctx.cache->clear();
+        if (ctx.lstAll) SendMessageW(ctx.lstAll, LB_RESETCONTENT, 0, 0);
+        EnumWindows(EnumUnboundProc, reinterpret_cast<LPARAM>(&ctx));
     }
 }
 
