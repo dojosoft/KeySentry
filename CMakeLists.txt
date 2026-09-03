@@ -47,5 +47,7 @@ if(MSVC)
     set_property(TARGET KeySentry PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 else()
     # -static: 全静态链接 libgcc/libstdc++/winpthread，产物仅依赖系统自带 DLL
-    target_link_options(KeySentry PRIVATE -municode -static -s)
+    # gc-sections: 链接期剔除未引用代码段，大幅减小静态链接产物体积
+    target_compile_options(KeySentry PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(KeySentry PRIVATE -municode -static -s -Wl,--gc-sections)
 endif()
