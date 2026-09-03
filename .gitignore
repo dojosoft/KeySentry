@@ -1,5 +1,6 @@
 # 构建产物
 build/
+build-*/
 release/
 *.obj
 *.exe
