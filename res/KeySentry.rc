@@ -1,4 +1,4 @@
-﻿#pragma code_page(65001)
+#pragma code_page(65001)
 
 #include "Resource.h"
 
@@ -20,8 +20,8 @@ IDI_APP ICON "KeySentry.ico"
 1 RT_MANIFEST "KeySentry.manifest"
 
 1 VERSIONINFO
-FILEVERSION 1,9,0,902
-PRODUCTVERSION 1,9,0,902
+FILEVERSION 1,10,0,903
+PRODUCTVERSION 1,10,0,903
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 FILEFLAGS 0
 FILEOS VOS_NT_WINDOWS32
@@ -34,12 +34,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Marvin"
             VALUE "FileDescription", "Key Sentry 键客"
-            VALUE "FileVersion", "1.9.0.0902"
+            VALUE "FileVersion", "1.10.0.0903"
             VALUE "InternalName", "KeySentry"
             VALUE "LegalCopyright", "Copyright 2026 Marvin 翁敏峰"
             VALUE "OriginalFilename", "KeySentry.exe"
             VALUE "ProductName", "Key Sentry 键客"
-            VALUE "ProductVersion", "1.9.0.0902"
+            VALUE "ProductVersion", "1.10.0.0903"
         END
     END
     BLOCK "VarFileInfo"
