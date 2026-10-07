@@ -1041,7 +1041,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.10.0.0905",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.20.0.1007",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
