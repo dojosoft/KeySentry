@@ -41,8 +41,8 @@ private:
     void LockWindow(HWND hwnd, DWORD pid);
     // 重新应用保护（恢复最小化的窗口、重新移除最小化按钮）
     void ReLockWindow(LockedWindow& lw);
-    // 检查指定窗口是否匹配保护规则
-    bool IsWindowMatched(HWND hwnd) const;
+    // 检查指定窗口是否匹配保护规则（cache 用于复用进程路径查询结果）
+    bool IsWindowMatched(HWND hwnd, ProcessUtils::PathCache& cache) const;
 
     bool m_enabled = false;                             // 是否启用
     std::vector<BoundWindowInfo> m_protectedWindows;    // 受保护窗口匹配规则

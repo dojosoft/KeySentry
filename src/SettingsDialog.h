@@ -37,8 +37,6 @@ public:
     // 从禁用按键列表中删除选中项
     static void RemoveDisabledKey(HWND hwnd, AppConfig& config);
 
-    // 添加一个窗口隐藏绑定窗口（弹出绑定对话框）
-    static void AddBossWindow(HWND hwnd, AppConfig& config);
     // 从窗口隐藏绑定列表中删除选中项
     static void RemoveBossWindow(HWND hwnd, AppConfig& config);
 
@@ -46,9 +44,6 @@ public:
     static void AddWindWindow(HWND hwnd, AppConfig& config);
     // 从窗口置顶绑定列表中删除选中项
     static void RemoveWindWindow(HWND hwnd, AppConfig& config);
-
-    // 从窗口列表中选择一个窗口并填入编辑框（预留接口）
-    static void SelectWindow(HWND hwnd, int listBoxId, int editId);
 
     // 开始捕获窗口隐藏热键（用户按下组合键后自动设置）
     static void StartHotKeyCapture(HWND hwnd);
@@ -64,8 +59,6 @@ public:
     static void RefreshDisabledKeyList(HWND hwnd, AppConfig& config);
     // 刷新窗口隐藏绑定列表视图的内容
     static void RefreshBossWindowList(HWND hwnd, AppConfig& config);
-    // 刷新所有窗口列表（用于绑定对话框中的可选窗口）
-    static void RefreshAllWindowsList(HWND hwnd, AppConfig& config);
     // 刷新窗口置顶绑定列表视图的内容
     static void RefreshWindWindowList(HWND hwnd, AppConfig& config);
 
@@ -84,27 +77,6 @@ public:
     // 显示虚拟键盘选择器对话框，返回选中的虚拟键码，0 表示取消
     static int ShowKeyboardPicker(HWND parent);
 
-    // 扫描系统中已被注册的全局热键，结果存入 scannedHotkeys
-    static void ScanHotkeys(HWND hwnd, AppConfig& config);
-    // 探测选中热键的归属程序（通过模拟按键触发后检测前台窗口变化）
-    static void ProbeHotkey(HWND hwnd, AppConfig& config);
-    // 将选中的已占用热键添加到禁用列表
-    static void DisableHotkey(HWND hwnd, AppConfig& config);
-    // 将选中的已禁用热键从禁用列表中移除（恢复启用）
-    static void EnableHotkey(HWND hwnd, AppConfig& config);
-    // 刷新系统热键列表视图的内容（支持过滤和搜索）
-    static void RefreshHotkeyList(HWND hwnd, AppConfig& config);
-    // 刷新已禁用热键列表（委托给 RefreshHotkeyList）
-    static void RefreshDisabledHotkeyList(HWND hwnd, AppConfig& config);
-
-    // 从所有窗口列表添加绑定（预留接口）
-    static void AddBindingFromAll(HWND hwnd, AppConfig& config);
-    // 移除绑定到所有窗口（委托给 RemoveBossWindow）
-    static void RemoveBindingToAll(HWND hwnd, AppConfig& config);
-    // 添加进程绑定（预留接口）
-    static void AddProcessBinding(HWND hwnd, AppConfig& config);
-    // 添加窗口绑定（预留接口）
-    static void AddWindowBinding(HWND hwnd, AppConfig& config);
     // 显示添加绑定的模态对话框，支持按进程名/窗口名/手动输入三种方式
     static void ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector<BoundWindowInfo>& boundWindows, const wchar_t* className);
 
@@ -119,13 +91,6 @@ public:
     // 显示自定义热键编辑对话框，editIndex=-1 表示新增，否则为编辑模式
     static void ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editIndex = -1);
 
-    // 扫描到的热键信息结构体
-    struct ScannedHotkey {
-        UINT mod;                   // 修饰键标志（MOD_ALT | MOD_CONTROL 等）
-        UINT vk;                    // 虚拟键码
-        std::wstring ownerName;     // 归属程序名称（探测后填充）
-    };
-
     // 对话框运行时数据结构体，存储在窗口的 GWLP_USERDATA 中
     struct DialogData {
         AppConfig* config;          // 指向原始配置的指针（用于取消时恢复）
@@ -138,7 +103,6 @@ public:
         bool capturingCloseHotKey;  // 是否正在捕获一键关闭程序热键
         UINT captureCloseMod;       // 捕获到的一键关闭热键修饰键
         UINT captureCloseVK;        // 捕获到的一键关闭热键虚拟键码
-        std::vector<ScannedHotkey> scannedHotkeys;  // 扫描到的系统热键列表
         std::vector<BoundWindowInfo> allWindowsCache; // 所有可选窗口的缓存
     };
 };

@@ -12,7 +12,6 @@
 
 // 外部函数声明
 extern void ShowAboutDialog(HWND parent);   // 显示关于对话框
-extern void SetHookSimulating(bool sim);    // 设置钩子模拟标志，防止模拟按键被自身钩子拦截
 extern void SetSettingsWnd(HWND wnd);       // 设置设置窗口句柄到全局，供主窗口消息处理使用
 
 // ===== 静态回调指针初始化 =====
@@ -29,6 +28,82 @@ void SettingsDialog::SetCaptureModeCallback(void (*callback)(bool)) {
 // 在配置被应用后调用，通知外部模块重新加载配置
 void SettingsDialog::SetApplyCallback(void (*callback)()) {
     s_applyCallback = callback;
+}
+
+// ===== 内联热键捕获的吞键钩子 =====
+// 老板键/关闭键/自定义热键的内联捕获共用：捕获期间安装临时低级键盘钩子，
+// 吞掉所有物理按键（含 Win+R/Win+D、开始菜单等系统快捷键），仅把按键信息
+// 以 WM_INLINE_CAPTURE_KEY 投递给捕获窗口，避免捕获操作本身触发系统动作
+static const UINT WM_INLINE_CAPTURE_KEY = WM_USER + 302;  // wParam=虚拟键码，lParam=修饰键组合(MOD_*)
+static HHOOK s_inlineCapHook = nullptr;  // 内联捕获吞键钩子
+static HWND s_inlineCapWnd = nullptr;    // 接收捕获按键的窗口
+static UINT s_inlineCapMods = 0;         // 钩子内自行跟踪的修饰键状态（按键被吞后 GetAsyncKeyState 不更新）
+
+// 按键按下/抬起时更新修饰键组合
+static void InlineCapUpdateMods(UINT vk, bool down) {
+    UINT bit = 0;
+    if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) bit = MOD_SHIFT;
+    else if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) bit = MOD_CONTROL;
+    else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) bit = MOD_ALT;
+    else if (vk == VK_LWIN || vk == VK_RWIN) bit = MOD_WIN;
+    if (bit) {
+        if (down) s_inlineCapMods |= bit;
+        else s_inlineCapMods &= ~bit;
+    }
+}
+
+// 判断虚拟键码是否为纯修饰键（捕获时需继续等待主键）
+static bool InlineCapIsModifier(int vk) {
+    return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+           vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+           vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+           vk == VK_LWIN || vk == VK_RWIN;
+}
+
+static LRESULT CALLBACK InlineCaptureHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && s_inlineCapWnd) {
+        auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        // 注入按键放行（程序自身的模拟输入不参与捕获）
+        if (!(kb->flags & LLKHF_INJECTED) &&
+            (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
+             wParam == WM_KEYUP || wParam == WM_SYSKEYUP)) {
+            bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+            InlineCapUpdateMods(kb->vkCode, down);
+            if (down) {
+                PostMessageW(s_inlineCapWnd, WM_INLINE_CAPTURE_KEY,
+                             (WPARAM)kb->vkCode, (LPARAM)s_inlineCapMods);
+            }
+            return 1;  // 吞掉物理按键：普通输入与系统快捷键均不会触发
+        }
+    }
+    return CallNextHookEx(s_inlineCapHook, nCode, wParam, lParam);
+}
+
+// 开始内联捕获：安装吞键钩子并通知全局键盘钩子放行（幂等，可在两项捕获间切换）
+static void BeginInlineCapture(HWND hwnd) {
+    s_inlineCapWnd = hwnd;
+    s_inlineCapMods = 0;
+    if (!s_inlineCapHook) {
+        s_inlineCapHook = SetWindowsHookExW(WH_KEYBOARD_LL, InlineCaptureHookProc,
+                                            GetModuleHandleW(nullptr), 0);
+    }
+    g_suppressHotkeys = true;  // 捕获期间抑制热键转发，避免捕获操作触发已注册热键
+    if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(true);
+}
+
+// 结束内联捕获：仅当钩子归属于 owner 时才卸载
+// （捕获过程中若其他对话框接管了钩子，此处不得误拆，否则该对话框的捕获会失效）
+static void EndInlineCapture(HWND owner) {
+    // 钩子已归属其他捕获窗口：交由该窗口收尾
+    if (s_inlineCapWnd && s_inlineCapWnd != owner) return;
+    if (s_inlineCapHook) {
+        UnhookWindowsHookEx(s_inlineCapHook);
+        s_inlineCapHook = nullptr;
+    }
+    s_inlineCapWnd = nullptr;
+    s_inlineCapMods = 0;
+    g_suppressHotkeys = false;
+    if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(false);
 }
 
 // ===== 对话框布局常量 =====
@@ -259,9 +334,11 @@ static const KbKey KB_KEYS[] = {
     {VK_NUMPAD3, L"3", 638, 128, 28, 28}, {VK_RETURN, L"Ent", 668, 128, 28, 56},
 
     {VK_LCONTROL, L"Ctrl", 0, 160, 44, 28}, {VK_LWIN, L"Win", 48, 160, 36, 28},
-    {VK_LMENU, L"Alt", 88, 160, 36, 28}, {VK_SPACE, L"Space", 128, 160, 198, 28},
-    {VK_RMENU, L"Alt", 330, 160, 36, 28}, {VK_RWIN, L"Win", 370, 160, 36, 28},
-    {VK_APPS, L"Menu", 410, 160, 36, 28}, {VK_RCONTROL, L"Ctrl", 450, 160, 42, 28},
+    // 注意：右 Ctrl 必须排在方向键左侧且不与 ←（x=456）重叠，
+    // 否则后创建的 ← 按钮会遮住右 Ctrl，导致鼠标无法选中它
+    {VK_LMENU, L"Alt", 88, 160, 36, 28}, {VK_SPACE, L"Space", 128, 160, 158, 28},
+    {VK_RMENU, L"Alt", 290, 160, 36, 28}, {VK_RWIN, L"Win", 330, 160, 36, 28},
+    {VK_APPS, L"Menu", 370, 160, 36, 28}, {VK_RCONTROL, L"Ctrl", 410, 160, 42, 28},
     {VK_LEFT, L"←", 456, 160, 36, 28}, {VK_DOWN, L"↓", 494, 160, 36, 28}, {VK_RIGHT, L"→", 532, 160, 36, 28},
     {VK_NUMPAD0, L"0", 578, 160, 58, 28}, {VK_DECIMAL, L".", 638, 160, 28, 28},
 
@@ -302,6 +379,14 @@ static LRESULT CALLBACK KbPickerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         }
         break;
     }
+    // Esc 取消（焦点在窗口自身时生效；焦点在按钮上时用下方"取消"按钮）
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) {
+            if (pd) pd->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         if (pd) pd->done = true;
         DestroyWindow(hwnd);
@@ -334,8 +419,8 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
         registered = true;
     }
 
-    // 计算窗口尺寸并居中显示
-    RECT rc = { 0, 0, 710, 260 };
+    // 计算窗口尺寸并居中显示（高度预留底部"取消"按钮）
+    RECT rc = { 0, 0, 710, 292 };
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
@@ -364,18 +449,31 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
         SendMessageW(btn, WM_SETFONT, (WPARAM)keyFont.get(), TRUE);
     }
 
+    // 底部"取消"按钮，提供明确的取消路径（点击后走 WM_COMMAND IDCANCEL）
+    HWND btnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     310, 240, 90, 26,
+                                     hwnd, (HMENU)(LONG_PTR)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(btnCancel, WM_SETFONT, (WPARAM)keyFont.get(), TRUE);
+
     // 模态消息循环
     {
         ModalGuard guard(parent);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        SetFocus(hwnd);   // 让 Esc 能被窗口自身收到
 
         MSG msg;
         while (!pd.done && IsWindow(hwnd)) {
             BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
             if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
             // 将热键消息转发给主窗口处理
-            if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
+            // 按键捕获期间丢弃 WM_HOTKEY，避免按下的组合同时触发已注册热键
+            if (msg.message == WM_HOTKEY) {
+                if (!g_suppressHotkeys && g_mainWnd && IsWindow(g_mainWnd))
+                    SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -384,358 +482,6 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
 
     return pd.selectedVK;
-}
-
-// ===== 热键扫描：修饰键组合列表 =====
-// 包含所有需要扫描的双修饰键及三修饰键组合（不含单修饰键，因为单修饰键+字母容易误判）
-static const UINT SCAN_MODS[] = {
-    MOD_ALT | MOD_CONTROL,
-    MOD_ALT | MOD_SHIFT,
-    MOD_CONTROL | MOD_SHIFT,
-    MOD_ALT | MOD_CONTROL | MOD_SHIFT,
-    MOD_WIN,
-    MOD_WIN | MOD_ALT,
-    MOD_WIN | MOD_CONTROL,
-    MOD_WIN | MOD_SHIFT,
-    MOD_WIN | MOD_ALT | MOD_CONTROL,
-    MOD_WIN | MOD_ALT | MOD_SHIFT,
-    MOD_WIN | MOD_CONTROL | MOD_SHIFT,
-    MOD_WIN | MOD_ALT | MOD_CONTROL | MOD_SHIFT,
-};
-static const int SCAN_MOD_COUNT = sizeof(SCAN_MODS) / sizeof(SCAN_MODS[0]);
-
-// ===== 热键扫描：虚拟键码列表 =====
-// 包含字母键 A-Z、功能键 F1-F12、数字键 0-9
-static const int SCAN_VKS[] = {
-    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A,
-    0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54,
-    0x55, 0x56, 0x57, 0x58, 0x59, 0x5A,
-    VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
-    VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-};
-static const int SCAN_VK_COUNT = sizeof(SCAN_VKS) / sizeof(SCAN_VKS[0]);
-
-// ===== 根据进程 ID 获取进程名称 =====
-static std::wstring GetProcessNameFromPid(DWORD pid) {
-    return ProcessUtils::GetProcessName(pid);
-}
-
-// ===== 判断热键是否安全可模拟 =====
-// 某些系统热键（如 Ctrl+Alt+Del、Win+L 等）模拟后会导致严重后果，
-// 此函数用于在探测热键归属程序前检查安全性
-static bool IsSafeHotkeyToSimulate(UINT mod, UINT vk) {
-    if ((mod & MOD_CONTROL) && (mod & MOD_ALT) && vk == VK_DELETE) return false;  // Ctrl+Alt+Del
-    if ((mod & MOD_WIN) && (vk == 'L')) return false;                              // Win+L 锁屏
-    if ((mod & MOD_ALT) && vk == VK_F4) return false;                              // Alt+F4 关闭
-    if ((mod & MOD_WIN) && (vk == 'D')) return false;                              // Win+D 桌面
-    if ((mod & MOD_CONTROL) && (mod & MOD_SHIFT) && vk == VK_ESCAPE) return false; // Ctrl+Shift+Esc 任务管理器
-    if ((mod & MOD_ALT) && vk == VK_TAB) return false;                             // Alt+Tab 切换
-    if ((mod & MOD_WIN) && (vk == 'R')) return false;                              // Win+R 运行
-    if ((mod & MOD_WIN) && (vk == 'E')) return false;                              // Win+E 资源管理器
-    if ((mod & MOD_WIN) && (vk == 'I')) return false;                              // Win+I 设置
-    if ((mod & MOD_WIN) && (vk == 'M')) return false;                              // Win+M 最小化
-    return true;
-}
-
-// ===== 识别热键归属程序 =====
-// 通过模拟发送热键组合，观察前台窗口是否变化来判断热键被哪个程序注册
-// 原理：模拟按键后等待 300ms，如果前台窗口发生变化，则新前台窗口即为热键注册者
-static std::wstring IdentifyHotkeyOwner(UINT mod, UINT vk) {
-    if (!IsSafeHotkeyToSimulate(mod, vk)) return L"";
-
-    // 检查是否为可能触发数据丢失的热键（如 Alt+F4、Ctrl+W 等关闭类热键）
-    // 同时检查是否为系统保护热键（如 Ctrl+Alt+Del、Win+L 等）
-    bool isDangerousClose = (mod & MOD_ALT) && vk == VK_F4;
-    bool isDangerousTabClose = (mod & MOD_CONTROL) && (vk == 'W' || vk == VK_F4);
-    bool isSystemProtected = !IsSafeHotkeyToSimulate(mod, vk);
-    if (isDangerousClose || isDangerousTabClose || isSystemProtected) {
-        int result = MessageBoxW(g_mainWnd,
-            L"该热键可能触发程序关闭、标签页关闭或系统功能，导致未保存数据丢失或系统不稳定。\n\n是否继续探测？",
-            L"安全确认", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-        if (result != IDYES) return L"";
-    }
-
-    // 记录当前前台窗口信息
-    HWND prevFG = GetForegroundWindow();
-    DWORD prevPid = 0;
-    if (prevFG) GetWindowThreadProcessId(prevFG, &prevPid);
-
-    // 构建模拟按键输入序列：按下修饰键 -> 按下主键 -> 释放主键 -> 释放修饰键
-    INPUT inputs[16] = {};
-    int idx = 0;
-    if (mod & MOD_CONTROL) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_CONTROL; idx++; }
-    if (mod & MOD_SHIFT) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_SHIFT; idx++; }
-    if (mod & MOD_ALT) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_MENU; idx++; }
-    if (mod & MOD_WIN) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_LWIN; idx++; }
-
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = (WORD)vk; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = (WORD)vk;
-    inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
-
-    if (mod & MOD_WIN) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_LWIN; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++; }
-    if (mod & MOD_ALT) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_MENU; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++; }
-    if (mod & MOD_SHIFT) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_SHIFT; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++; }
-    if (mod & MOD_CONTROL) { inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_CONTROL; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++; }
-
-    // 设置模拟标志防止钩子拦截，发送按键后等待 300ms 观察前台窗口变化
-    SetHookSimulating(true);
-    SendInput(idx, inputs, sizeof(INPUT));
-    Sleep(300);
-    SetHookSimulating(false);
-
-    // 检查前台窗口是否变化，如果变化则获取新窗口的进程名
-    HWND newFG = GetForegroundWindow();
-    std::wstring result;
-    if (newFG && newFG != prevFG) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(newFG, &pid);
-        result = GetProcessNameFromPid(pid);
-    }
-    // 恢复之前的前台窗口
-    if (prevFG && IsWindow(prevFG)) SetForegroundWindow(prevFG);
-    return result;
-}
-
-// ===== 扫描系统热键 =====
-// 遍历所有修饰键+虚拟键组合，尝试注册全局热键，
-// 如果注册失败（ERROR_HOTKEY_ALREADY_REGISTERED），说明该热键已被其他程序占用
-void SettingsDialog::ScanHotkeys(HWND hwnd, AppConfig& config) {
-    auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    data->scannedHotkeys.clear();
-
-    HWND mainWnd = GetParent(hwnd);
-    int tempId = 10000; // 临时热键 ID 起始值，避免与现有热键 ID 冲突
-
-    for (int m = 0; m < SCAN_MOD_COUNT; m++) {
-        for (int k = 0; k < SCAN_VK_COUNT; k++) {
-            UINT mod = SCAN_MODS[m];
-            int vk = SCAN_VKS[k];
-
-            // 跳过本程序已注册的窗口隐藏热键
-            if (config.bossKeyEnabled && mod == config.bossKeyMod && (UINT)vk == config.bossKeyVK) {
-                continue;
-            }
-            // 跳过本程序已注册的一键关闭程序热键
-            if (config.bossKeyEnabled && mod == config.bossKeyCloseMod && (UINT)vk == config.bossKeyCloseVK) {
-                continue;
-            }
-            // 跳过本程序已注册的自定义热键
-            if (config.customHotkeysEnabled) {
-                bool isCustom = false;
-                for (const auto& hk : config.customHotkeys) {
-                    if (hk.mod == mod && hk.vk == (UINT)vk) { isCustom = true; break; }
-                }
-                if (isCustom) continue;
-            }
-
-            // 尝试注册热键，如果失败说明已被占用
-            if (!RegisterHotKey(mainWnd, tempId, mod, vk)) {
-                DWORD err = GetLastError();
-                if (err == ERROR_HOTKEY_ALREADY_REGISTERED) {
-                    ScannedHotkey sh;
-                    sh.mod = mod;
-                    sh.vk = (UINT)vk;
-                    sh.ownerName = L"";
-                    data->scannedHotkeys.push_back(sh);
-                }
-            } else {
-                // 注册成功说明未被占用，立即注销
-                UnregisterHotKey(mainWnd, tempId);
-            }
-            tempId++;
-        }
-    }
-
-    RefreshHotkeyList(hwnd, config);
-}
-
-// ===== 获取热键列表选中项的真实数据下标 =====
-// 列表在过滤/搜索后显示行号与 scannedHotkeys 向量下标错位，
-// 因此插入时把真实下标存入 lParam，操作时经 lParam 取回
-static int GetSelectedHotkeyIndex(HWND lv, const std::vector<SettingsDialog::ScannedHotkey>& hotkeys) {
-    int sel = (int)SendMessageW(lv, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-    if (sel < 0) return -1;
-    LVITEMW item = {};
-    item.mask = LVIF_PARAM;
-    item.iItem = sel;
-    if (!SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&item)) return -1;
-    int idx = (int)item.lParam;
-    if (idx < 0 || idx >= (int)hotkeys.size()) return -1;
-    return idx;
-}
-
-// ===== 探测热键归属程序 =====
-// 选中一个已占用的热键后，通过模拟按键来识别注册该热键的程序
-void SettingsDialog::ProbeHotkey(HWND hwnd, AppConfig& config) {
-    auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    HWND lv = GetDlgItem(hwnd, IDC_LV_HOTKEYS);
-    int sel = GetSelectedHotkeyIndex(lv, data->scannedHotkeys);
-    if (sel < 0) {
-        MessageBoxW(hwnd, L"请先选择一个热键",
-                     L"提示", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    auto& sh = data->scannedHotkeys[sel];
-    // 系统保护的热键无法模拟探测
-    if (!IsSafeHotkeyToSimulate(sh.mod, sh.vk)) {
-        sh.ownerName = L"系统保护";
-        RefreshHotkeyList(hwnd, config);
-        return;
-    }
-
-    // 提示用户即将模拟按键，可能会短暂激活该热键对应的功能
-    int result = MessageBoxW(hwnd,
-        L"即将短暂模拟该热键以识别注册程序，可能会短暂激活该功能。是否继续？",
-        L"探测热键",
-        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-    if (result != IDYES) return;
-
-    // 执行探测
-    sh.ownerName = IdentifyHotkeyOwner(sh.mod, sh.vk);
-    if (sh.ownerName.empty()) {
-        sh.ownerName = L"[未知]";
-    }
-
-    // 清理探测过程中可能产生的消息
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        // WM_QUIT 不能被 Dispatch，需重新投递以保留退出请求
-        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
-        if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    RefreshHotkeyList(hwnd, config);
-}
-
-// ===== 禁用选中的热键 =====
-// 将选中的已占用热键添加到禁用列表，使其不再生效
-void SettingsDialog::DisableHotkey(HWND hwnd, AppConfig& config) {
-    auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    HWND lv = GetDlgItem(hwnd, IDC_LV_HOTKEYS);
-    int sel = GetSelectedHotkeyIndex(lv, data->scannedHotkeys);
-    if (sel < 0) return;
-
-    auto hk = data->scannedHotkeys[sel];
-    // 检查是否已在禁用列表中
-    bool exists = false;
-    for (auto& d : config.disabledHotkeys) {
-        if (d.first == hk.mod && d.second == hk.vk) { exists = true; break; }
-    }
-    if (exists) return;
-
-    // 检查是否与窗口隐藏热键冲突
-    if (config.bossKeyEnabled) {
-        if (hk.mod == config.bossKeyMod && hk.vk == config.bossKeyVK) {
-            MessageBoxW(hwnd, L"该热键与窗口隐藏冲突，无法禁用",
-                         L"提示", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        if (hk.mod == config.bossKeyCloseMod && hk.vk == config.bossKeyCloseVK) {
-            MessageBoxW(hwnd, L"该热键与一键关闭程序热键冲突，无法禁用",
-                         L"提示", MB_OK | MB_ICONWARNING);
-            return;
-        }
-    }
-
-    config.disabledHotkeys.push_back({hk.mod, hk.vk});
-    RefreshHotkeyList(hwnd, config);
-}
-
-// ===== 启用选中的热键 =====
-// 将选中的已禁用热键从禁用列表中移除，恢复其功能
-void SettingsDialog::EnableHotkey(HWND hwnd, AppConfig& config) {
-    auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    HWND lv = GetDlgItem(hwnd, IDC_LV_HOTKEYS);
-    int sel = GetSelectedHotkeyIndex(lv, data->scannedHotkeys);
-    if (sel < 0) return;
-
-    auto hk = data->scannedHotkeys[sel];
-    for (auto it = config.disabledHotkeys.begin(); it != config.disabledHotkeys.end(); ++it) {
-        if (it->first == hk.mod && it->second == hk.vk) {
-            config.disabledHotkeys.erase(it);
-            RefreshHotkeyList(hwnd, config);
-            return;
-        }
-    }
-}
-
-// ===== 刷新系统热键列表视图 =====
-// 根据过滤条件和搜索关键词更新热键列表视图的内容
-void SettingsDialog::RefreshHotkeyList(HWND hwnd, AppConfig& config) {
-    auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    HWND lv = GetDlgItem(hwnd, IDC_LV_HOTKEYS);
-    if (!lv) return;
-    SendMessageW(lv, LVM_DELETEALLITEMS, 0, 0);
-
-    // 获取过滤条件：0=全部, 1=已占用, 2=已禁用, 3=系统保护
-    HWND cbo = GetDlgItem(hwnd, IDC_CBO_HKFILTER);
-    int filter = cbo ? (int)SendMessageW(cbo, CB_GETCURSEL, 0, 0) : 0;
-
-    // 获取搜索关键词（不区分大小写）
-    wchar_t searchText[128] = {};
-    HWND edt = GetDlgItem(hwnd, IDC_EDT_HKSEARCH);
-    if (edt) GetWindowTextW(edt, searchText, 128);
-    std::wstring search = searchText;
-    for (auto& c : search) c = towlower(c);
-
-    int idx = 0;
-    for (size_t i = 0; i < data->scannedHotkeys.size(); i++) {
-        const auto& hk = data->scannedHotkeys[i];
-        // 判断热键状态
-        bool isDisabled = false;
-        for (auto& d : config.disabledHotkeys) {
-            if (d.first == hk.mod && d.second == hk.vk) { isDisabled = true; break; }
-        }
-        bool isProtected = !IsSafeHotkeyToSimulate(hk.mod, hk.vk);
-
-        // 根据过滤条件筛选
-        if (filter == 1 && (isDisabled || isProtected)) continue;
-        if (filter == 2 && !isDisabled) continue;
-        if (filter == 3 && !isProtected) continue;
-
-        std::wstring keyName = FormatHotKey(hk.mod, hk.vk);
-        std::wstring owner = hk.ownerName.empty() ? L"" : hk.ownerName;
-        std::wstring status;
-        if (isDisabled) status = L"已禁用";
-        else if (isProtected) status = L"系统保护";
-        else status = L"已占用";
-
-        // 搜索关键词匹配（在热键名、归属程序、状态中搜索）
-        if (!search.empty()) {
-            std::wstring combined = keyName + owner + status;
-            for (auto& c : combined) c = towlower(c);
-            if (combined.find(search) == std::wstring::npos) continue;
-        }
-
-        // 插入列表视图项（lParam 保存真实数据下标，过滤/搜索后行号与下标会错位）
-        LVITEMW item = {};
-        item.mask = LVIF_TEXT | LVIF_PARAM;
-        item.iItem = idx;
-        item.iSubItem = 0;
-        item.lParam = (LPARAM)i;
-        item.pszText = const_cast<LPWSTR>(keyName.c_str());
-        SendMessageW(lv, LVM_INSERTITEMW, 0, (LPARAM)&item);
-
-        item.iSubItem = 1;
-        item.pszText = const_cast<LPWSTR>(owner.c_str());
-        SendMessageW(lv, LVM_SETITEMW, 0, (LPARAM)&item);
-
-        item.iSubItem = 2;
-        item.pszText = const_cast<LPWSTR>(status.c_str());
-        SendMessageW(lv, LVM_SETITEMW, 0, (LPARAM)&item);
-
-        idx++;
-    }
-}
-
-// ===== 刷新已禁用热键列表 =====
-// 委托给 RefreshHotkeyList，因为禁用热键列表和热键列表共享同一个视图
-void SettingsDialog::RefreshDisabledHotkeyList(HWND hwnd, AppConfig& config) {
-    RefreshHotkeyList(hwnd, config);
 }
 
 // ===== 显示设置对话框 =====
@@ -859,52 +605,73 @@ INT_PTR SettingsDialog::Show(HWND parent, AppConfig& config) {
         BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
         if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
         // 将热键消息转发给主窗口处理
-        if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
-        // 处理窗口隐藏热键捕获
-        if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && data.capturingHotKey) {
-            UINT mod = WindowUtils::GetCurrentModifiers();
-            int vk = (int)msg.wParam;
-            if (vk == VK_ESCAPE) {
-                // Esc 取消捕获，恢复显示原热键
-                data.capturingHotKey = false;
-                SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETHOTKEY),
-                               FormatHotKey(data.workingCopy.bossKeyMod, data.workingCopy.bossKeyVK).c_str());
-            } else if (vk != VK_CONTROL && vk != VK_SHIFT && vk != VK_MENU &&
-                vk != VK_LWIN && vk != VK_RWIN) {
-                // 非纯修饰键：记录捕获到的热键组合
-                data.captureMod = mod;
-                data.captureVK = (UINT)vk;
-                data.capturingHotKey = false;
-                data.workingCopy.bossKeyMod = mod;
-                data.workingCopy.bossKeyVK = (UINT)vk;
-                SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETHOTKEY),
-                               FormatHotKey(mod, (UINT)vk).c_str());
+        // 捕获热键期间丢弃 WM_HOTKEY：RegisterHotKey 不受键盘钩子影响，
+        // 若此时按下的组合正好是已注册热键，会触发热键动作打断捕获
+        if (msg.message == WM_HOTKEY) {
+            if (!g_suppressHotkeys && !(data.capturingHotKey || data.capturingCloseHotKey)) {
+                if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
             }
             continue;
         }
-        // 处理一键关闭程序热键捕获
-        if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && data.capturingCloseHotKey) {
-            UINT mod = WindowUtils::GetCurrentModifiers();
+        // 处理内联热键捕获（按键由吞键钩子以 WM_INLINE_CAPTURE_KEY 投递）
+        if (msg.message == WM_INLINE_CAPTURE_KEY &&
+            (data.capturingHotKey || data.capturingCloseHotKey)) {
+            UINT mod = (UINT)msg.lParam;
             int vk = (int)msg.wParam;
+            // 纯修饰键：继续等待主键
+            if (InlineCapIsModifier(vk)) continue;
+
+            HWND btn = GetDlgItem(hwnd, data.capturingHotKey ? IDC_BTN_SETHOTKEY : IDC_BTN_SETCLOSEHOTKEY);
             if (vk == VK_ESCAPE) {
-                data.capturingCloseHotKey = false;
-                SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY),
-                               FormatHotKey(data.workingCopy.bossKeyCloseMod, data.workingCopy.bossKeyCloseVK).c_str());
-            } else if (vk != VK_CONTROL && vk != VK_SHIFT && vk != VK_MENU &&
-                vk != VK_LWIN && vk != VK_RWIN) {
+                // Esc 取消捕获，恢复显示原热键
+                if (data.capturingHotKey) {
+                    data.capturingHotKey = false;
+                    // 仅当另一项捕获也未进行时才卸载吞键钩子，避免相互干扰
+                    if (!data.capturingCloseHotKey) EndInlineCapture(hwnd);
+                    SetWindowTextW(btn,
+                                   FormatHotKey(data.workingCopy.bossKeyMod, data.workingCopy.bossKeyVK).c_str());
+                } else {
+                    data.capturingCloseHotKey = false;
+                    if (!data.capturingHotKey) EndInlineCapture(hwnd);
+                    SetWindowTextW(btn,
+                                   FormatHotKey(data.workingCopy.bossKeyCloseMod, data.workingCopy.bossKeyCloseVK).c_str());
+                }
+            } else if (mod == 0) {
+                // 拒绝无修饰键的裸键：注册后会在全系统劫持该普通按键（如 A/回车）
+                SetWindowTextW(btn, L"请使用 修饰键+按键 的组合...");
+            } else if (data.capturingHotKey) {
+                // 记录捕获到的窗口隐藏热键组合
+                data.captureMod = mod;
+                data.captureVK = (UINT)vk;
+                data.capturingHotKey = false;
+                if (!data.capturingCloseHotKey) EndInlineCapture(hwnd);
+                data.workingCopy.bossKeyMod = mod;
+                data.workingCopy.bossKeyVK = (UINT)vk;
+                SetWindowTextW(btn, FormatHotKey(mod, (UINT)vk).c_str());
+            } else {
+                // 记录捕获到的一键关闭热键组合
                 data.captureCloseMod = mod;
                 data.captureCloseVK = (UINT)vk;
                 data.capturingCloseHotKey = false;
+                if (!data.capturingHotKey) EndInlineCapture(hwnd);
                 data.workingCopy.bossKeyCloseMod = mod;
                 data.workingCopy.bossKeyCloseVK = (UINT)vk;
-                SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY),
-                               FormatHotKey(mod, (UINT)vk).c_str());
+                SetWindowTextW(btn, FormatHotKey(mod, (UINT)vk).c_str());
             }
             continue;
         }
         if (!IsWindow(hwnd)) break;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    // 兜底：捕获过程中若对话框被关闭，复位捕获状态并卸载吞键钩子，
+    // 避免键盘钩子长期放行/吞掉按键；EndInlineCapture 内部按归属判断，
+    // 若钩子已被其他捕获窗口接管则不会误拆
+    if (data.capturingHotKey || data.capturingCloseHotKey || s_inlineCapWnd == hwnd) {
+        data.capturingHotKey = false;
+        data.capturingCloseHotKey = false;
+        EndInlineCapture(hwnd);
     }
 
     // 兜底：异常退出路径（GetMessage 返回 0/-1）下窗口可能仍存活，
@@ -1013,10 +780,41 @@ void SettingsDialog::UpdateRemapState(HWND hwnd, bool enabled) {
     if (btnDel) EnableWindow(btnDel, enabled);
 }
 
+// ===== 取消进行中的内联热键捕获 =====
+// 捕获只用键盘钩子拦键盘，鼠标仍可操作，因此用户可能在捕获过程中切换选项卡、
+// 点击"重置"或打开其他对话框。这些操作会脱离捕获上下文（捕获按钮可能被销毁），
+// 若不取消，吞键钩子会继续吞掉全系统按键且界面无任何提示。
+// 仅复位捕获标志、恢复按钮文本（按钮存在时）并卸载吞键钩子。
+static void CancelInlineCapture(SettingsDialog::DialogData* data, HWND hwnd) {
+    if (!data || (!data->capturingHotKey && !data->capturingCloseHotKey)) return;
+
+    if (data->capturingHotKey) {
+        data->capturingHotKey = false;
+        HWND btn = GetDlgItem(hwnd, IDC_BTN_SETHOTKEY);
+        if (btn) {
+            SetWindowTextW(btn, SettingsDialog::FormatHotKey(
+                data->workingCopy.bossKeyMod, data->workingCopy.bossKeyVK).c_str());
+        }
+    }
+    if (data->capturingCloseHotKey) {
+        data->capturingCloseHotKey = false;
+        HWND btn = GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY);
+        if (btn) {
+            SetWindowTextW(btn, SettingsDialog::FormatHotKey(
+                data->workingCopy.bossKeyCloseMod, data->workingCopy.bossKeyCloseVK).c_str());
+        }
+    }
+    EndInlineCapture(hwnd);
+}
+
 // ===== 切换选项卡页面 =====
 // 保存当前页面状态，销毁旧控件，根据新索引创建对应的页面控件
 void SettingsDialog::SwitchTab(HWND hwnd, int tabIndex, AppConfig& config) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    // 切页会销毁当前页面的捕获按钮，先取消进行中的捕获，
+    // 避免捕获态残留导致键盘被持续吞掉、且下一次按键静默改写老板键
+    CancelInlineCapture(data, hwnd);
 
     // 如果当前有已选中的选项卡且不是目标选项卡，先保存当前页面状态
     if (data->currentTab >= 0 && data->currentTab != tabIndex) {
@@ -1309,64 +1107,12 @@ void SettingsDialog::SwitchTab(HWND hwnd, int tabIndex, AppConfig& config) {
     }
 
     case 3: { // ===== 热键管理页面 =====
-        makeButton(IDC_BTN_SCANHOTKEYS, L"扫描系统热键", PAGE_X, y, smallBtnW + 20, btnH);
-        makeLabel(L"过滤:", PAGE_X + smallBtnW + 30, y, 40, btnH);
-        CreateWindowExW(0, L"COMBOBOX", L"",
-                         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                         PAGE_X + smallBtnW + 72, y, 100, 200,
-                         hwnd, (HMENU)IDC_CBO_HKFILTER, GetModuleHandleW(nullptr), nullptr);
-        {
-            HWND cbo = GetDlgItem(hwnd, IDC_CBO_HKFILTER);
-            SendMessageW(cbo, CB_ADDSTRING, 0, (LPARAM)L"全部");
-            SendMessageW(cbo, CB_ADDSTRING, 0, (LPARAM)L"已占用");
-            SendMessageW(cbo, CB_ADDSTRING, 0, (LPARAM)L"已禁用");
-            SendMessageW(cbo, CB_ADDSTRING, 0, (LPARAM)L"系统保护");
-            SendMessageW(cbo, CB_SETCURSEL, 0, 0);
-            SetControlFont(cbo, font);
-        }
-
-        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                         PAGE_X + smallBtnW + 180, y, PAGE_W - smallBtnW - 190, lineH - 2,
-                         hwnd, (HMENU)IDC_EDT_HKSEARCH, GetModuleHandleW(nullptr), nullptr);
-        SetControlFont(GetDlgItem(hwnd, IDC_EDT_HKSEARCH), font);
-        y += btnH + 6;
-
-        int lvH = (PAGE_Y + PAGE_H - y - btnH * 2 - 60) / 2;
-        if (lvH < 80) lvH = 80;
-        HWND lv = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                                     WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER,
-                                    PAGE_X, y, PAGE_W - 10, lvH,
-                                    hwnd, (HMENU)IDC_LV_HOTKEYS, GetModuleHandleW(nullptr), nullptr);
-        SetControlFont(lv, font);
-        SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        ListView_SetBkColor(lv, RGB(255, 255, 255));
-        ListView_SetTextColor(lv, GetSysColor(COLOR_WINDOWTEXT));
-        ListView_SetTextBkColor(lv, RGB(255, 255, 255));
-
-        LVCOLUMNW col = {};
-        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
-        col.fmt = LVCFMT_LEFT;
-        col.cx = 160; col.pszText = const_cast<LPWSTR>(L"热键");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
-        col.cx = 140; col.pszText = const_cast<LPWSTR>(L"归属程序");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
-        col.cx = 80; col.pszText = const_cast<LPWSTR>(L"状态");
-        SendMessageW(lv, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
-
-        y += lvH + 6;
+        makeChk(IDC_CHK_CUSTOM_HK_ENABLE, L"启用自定义热键", PAGE_X, y, PAGE_W - 20, config.customHotkeysEnabled);
+        y += lineH + 8;
 
         int customBtnW = (PAGE_W - 40) / 4;
-        makeButton(IDC_BTN_PROBEHOTKEY, L"探测所属程序", PAGE_X, y, customBtnW, btnH);
-        makeButton(IDC_BTN_DISABLEHOTKEY, L"禁用选中热键", PAGE_X + customBtnW + 10, y, customBtnW, btnH);
-        makeButton(IDC_BTN_ENABLEHOTKEY, L"启用选中热键", PAGE_X + (customBtnW + 10) * 2, y, customBtnW, btnH);
-        y += btnH + 8;
-
-        makeChk(IDC_CHK_CUSTOM_HK_ENABLE, L"启用自定义热键", PAGE_X, y, PAGE_W - 20, config.customHotkeysEnabled);
-        y += lineH + 4;
-
         int customLvH = PAGE_Y + PAGE_H - y - btnH - 16;
-        if (customLvH < 40) customLvH = 40;
+        if (customLvH < 60) customLvH = 60;
         HWND customLv = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                          WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER,
                                          PAGE_X, y, PAGE_W - 10, customLvH,
@@ -1400,7 +1146,6 @@ void SettingsDialog::SwitchTab(HWND hwnd, int tabIndex, AppConfig& config) {
             EnableWindow(GetDlgItem(hwnd, IDC_BTN_DEL_CUSTOMHK), FALSE);
         }
 
-        RefreshHotkeyList(hwnd, config);
         RefreshCustomHotkeyList(hwnd, config);
         break;
     }
@@ -1677,55 +1422,6 @@ void SettingsDialog::RefreshBossWindowList(HWND hwnd, AppConfig& config) {
     }
 }
 
-// 枚举回调上下文：所有窗口列表
-struct AllWindowsEnumCtx {
-    std::vector<BoundWindowInfo>* cache;
-    std::vector<BoundWindowInfo>* bound;
-    HWND lstAll;
-};
-
-// 枚举回调：32 位下 GCC 的 lambda 无法隐式转换为 stdcall 的 WNDENUMPROC，
-// 故用显式 CALLBACK 约定的命名函数
-static BOOL CALLBACK CollectAllWindowsProc(HWND hwnd, LPARAM lParam) {
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    wchar_t title[512] = {};
-    GetWindowTextW(hwnd, title, 512);
-    if (wcslen(title) == 0) return TRUE;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
-
-    std::wstring processName;
-    std::wstring processPath;
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (hProc) {
-        wchar_t path[MAX_PATH] = {};
-        DWORD sz = MAX_PATH;
-        if (QueryFullProcessImageNameW(hProc, 0, path, &sz)) {
-            processPath = path;
-            std::wstring fp(path);
-            size_t pos = fp.find_last_of(L"\\/");
-            processName = (pos != std::wstring::npos) ? fp.substr(pos + 1) : fp;
-        }
-        CloseHandle(hProc);
-    }
-
-    auto* ctx = reinterpret_cast<AllWindowsEnumCtx*>(lParam);
-    bool alreadyBound = false;
-    for (const auto& b : *ctx->bound) {
-        if (b.pid == pid || (!b.processName.empty() && _wcsicmp(b.processName.c_str(), processName.c_str()) == 0)) {
-            alreadyBound = true;
-            break;
-        }
-    }
-    if (!alreadyBound) {
-        BoundWindowInfo info{ title, processName, pid, processPath };
-        ctx->cache->push_back(info);
-        SendMessageW(ctx->lstAll, LB_ADDSTRING, 0, (LPARAM)info.DisplayName().c_str());
-    }
-    return TRUE;
-}
-
 // 枚举回调上下文：异常置顶窗口收集
 struct TopmostEnumData {
     std::vector<HWND>* windows;
@@ -1757,39 +1453,6 @@ static BOOL CALLBACK CollectTopmostWindowsProc(HWND hwnd, LPARAM lParam) {
     }
     reinterpret_cast<TopmostEnumData*>(lParam)->windows->push_back(hwnd);
     return TRUE;
-}
-
-// ===== 刷新所有窗口列表 =====
-// 枚举当前系统中所有可见窗口，排除已绑定的窗口，填充到列表框中
-void SettingsDialog::RefreshAllWindowsList(HWND hwnd, AppConfig& config) {
-    HWND lstAll = GetDlgItem(hwnd, IDC_LST_ALL_WINDOWS);
-    if (!lstAll) return;
-
-    auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    if (!data) return;
-
-    data->allWindowsCache.clear();
-    SendMessageW(lstAll, LB_RESETCONTENT, 0, 0);
-
-    AllWindowsEnumCtx ctx{ &data->allWindowsCache, &config.bossKeyWindows, lstAll };
-    EnumWindows(CollectAllWindowsProc, reinterpret_cast<LPARAM>(&ctx));
-}
-
-// 从所有窗口列表添加绑定（预留接口，当前未实现）
-void SettingsDialog::AddBindingFromAll(HWND hwnd, AppConfig& config) {
-}
-
-// 移除绑定到所有窗口（委托给 RemoveBossWindow）
-void SettingsDialog::RemoveBindingToAll(HWND hwnd, AppConfig& config) {
-    RemoveBossWindow(hwnd, config);
-}
-
-// 添加进程绑定（预留接口，当前未实现）
-void SettingsDialog::AddProcessBinding(HWND hwnd, AppConfig& config) {
-}
-
-// 添加窗口绑定（预留接口，当前未实现）
-void SettingsDialog::AddWindowBinding(HWND hwnd, AppConfig& config) {
 }
 
 // ===== 刷新窗口置顶绑定列表视图 =====
@@ -1963,6 +1626,7 @@ static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar
 
     // 通知进入捕获模式
     if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(true);
+    g_suppressHotkeys = true;  // 捕获期间抑制热键转发
 
     // 安装低级键盘钩子
     s_captureKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, CaptureKeyHookProc,
@@ -1977,7 +1641,12 @@ static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar
         while (!data.done && IsWindow(hwnd)) {
             BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
             if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
-            if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
+            // 按键捕获期间丢弃 WM_HOTKEY，避免按下的组合同时触发已注册热键
+            if (msg.message == WM_HOTKEY) {
+                if (!g_suppressHotkeys && g_mainWnd && IsWindow(g_mainWnd))
+                    SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1992,6 +1661,8 @@ static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar
 
     // 通知退出捕获模式
     if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(false);
+    // 仅在本对话框之外已无内联捕获时解除抑制（内联捕获可能嵌套于本对话框之下）
+    g_suppressHotkeys = (s_inlineCapHook != nullptr);
 
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
 
@@ -2082,10 +1753,6 @@ void SettingsDialog::RemoveRemapEntry(HWND hwnd, AppConfig& config) {
         config.keyRemappings.erase(config.keyRemappings.begin() + sel);
         RefreshRemapList(hwnd, config);
     }
-}
-
-// 添加窗口隐藏绑定窗口（预留接口）
-void SettingsDialog::AddBossWindow(HWND hwnd, AppConfig& config) {
 }
 
 // ===== 添加绑定对话框相关定义 =====
@@ -2347,7 +2014,12 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
         while (IsWindow(dlg)) {
             BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
             if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
-            if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
+            // 按键捕获期间丢弃 WM_HOTKEY，避免按下的组合同时触发已注册热键
+            if (msg.message == WM_HOTKEY) {
+                if (!g_suppressHotkeys && g_mainWnd && IsWindow(g_mainWnd))
+                    SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -2374,7 +2046,6 @@ void SettingsDialog::RemoveBossWindow(HWND hwnd, AppConfig& config) {
     if (sel < (int)config.bossKeyWindows.size()) {
         config.bossKeyWindows.erase(config.bossKeyWindows.begin() + sel);
         RefreshBossWindowList(hwnd, config);
-        RefreshAllWindowsList(hwnd, config);
     }
 }
 
@@ -2404,10 +2075,6 @@ static BOOL CALLBACK EnumSelWindowsProc(HWND hwnd, LPARAM lParam) {
     auto* data = reinterpret_cast<EnumSelData*>(lParam);
     SendMessageW(data->listHwnd, LB_ADDSTRING, 0, (LPARAM)title);
     return TRUE;
-}
-
-// 从窗口列表中选择窗口并填入编辑框（预留接口，当前未实现）
-void SettingsDialog::SelectWindow(HWND hwnd, int listBoxId, int editId) {
 }
 
 // ===== 自定义热键对话框相关定义 =====
@@ -2472,15 +2139,15 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 return 0;
             }
 
-            // 主键必须有效：未点捕获按钮时尝试解析手输文本，防止保存 vk=0 的无效热键
-            if (ahd->captureVK == 0) {
-                UINT parsedVK = (UINT)AppConfig::NameToVK(keyText);
-                if (parsedVK == 0) {
-                    MessageBoxW(hwnd, L"主键无效，请点击\"捕获快捷键\"按钮设置主键",
-                                 L"提示", MB_OK | MB_ICONWARNING);
-                    return 0;
-                }
+            // 主键取值：优先采用文本框当前内容（支持手动修改），
+            // 无法解析时回退到捕获值；两者均无效则拒绝保存，防止 vk=0 的无效热键
+            UINT parsedVK = (UINT)AppConfig::NameToVK(keyText);
+            if (parsedVK != 0) {
                 ahd->captureVK = parsedVK;
+            } else if (ahd->captureVK == 0) {
+                MessageBoxW(hwnd, L"主键无效，请点击\"捕获快捷键\"按钮设置主键",
+                             L"提示", MB_OK | MB_ICONWARNING);
+                return 0;
             }
 
             // 检查是否至少选择了一个修饰键
@@ -2555,6 +2222,12 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             if (ahd->isEdit && ahd->editIndex >= 0 && ahd->editIndex < (int)ahd->workingCopy->customHotkeys.size()) {
                 ahd->workingCopy->customHotkeys[ahd->editIndex] = hk;
             } else {
+                // 上限校验：超过注册上限的热键会被静默忽略，提前提示避免用户困惑
+                if ((int)ahd->workingCopy->customHotkeys.size() >= MAX_CUSTOM_HOTKEYS) {
+                    MessageBoxW(hwnd, L"自定义热键数量已达上限（100 个），无法继续添加。",
+                                 L"提示", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
                 ahd->workingCopy->customHotkeys.push_back(hk);
             }
             ahd->confirmed = true;
@@ -2565,8 +2238,9 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             DestroyWindow(hwnd);
             return 0;
         case IDC_BTN_HK_CAPTURE:
-            // 开始捕获热键
+            // 开始捕获热键：安装吞键钩子，避免按键被全局钩子吞掉或触发系统快捷键
             ahd->capturing = true;
+            BeginInlineCapture(hwnd);
             SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HK_CAPTURE), L"请按下快捷键...");
             SetFocus(hwnd);
             return 0;
@@ -2888,13 +2562,16 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         while (IsWindow(dlg)) {
             BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
             if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
-            if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && ahd.capturing) {
-                UINT mod = WindowUtils::GetCurrentModifiers();
+            // 捕获的按键由吞键钩子以 WM_INLINE_CAPTURE_KEY 投递（lParam=修饰键组合）
+            if (msg.message == WM_INLINE_CAPTURE_KEY && ahd.capturing) {
+                UINT mod = (UINT)msg.lParam;
                 int vk = (int)msg.wParam;
-                if (vk != VK_CONTROL && vk != VK_SHIFT && vk != VK_MENU && vk != VK_LWIN && vk != VK_RWIN) {
+                if (!InlineCapIsModifier(vk)) {
                     ahd.captureMod = mod;
                     ahd.captureVK = (UINT)vk;
                     ahd.capturing = false;
+                    // 卸载吞键钩子：恢复键盘钩子对按键的拦截
+                    EndInlineCapture(dlg);
                     SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_CTRL), BM_SETCHECK, (mod & MOD_CONTROL) ? BST_CHECKED : BST_UNCHECKED, 0);
                     SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_SHIFT), BM_SETCHECK, (mod & MOD_SHIFT) ? BST_CHECKED : BST_UNCHECKED, 0);
                     SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_ALT), BM_SETCHECK, (mod & MOD_ALT) ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -2904,9 +2581,22 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
                 }
                 continue;
             }
-            if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
+            // 捕获热键期间丢弃 WM_HOTKEY：按下的组合若正好是已注册热键，
+            // 转发会触发热键动作（如老板键隐藏窗口）打断捕获
+            if (msg.message == WM_HOTKEY) {
+                if (!ahd.capturing && g_mainWnd && IsWindow(g_mainWnd))
+                    SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // 兜底：捕获过程中对话框被关闭时卸载吞键钩子，避免按键被长期吞掉；
+        // EndInlineCapture 内部按归属判断，不会误拆其他对话框正在使用的钩子
+        if (ahd.capturing || s_inlineCapWnd == dlg) {
+            ahd.capturing = false;
+            EndInlineCapture(dlg);
         }
 
         // 兜底：异常退出路径下销毁窗口，避免 GWLP_USERDATA 指向已失效的栈对象 ahd
@@ -3004,7 +2694,16 @@ void SettingsDialog::RefreshCustomHotkeyList(HWND hwnd, AppConfig& config) {
 // ===== 开始捕获窗口隐藏热键 =====
 void SettingsDialog::StartHotKeyCapture(HWND hwnd) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // 两项内联捕获互斥：开始本项前先取消另一项，
+    // 避免两个标志同时为真时退出其一就错误地提前结束捕获模式
+    if (data->capturingCloseHotKey) {
+        data->capturingCloseHotKey = false;
+        SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY),
+                       FormatHotKey(data->workingCopy.bossKeyCloseMod, data->workingCopy.bossKeyCloseVK).c_str());
+    }
     data->capturingHotKey = true;
+    // 安装吞键钩子：待捕获按键不会被全局钩子吞掉，也不会触发系统快捷键
+    BeginInlineCapture(hwnd);
     SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETHOTKEY), L"请按下快捷键...");
     SetFocus(hwnd);
 }
@@ -3012,7 +2711,15 @@ void SettingsDialog::StartHotKeyCapture(HWND hwnd) {
 // ===== 开始捕获一键关闭程序热键 =====
 void SettingsDialog::StartCloseHotKeyCapture(HWND hwnd) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // 两项内联捕获互斥：开始本项前先取消另一项（对称处理，见 StartHotKeyCapture）
+    if (data->capturingHotKey) {
+        data->capturingHotKey = false;
+        SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETHOTKEY),
+                       FormatHotKey(data->workingCopy.bossKeyMod, data->workingCopy.bossKeyVK).c_str());
+    }
     data->capturingCloseHotKey = true;
+    // 安装吞键钩子（对称处理，见 StartHotKeyCapture）
+    BeginInlineCapture(hwnd);
     SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY), L"请按下快捷键...");
     SetFocus(hwnd);
 }
@@ -3020,6 +2727,9 @@ void SettingsDialog::StartCloseHotKeyCapture(HWND hwnd) {
 // ===== 重置窗口隐藏热键为默认值（Win+`） =====
 void SettingsDialog::ResetHotKey(HWND hwnd) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // 若该项正处于捕获中，先取消捕获：否则标志与吞键钩子残留，
+    // 按钮文本已被改成默认值却仍提示按键，下一次按键会静默覆盖重置结果
+    CancelInlineCapture(data, hwnd);
     data->workingCopy.bossKeyMod = MOD_WIN;
     data->workingCopy.bossKeyVK = 0xC0;
     SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETHOTKEY),
@@ -3029,6 +2739,8 @@ void SettingsDialog::ResetHotKey(HWND hwnd) {
 // ===== 重置一键关闭程序热键为默认值（Win+Esc） =====
 void SettingsDialog::ResetCloseHotKey(HWND hwnd) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // 与 ResetHotKey 对称处理，避免捕获态残留
+    CancelInlineCapture(data, hwnd);
     data->workingCopy.bossKeyCloseMod = MOD_WIN;
     data->workingCopy.bossKeyCloseVK = VK_ESCAPE;
     SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY),
@@ -3318,38 +3030,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case IDC_BTN_DELREMAP:
             SettingsDialog::RemoveRemapEntry(hwnd, data->workingCopy);
             return 0;
-        case IDC_BTN_ADDBOSS:
-            SettingsDialog::AddBossWindow(hwnd, data->workingCopy);
-            return 0;
         case IDC_BTN_DELBOSS:
             SettingsDialog::RemoveBossWindow(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_ADD_BOSS_BINDING:
             SettingsDialog::ShowBindingDialog(hwnd, data->workingCopy, data->workingCopy.bossKeyWindows, ADD_BINDING_CLASS);
             return 0;
-        case IDC_BTN_ADD_PROC_BINDING:
-            SettingsDialog::AddProcessBinding(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_ADD_WIN_BINDING:
-            SettingsDialog::AddWindowBinding(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_ADD_BINDING:
-            SettingsDialog::AddBindingFromAll(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_DEL_BINDING:
-            SettingsDialog::RemoveBindingToAll(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_REFRESH_WINS:
-            SettingsDialog::RefreshAllWindowsList(hwnd, data->workingCopy);
-            return 0;
         case IDC_BTN_ADD_WIND_BINDING:
             SettingsDialog::AddWindWindow(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_DELWIND:
             SettingsDialog::RemoveWindWindow(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_SELBOSS:
-            SettingsDialog::SelectWindow(hwnd, IDC_LST_BOSSWINS, IDC_EDT_BOSSWIN);
             return 0;
         case IDC_BTN_SETHOTKEY:
             SettingsDialog::StartHotKeyCapture(hwnd);
@@ -3362,18 +3053,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             return 0;
         case IDC_BTN_RESETCLOSEHOTKEY:
             SettingsDialog::ResetCloseHotKey(hwnd);
-            return 0;
-        case IDC_BTN_SCANHOTKEYS:
-            SettingsDialog::ScanHotkeys(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_PROBEHOTKEY:
-            SettingsDialog::ProbeHotkey(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_DISABLEHOTKEY:
-            SettingsDialog::DisableHotkey(hwnd, data->workingCopy);
-            return 0;
-        case IDC_BTN_ENABLEHOTKEY:
-            SettingsDialog::EnableHotkey(hwnd, data->workingCopy);
             return 0;
         case IDC_CHK_CUSTOM_HK_ENABLE: {
             // 启用自定义热键复选框：切换相关控件的启用状态
@@ -3397,18 +3076,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case IDC_BTN_DEL_CUSTOMHK:
             SettingsDialog::DeleteCustomHotkey(hwnd, data->workingCopy);
             return 0;
-        case IDC_CBO_HKFILTER:
-            // 热键过滤下拉框选择变化时刷新列表
-            if (HIWORD(wp) == CBN_SELCHANGE) {
-                SettingsDialog::RefreshHotkeyList(hwnd, data->workingCopy);
-            }
-            return 0;
-        case IDC_EDT_HKSEARCH:
-            // 热键搜索框内容变化时实时刷新列表
-            if (HIWORD(wp) == EN_CHANGE) {
-                SettingsDialog::RefreshHotkeyList(hwnd, data->workingCopy);
-            }
-            return 0;
         }
         break;
 
@@ -3418,49 +3085,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         if (nmhdr->idFrom == IDC_TAB_MAIN && nmhdr->code == TCN_SELCHANGE) {
             int sel = TabCtrl_GetCurSel(GetDlgItem(hwnd, IDC_TAB_MAIN));
             SettingsDialog::SwitchTab(hwnd, sel, data->workingCopy);
-        }
-        // 热键列表右键菜单
-        if (nmhdr->idFrom == IDC_LV_HOTKEYS && nmhdr->code == NM_RCLICK) {
-            auto* nmitem = reinterpret_cast<NMITEMACTIVATE*>(lp);
-            if (nmitem->iItem >= 0) {
-                HWND lv = GetDlgItem(hwnd, IDC_LV_HOTKEYS);
-                // 经 lParam 取回真实数据下标（显示行号在过滤/搜索后会错位）
-                LVITEMW rcItem = {};
-                rcItem.mask = LVIF_PARAM;
-                rcItem.iItem = nmitem->iItem;
-                int hkIdx = -1;
-                if (SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&rcItem)) {
-                    hkIdx = (int)rcItem.lParam;
-                }
-                if (hkIdx >= 0 && hkIdx < (int)data->scannedHotkeys.size()) {
-                    SendMessageW(lv, LVM_SETITEMSTATE, nmitem->iItem, MAKELPARAM(LVIS_SELECTED, LVIS_SELECTED));
-
-                    auto& hk = data->scannedHotkeys[hkIdx];
-                    bool isDisabled = false;
-                    for (auto& d : data->workingCopy.disabledHotkeys) {
-                        if (d.first == hk.mod && d.second == hk.vk) { isDisabled = true; break; }
-                    }
-
-                    HMENU hMenu = CreatePopupMenu();
-                    if (isDisabled) {
-                        AppendMenuW(hMenu, MF_STRING, 1, L"启用该热键");
-                    } else {
-                        AppendMenuW(hMenu, MF_STRING, 2, L"禁用该热键");
-                    }
-                    if (IsSafeHotkeyToSimulate(hk.mod, hk.vk)) {
-                        AppendMenuW(hMenu, MF_STRING, 3, L"探测所属程序");
-                    }
-
-                    POINT pt = nmitem->ptAction;
-                    ClientToScreen(lv, &pt);
-                    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
-                    DestroyMenu(hMenu);
-
-                    if (cmd == 1) SettingsDialog::EnableHotkey(hwnd, data->workingCopy);
-                    else if (cmd == 2) SettingsDialog::DisableHotkey(hwnd, data->workingCopy);
-                    else if (cmd == 3) SettingsDialog::ProbeHotkey(hwnd, data->workingCopy);
-                }
-            }
         }
         break;
     }

@@ -51,16 +51,16 @@ void KeyboardHook::SetShowOverlay(bool show) {
     m_showOverlay = show;
 }
 
+void KeyboardHook::SetShowMuteOverlay(bool show) {
+    m_showMuteOverlay = show;
+}
+
 void KeyboardHook::SetKeyRemapEnabled(bool enabled) {
     m_keyRemapEnabled = enabled;
 }
 
 void KeyboardHook::SetKeyRemappings(const std::vector<std::pair<int, int>>& remappings) {
     m_remappings = remappings;
-}
-
-void KeyboardHook::SetDisabledHotkeys(const std::vector<std::pair<UINT, UINT>>& hotkeys) {
-    m_disabledHotkeys = hotkeys;
 }
 
 void KeyboardHook::SetSimulatingInput(bool sim) {
@@ -75,12 +75,11 @@ void KeyboardHook::SetCaptureMode(bool enabled) {
 // KeyboardHook::LowLevelProc - 低级键盘钩子回调
 // 处理优先级：
 //   1. 模拟输入/重映射/捕获模式下直接放行
-//   2. 热键屏蔽检查
-//   3. 按键重映射
-//   4. NumLock 禁用处理
-//   5. Insert 键禁用
-//   6. 指定按键屏蔽
-//   7. 锁键/静音状态浮层通知
+//   2. 按键重映射
+//   3. NumLock 禁用处理
+//   4. Insert 键禁用
+//   5. 指定按键屏蔽
+//   6. 锁键/静音状态浮层通知
 // ============================================================
 LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && s_instance) {
@@ -98,35 +97,6 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
 
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
             wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-
-            // --- 热键屏蔽（延迟处理，避免钩子回调阻塞）---
-            // 仅在非注入按键按下时检查，避免拦截自己模拟的按键
-            if (!s_instance->m_disabledHotkeys.empty() &&
-                (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) &&
-                !(kb->flags & LLKHF_INJECTED)) {
-                int vk = (int)kb->vkCode;
-                // 跳过修饰键本身，只检查非修饰键
-                if (vk != VK_CONTROL && vk != VK_LCONTROL && vk != VK_RCONTROL &&
-                    vk != VK_SHIFT && vk != VK_LSHIFT && vk != VK_RSHIFT &&
-                    vk != VK_MENU && vk != VK_LMENU && vk != VK_RMENU &&
-                    vk != VK_LWIN && vk != VK_RWIN) {
-                    // 获取当前按下的修饰键组合
-                    UINT mod = 0;
-                    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mod |= MOD_CONTROL;
-                    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mod |= MOD_SHIFT;
-                    if (kb->flags & LLKHF_ALTDOWN) mod |= MOD_ALT;
-                    if ((GetAsyncKeyState(VK_LWIN) & 0x8000) ||
-                        (GetAsyncKeyState(VK_RWIN) & 0x8000)) mod |= MOD_WIN;
-                    // 检查是否在屏蔽列表中
-                    for (const auto& hk : s_instance->m_disabledHotkeys) {
-                        if (hk.first == mod && hk.second == (UINT)vk) {
-                            // 延迟到主窗口处理，不直接 return 1（避免钩子超时）
-                            s_instance->ProcessBlockedHotkey(mod, (UINT)vk);
-                            return 1; // 吞掉原始按键，但处理延迟执行
-                        }
-                    }
-                }
-            }
 
             // --- 按键重映射 ---
             // 跳过注入按键，防止重映射的注入按键触发二次重映射（无限递归）
@@ -193,8 +163,8 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
 
             // --- 锁键/静音状态浮层通知 ---
             if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                // CapsLock / NumLock / ScrollLock 状态变化通知（受锁键浮层开关控制）
                 if (s_instance->m_showOverlay) {
-                    // CapsLock / NumLock / ScrollLock 状态变化通知
                     if (kb->vkCode == VK_CAPITAL || kb->vkCode == VK_NUMLOCK || kb->vkCode == VK_SCROLL) {
                         // NumLock 禁用时，已在上面的专用段发送了通知，此处跳过避免双重发送
                         if (kb->vkCode == VK_NUMLOCK && s_instance->m_disableNumLock) {
@@ -206,25 +176,13 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                                          (WPARAM)kb->vkCode, (LPARAM)(newState ? 1 : 0));
                         }
                     }
-                    // 静音键状态变化通知
-                    else if (kb->vkCode == VK_VOLUME_MUTE) {
-                        PostMessageW(s_instance->m_notifyWnd, WM_MUTE_NOTIFY, 0, 0);
-                    }
+                }
+                // 静音键状态变化通知（受静音浮层开关控制，与锁键浮层解耦）
+                if (s_instance->m_showMuteOverlay && kb->vkCode == VK_VOLUME_MUTE) {
+                    PostMessageW(s_instance->m_notifyWnd, WM_MUTE_NOTIFY, 0, 0);
                 }
             }
         }
     }
     return CallNextHookEx(s_instance ? s_instance->m_hook : nullptr, nCode, wParam, lParam);
-}
-
-// ============================================================
-// ProcessBlockedHotkey - 延迟处理被屏蔽的热键
-// 从钩子回调 PostMessage 到主窗口执行，避免钩子回调阻塞
-// ============================================================
-void KeyboardHook::ProcessBlockedHotkey(UINT mod, UINT vk) {
-    // 向主窗口发送自定义消息，主窗口收到后记录日志或显示提示
-    // 实际屏蔽已在钩子中 return 1 完成，这里仅做通知
-    if (m_notifyWnd && IsWindow(m_notifyWnd)) {
-        PostMessageW(m_notifyWnd, WM_HOTKEY_BLOCKED, (WPARAM)mod, (LPARAM)vk);
-    }
 }

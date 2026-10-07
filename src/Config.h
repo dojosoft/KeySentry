@@ -96,25 +96,21 @@ struct CustomHotkey {
     std::wstring command;               // 要执行的程序路径
     std::wstring parameters;            // 命令行参数
     std::wstring workDir;               // 工作目录
-    std::wstring sound;                 // 触发时播放的音效文件路径
     std::wstring description;           // 热键描述/显示名称
     HotkeyWindowState windowState = HotkeyWindowState::Normal; // 启动后窗口状态
-    int opacity = -1;                   // 窗口透明度（-1 表示不设置）
-    bool autoStart = false;              // 是否随程序启动自动执行
     bool confirmBeforeRun = false;       // 执行前是否需要确认
     bool runAsAdmin = false;             // 是否以管理员权限运行
     bool simulateKey = false;            // 触发动作类型：true=模拟按键（targetVK 为被模拟键），false=运行命令
     UINT targetVK = 0;                   // 模拟按键模式下被模拟的按键虚拟键码
 
-    // 将自定义热键序列化为管道分隔的字符串
+    // 将自定义热键序列化为管道分隔的字符串（当前规范共 11 个字段）
+    // 说明：早期版本中的 sound/opacity/autoStart 字段已废弃，不再写入
     std::wstring Serialize() const {
         return std::to_wstring(mod) + L"|" + std::to_wstring(vk) + L"|" +
                ConfigUtils::EscapeField(command) + L"|" + ConfigUtils::EscapeField(parameters) + L"|" +
-               ConfigUtils::EscapeField(workDir) + L"|" + ConfigUtils::EscapeField(sound) + L"|" +
+               ConfigUtils::EscapeField(workDir) + L"|" +
                ConfigUtils::EscapeField(description) + L"|" +
                std::to_wstring((int)windowState) + L"|" +
-               std::to_wstring(opacity) + L"|" +
-               IniUtils::BoolToStr(autoStart) + L"|" +
                IniUtils::BoolToStr(confirmBeforeRun) + L"|" +
                IniUtils::BoolToStr(runAsAdmin) + L"|" +
                IniUtils::BoolToStr(simulateKey) + L"|" +
@@ -122,31 +118,53 @@ struct CustomHotkey {
     }
 
     // 从管道分隔的字符串反序列化自定义热键
+    // 兼容三种历史格式（按管道 | 的数量区分）：
+    //   新格式  11 字段(10 个 |)：已移除废弃字段 sound/opacity/autoStart
+    //   旧格式  12/13 字段(11/12 个 |)：含 sound/opacity/autoStart
+    //   更旧    14 字段(13 个 |)：额外含 simulateKey/targetVK
     static CustomHotkey Deserialize(const std::wstring& str) {
         CustomHotkey hk;
         std::vector<size_t> pipes;
         for (size_t i = 0; i < str.size(); i++) {
             if (str[i] == L'|') pipes.push_back(i);
         }
-        if (pipes.size() < 11) return hk;
-        hk.mod = (UINT)ConfigUtils::SafeParseInt(str.substr(0, pipes[0]));
-        hk.vk = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[0] + 1, pipes[1] - pipes[0] - 1));
-        hk.command = ConfigUtils::UnescapeField(str.substr(pipes[1] + 1, pipes[2] - pipes[1] - 1));
-        hk.parameters = ConfigUtils::UnescapeField(str.substr(pipes[2] + 1, pipes[3] - pipes[2] - 1));
-        hk.workDir = ConfigUtils::UnescapeField(str.substr(pipes[3] + 1, pipes[4] - pipes[3] - 1));
-        hk.sound = ConfigUtils::UnescapeField(str.substr(pipes[4] + 1, pipes[5] - pipes[4] - 1));
-        hk.description = ConfigUtils::UnescapeField(str.substr(pipes[5] + 1, pipes[6] - pipes[5] - 1));
-        hk.windowState = ConfigUtils::ClampWindowState(ConfigUtils::SafeParseInt(str.substr(pipes[6] + 1, pipes[7] - pipes[6] - 1)));
-        hk.opacity = ConfigUtils::SafeParseInt(str.substr(pipes[7] + 1, pipes[8] - pipes[7] - 1), -1);
-        hk.autoStart = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1)) != 0;
-        hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[9] + 1, pipes[10] - pipes[9] - 1)) != 0;
-        // runAsAdmin：新格式（含模拟按键字段）需截断到第 12 个管道，旧格式取到结尾
-        hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[10] + 1,
-            (pipes.size() >= 12 ? pipes[11] : str.size()) - pipes[10] - 1)) != 0;
-        // 新增字段（模拟按键模式）：兼容旧版 12 字段格式，仅当存在第 13/14 字段时解析
-        if (pipes.size() >= 13) {
-            hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[11] + 1, pipes[12] - pipes[11] - 1)) != 0;
-            hk.targetVK = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[12] + 1));
+
+        // --- 旧格式：含已废弃的 sound / opacity / autoStart 字段 ---
+        if (pipes.size() >= 11) {
+            hk.mod = (UINT)ConfigUtils::SafeParseInt(str.substr(0, pipes[0]));
+            hk.vk = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[0] + 1, pipes[1] - pipes[0] - 1));
+            hk.command = ConfigUtils::UnescapeField(str.substr(pipes[1] + 1, pipes[2] - pipes[1] - 1));
+            hk.parameters = ConfigUtils::UnescapeField(str.substr(pipes[2] + 1, pipes[3] - pipes[2] - 1));
+            hk.workDir = ConfigUtils::UnescapeField(str.substr(pipes[3] + 1, pipes[4] - pipes[3] - 1));
+            // pipes[4]~pipes[5] 为废弃的 sound 字段，直接丢弃
+            hk.description = ConfigUtils::UnescapeField(str.substr(pipes[5] + 1, pipes[6] - pipes[5] - 1));
+            hk.windowState = ConfigUtils::ClampWindowState(ConfigUtils::SafeParseInt(str.substr(pipes[6] + 1, pipes[7] - pipes[6] - 1)));
+            // pipes[7]~pipes[8] 为废弃的 opacity、pipes[8]~pipes[9] 为废弃的 autoStart，直接丢弃
+            hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[9] + 1, pipes[10] - pipes[9] - 1)) != 0;
+            // runAsAdmin：13/14 字段格式需截断到第 12 个管道，12 字段格式取到结尾
+            hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[10] + 1,
+                (pipes.size() >= 12 ? pipes[11] : str.size()) - pipes[10] - 1)) != 0;
+            // 模拟按键字段：仅当存在第 13/14 字段时解析
+            if (pipes.size() >= 13) {
+                hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[11] + 1, pipes[12] - pipes[11] - 1)) != 0;
+                hk.targetVK = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[12] + 1));
+            }
+            return hk;
+        }
+
+        // --- 新格式：11 个字段 ---
+        if (pipes.size() == 10) {
+            hk.mod = (UINT)ConfigUtils::SafeParseInt(str.substr(0, pipes[0]));
+            hk.vk = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[0] + 1, pipes[1] - pipes[0] - 1));
+            hk.command = ConfigUtils::UnescapeField(str.substr(pipes[1] + 1, pipes[2] - pipes[1] - 1));
+            hk.parameters = ConfigUtils::UnescapeField(str.substr(pipes[2] + 1, pipes[3] - pipes[2] - 1));
+            hk.workDir = ConfigUtils::UnescapeField(str.substr(pipes[3] + 1, pipes[4] - pipes[3] - 1));
+            hk.description = ConfigUtils::UnescapeField(str.substr(pipes[4] + 1, pipes[5] - pipes[4] - 1));
+            hk.windowState = ConfigUtils::ClampWindowState(ConfigUtils::SafeParseInt(str.substr(pipes[5] + 1, pipes[6] - pipes[5] - 1)));
+            hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[6] + 1, pipes[7] - pipes[6] - 1)) != 0;
+            hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[7] + 1, pipes[8] - pipes[7] - 1)) != 0;
+            hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1)) != 0;
+            hk.targetVK = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[9] + 1));
         }
         return hk;
     }
@@ -201,6 +219,11 @@ struct BoundWindowInfo {
     // 判断指定窗口是否匹配此绑定信息
     bool Matches(HWND hwnd, bool requireVisible = true) const;
 
+    // 判断进程可执行名/完整路径是否匹配此绑定信息（供带缓存的匹配复用）
+    bool MatchesProcessInfo(const std::wstring& exeName, const std::wstring& fullPath) const;
+    // 判断窗口是否匹配，使用进程路径缓存避免重复 OpenProcess（仅 Process 模式受益）
+    bool Matches(HWND hwnd, ProcessUtils::PathCache& cache, bool requireVisible = true) const;
+
     // 获取绑定信息的显示名称
     std::wstring DisplayName() const {
         if (matchMode == MatchMode::Process) {
@@ -234,8 +257,11 @@ namespace WindowEnum {
             GetWindowThreadProcessId(hwnd, &pid);
             if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
 
-            std::wstring processName = ProcessUtils::GetProcessName(pid);
+            // 一次 OpenProcess 取回完整路径，再从路径截取进程名，避免重复打开进程
             std::wstring processPath = ProcessUtils::GetProcessPath(pid);
+            std::wstring processName = processPath;
+            size_t slash = processName.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) processName = processName.substr(slash + 1);
 
             auto* ctx = reinterpret_cast<EnumWindowCtx*>(lParam);
             // 跳过已绑定的窗口
@@ -294,8 +320,7 @@ struct AppConfig {
     bool keyRemapEnabled = false;         // 启用按键重映射
     std::vector<std::pair<int, int>> keyRemappings; // 重映射对：{源键, 目标键}
 
-    // --- 热键屏蔽与自定义热键 ---
-    std::vector<std::pair<UINT, UINT>> disabledHotkeys; // 被屏蔽的系统热键：{修饰键, 虚拟键}
+    // --- 自定义热键 ---
     bool customHotkeysEnabled = false;    // 启用自定义热键
     std::vector<CustomHotkey> customHotkeys; // 自定义热键列表
 
@@ -332,9 +357,6 @@ struct AppConfig {
     void Load(const std::wstring& iniPath);
     // 保存配置到 INI 文件
     void Save(const std::wstring& iniPath) const;
-
-    // 判断指定虚拟键码是否在禁用列表中
-    bool IsKeyDisabled(int vkCode) const;
 
     // 虚拟键码转可读名称
     static std::wstring VKToName(int vk);

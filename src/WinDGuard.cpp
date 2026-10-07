@@ -9,8 +9,34 @@ WinDGuard::~WinDGuard() {
     RemoveLock();
 }
 
+// 判断两组保护规则是否完全一致（用于跳过配置未变化时的重复重锁）
+static bool SameBoundWindows(const std::vector<BoundWindowInfo>& a,
+                             const std::vector<BoundWindowInfo>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const BoundWindowInfo& x = a[i];
+        const BoundWindowInfo& y = b[i];
+        if (x.matchMode != y.matchMode || x.pid != y.pid || x.title != y.title ||
+            x.processName != y.processName || x.processPath != y.processPath) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 提示一次"权限不足导致保护未生效"（提权窗口受 UIPI 限制，静默失败容易让用户误以为已生效）
+static void WarnLockFailedOnce() {
+    static bool warned = false;
+    if (warned) return;
+    warned = true;
+    ShowTrayNotification(L"部分目标窗口以管理员权限运行，置顶/禁止最小化保护无法生效。", true);
+}
+
 // 一次性配置启用状态和窗口列表
 void WinDGuard::Configure(bool enabled, const std::vector<BoundWindowInfo>& windows) {
+    // 配置与当前完全一致时直接返回：避免每次点击"应用/确定"都移除并按全量枚举重锁所有窗口
+    if (enabled == m_enabled && SameBoundWindows(windows, m_protectedWindows)) return;
+
     if (m_enabled) RemoveLock();       // 先移除旧保护（无论新状态是否启用）
     m_enabled = enabled;
     m_protectedWindows = windows;
@@ -20,10 +46,10 @@ void WinDGuard::Configure(bool enabled, const std::vector<BoundWindowInfo>& wind
     }
 }
 
-// 检查指定窗口是否匹配任一保护规则
-bool WinDGuard::IsWindowMatched(HWND hwnd) const {
+// 检查指定窗口是否匹配任一保护规则（复用进程路径缓存，避免重复 OpenProcess）
+bool WinDGuard::IsWindowMatched(HWND hwnd, ProcessUtils::PathCache& cache) const {
     for (const auto& info : m_protectedWindows) {
-        if (info.Matches(hwnd)) return true;
+        if (info.Matches(hwnd, cache)) return true;
     }
     return false;
 }
@@ -64,17 +90,24 @@ void WinDGuard::LockWindow(HWND hwnd, DWORD pid) {
     lw.processId = pid;
     m_lockedWindows.push_back(lw);
 
-    // 设为置顶窗口
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    // 设为置顶窗口（目标窗口若以管理员权限运行，会因 UIPI 限制失败）
+    BOOL topmostOk = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     // 移除最小化按钮并刷新窗口框架
+    bool minimizeOk = true;
     if (style & WS_MINIMIZEBOX) {
-        SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_MINIMIZEBOX);
+        SetLastError(0);
+        LONG_PTR prev = SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_MINIMIZEBOX);
+        // SetWindowLongPtrW 失败返回 0，需用 GetLastError 区分"返回值恰为 0"与"调用失败"
+        minimizeOk = (prev != 0) || (GetLastError() == 0);
         // 仅刷新框架，不改变 Z-order（上一步已设为 TOPMOST）
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
+
+    // 保护未真正生效时提示一次，避免用户误以为已置顶/已禁止最小化
+    if (!topmostOk || !minimizeOk) WarnLockFailedOnce();
 }
 
 // ============================================================
@@ -121,8 +154,9 @@ void WinDGuard::ApplyLock() {
     std::vector<HWND> allWindows;
     EnumWindows(EnumAllTopLevelWindowsProc, reinterpret_cast<LPARAM>(&allWindows));
 
+    ProcessUtils::PathCache cache;  // 单次枚举内复用进程路径，避免相同 pid 重复查询
     for (HWND hwnd : allWindows) {
-        if (IsWindowMatched(hwnd)) {
+        if (IsWindowMatched(hwnd, cache)) {
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
             LockWindow(hwnd, pid);
@@ -200,8 +234,9 @@ void WinDGuard::CheckNewWindows() {
         lockedSet.insert(lw.hwnd);
     }
 
+    ProcessUtils::PathCache cache;  // 单次枚举内复用进程路径，避免相同 pid 重复查询
     for (HWND hwnd : allWindows) {
-        if (IsWindowMatched(hwnd) && lockedSet.find(hwnd) == lockedSet.end()) {
+        if (IsWindowMatched(hwnd, cache) && lockedSet.find(hwnd) == lockedSet.end()) {
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
             LockWindow(hwnd, pid);

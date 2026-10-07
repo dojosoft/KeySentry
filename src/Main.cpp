@@ -6,6 +6,7 @@
 #include <ShellAPI.h>
 #include <ShlObj.h>
 #include <CommCtrl.h>
+#include <algorithm>
 
 #include "Resource.h"
 #include "Config.h"
@@ -43,6 +44,7 @@ static OverlayWindow g_overlay;     // 悬浮提示窗口，用于显示锁定�
 static BossKey g_bossKey;           // 老板键管理器，负责窗口隐藏/恢复逻辑
 static WinDGuard g_winDGuard;       // Win+D 守护管理器，防止 Win+D 最小化指定窗口
 HWND g_mainWnd = nullptr;           // 主窗口句柄，全局可访问
+bool g_suppressHotkeys = false;     // 按键捕获期间为 true，各模态循环据此丢弃 WM_HOTKEY
 static HINSTANCE g_hInst = nullptr; // 应用实例句柄
 static std::wstring g_iniPath;      // 配置文件（INI）路径
 static NOTIFYICONDATAW g_nid = {};  // 系统托盘图标数据结构
@@ -51,6 +53,7 @@ static HWND g_settingsWnd = nullptr;   // 设置对话框窗口句柄
 static bool g_trayIconVisible = true;  // 托盘图标是否可见
 static ULONGLONG g_lastCornerTick = 0; // 上次角落触发的时间戳，用于防抖
 static UINT g_msgTaskbarCreated = 0;  // TaskbarCreated 消息ID，用于 explorer 重启后恢复托盘图标
+static bool g_numLockTimerArmed = false; // NumLock 延迟定时器是否已启动，避免反复"应用"不断推迟
 
 // ===== SetSettingsWnd =====
 // 功能：设置设置对话框的窗口句柄，供外部模块调用
@@ -138,11 +141,13 @@ static std::wstring GetIniPath() {
     if (pos != std::wstring::npos) path = path.substr(0, pos + 1);  // 截取目录部分
     std::wstring iniPath = path + L"KeySentry.ini";
 
-    // 检测 exe 目录是否可写（OPEN_ALWAYS 不截断已有文件内容）
-    HANDLE hTest = CreateFileW(iniPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // 在 exe 目录创建临时测试文件探测可写性，
+    // FILE_FLAG_DELETE_ON_CLOSE 保证关闭句柄即自动删除，不残留空文件
+    std::wstring testPath = path + L".~wtest.tmp";
+    HANDLE hTest = CreateFileW(testPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
     if (hTest != INVALID_HANDLE_VALUE) {
-        CloseHandle(hTest);
+        CloseHandle(hTest);  // 关闭即删除测试文件
         return iniPath;
     }
 
@@ -161,11 +166,11 @@ static std::wstring GetIniPath() {
 // 逻辑：通过写入/删除注册表 Run 键值实现，优先使用 64 位注册表视图
 static void SetAutoStart(bool enable) {
     HKEY hKey = nullptr;
-    REGSAM access = KEY_SET_VALUE | KEY_WOW64_64KEY;  // 优先尝试 64 位注册表视图
+    REGSAM access = KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY;  // 优先尝试 64 位注册表视图
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
                        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                        0, access, &hKey) != ERROR_SUCCESS) {
-        access = KEY_SET_VALUE;  // 回退到默认视图
+        access = KEY_QUERY_VALUE | KEY_SET_VALUE;  // 回退到默认视图
         if (RegOpenKeyExW(HKEY_CURRENT_USER,
                            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                            0, access, &hKey) != ERROR_SUCCESS) return;
@@ -175,11 +180,22 @@ static void SetAutoStart(bool enable) {
         // 写入自启动键值：应用名 -> exe 路径
         wchar_t exePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        // 读取现有值，与当前 exe 路径相同则跳过写入，避免每次应用都写注册表
+        wchar_t curVal[MAX_PATH * 2] = {};
+        DWORD cbData = sizeof(curVal);
+        DWORD type = 0;
+        if (RegQueryValueExW(hKey, APP_NAME, nullptr, &type, (BYTE*)curVal, &cbData) == ERROR_SUCCESS &&
+            type == REG_SZ && wcscmp(curVal, exePath) == 0) {
+            RegCloseKey(hKey);
+            return;
+        }
         RegSetValueExW(hKey, APP_NAME, 0, REG_SZ,
                         (const BYTE*)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
     } else {
-        // 删除自启动键值
-        RegDeleteValueW(hKey, APP_NAME);
+        // 仅当键值存在时才删除
+        if (RegQueryValueExW(hKey, APP_NAME, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, APP_NAME);
+        }
     }
     RegCloseKey(hKey);
 }
@@ -214,6 +230,21 @@ static void ShowTrayIcon() {
     if (!g_trayIconVisible) {
         g_trayIconVisible = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
     }
+}
+
+// ===== ShowTrayNotification =====
+// 功能：弹出托盘气泡通知（用于非阻塞式一次性提示）
+// 逻辑：复用已存在的托盘图标句柄，附加 NIF_INFO 后 NIM_MODIFY，
+//       随后恢复原 uFlags，避免影响后续托盘图标操作
+void ShowTrayNotification(const std::wstring& text, bool warning) {
+    if (!g_trayIconVisible) return;  // 无托盘图标时气泡无法显示
+    g_nid.uFlags = NIF_INFO;
+    wcscpy_s(g_nid.szInfoTitle, APP_NAME);
+    wcsncpy_s(g_nid.szInfo, text.c_str(), _TRUNCATE);
+    g_nid.dwInfoFlags = warning ? NIIF_WARNING : NIIF_INFO;
+    g_nid.uTimeout = 5000;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;  // 恢复标志位
 }
 
 // ===== ShowTrayMenu =====
@@ -294,7 +325,7 @@ static void ApplyExplorerSettings() {
         DWORD_PTR dwResult = 0;
         SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
                             (LPARAM)L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-                            SMTO_ABORTIFHUNG, 1000, &dwResult);
+                            SMTO_ABORTIFHUNG, 500, &dwResult);
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     }
 }
@@ -541,7 +572,9 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
     }
 
     // 尝试注册窗口隐藏热键，检测是否被其他程序占用
-    if (newConfig.bossKeyEnabled) {
+    // 条件与 ApplyConfig 保持一致（mod/vk 缺一不可）：手改 INI 造成 VKCode=0 时，
+    // 用 vk=0 注册必然失败，会被误报为"被其他程序占用"
+    if (newConfig.bossKeyEnabled && newConfig.bossKeyMod != 0 && newConfig.bossKeyVK != 0) {
         UINT bossMod = newConfig.bossKeyMod | MOD_NOREPEAT;  // 优先尝试带 MOD_NOREPEAT 注册
         if (!RegisterHotKey(g_mainWnd, BOSS_HOTKEY_ID, bossMod, newConfig.bossKeyVK)) {
             if (!RegisterHotKey(g_mainWnd, BOSS_HOTKEY_ID, newConfig.bossKeyMod, newConfig.bossKeyVK)) {
@@ -555,8 +588,8 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
         }
     }
 
-    // 尝试注册一键关闭热键
-    if (newConfig.bossKeyCloseMod != 0 || newConfig.bossKeyCloseVK != 0) {
+    // 尝试注册一键关闭热键（条件与 ApplyConfig 一致，避免 mod/vk 缺一时误报占用）
+    if (newConfig.bossKeyCloseMod != 0 && newConfig.bossKeyCloseVK != 0) {
         UINT closeMod = newConfig.bossKeyCloseMod | MOD_NOREPEAT;
         if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, closeMod, newConfig.bossKeyCloseVK)) {
             if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, newConfig.bossKeyCloseMod, newConfig.bossKeyCloseVK)) {
@@ -573,7 +606,8 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
     if (newConfig.customHotkeysEnabled) {
         for (size_t i = 0; i < newConfig.customHotkeys.size() && i < MAX_CUSTOM_HOTKEYS; i++) {
             const auto& hk = newConfig.customHotkeys[i];
-            if (hk.mod != 0 || hk.vk != 0) {
+            // 条件与 ApplyConfig 一致：mod/vk 缺一即不注册，避免误报"被占用"
+            if (hk.mod != 0 && hk.vk != 0) {
                 UINT customMod = hk.mod | MOD_NOREPEAT;
                 int id = CUSTOM_HOTKEY_ID_START + (int)i;
                 if (!RegisterHotKey(g_mainWnd, id, customMod, hk.vk)) {
@@ -594,17 +628,24 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
     // --- 第四阶段：恢复当前配置的热键注册 ---
     // 检测完毕后，将热键注册恢复为当前生效的配置
 
+    // 记录恢复阶段是否有热键注册失败，避免恢复静默失败导致已生效热键失效
+    bool restoreFailed = false;
+
     if (g_config.bossKeyEnabled) {
         UINT bossMod = g_config.bossKeyMod | MOD_NOREPEAT;
         if (!g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, bossMod, g_config.bossKeyVK)) {
-            g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, g_config.bossKeyMod, g_config.bossKeyVK);
+            if (!g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, g_config.bossKeyMod, g_config.bossKeyVK)) {
+                restoreFailed = true;
+            }
         }
     }
 
     if (g_config.bossKeyCloseMod != 0 || g_config.bossKeyCloseVK != 0) {
         UINT closeMod = g_config.bossKeyCloseMod | MOD_NOREPEAT;
         if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, closeMod, g_config.bossKeyCloseVK)) {
-            RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, g_config.bossKeyCloseMod, g_config.bossKeyCloseVK);
+            if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, g_config.bossKeyCloseMod, g_config.bossKeyCloseVK)) {
+                restoreFailed = true;
+            }
         }
     }
 
@@ -615,13 +656,32 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
                 UINT customMod = hk.mod | MOD_NOREPEAT;
                 int id = CUSTOM_HOTKEY_ID_START + (int)i;
                 if (!RegisterHotKey(g_mainWnd, id, customMod, hk.vk)) {
-                    RegisterHotKey(g_mainWnd, id, hk.mod, hk.vk);
+                    if (!RegisterHotKey(g_mainWnd, id, hk.mod, hk.vk)) {
+                        restoreFailed = true;
+                    }
                 }
             }
         }
     }
 
+    // 恢复失败时提示用户，避免热键静默失效且用户无感知
+    if (restoreFailed) {
+        MessageBoxW(g_mainWnd, L"部分已生效的热键在冲突检测后未能重新注册，\n请重启程序或重新应用设置。",
+                    APP_NAME, MB_OK | MB_ICONWARNING);
+    }
+
     return conflicts;
+}
+
+// ===== WarnHotkeyOnce =====
+// 功能：热键注册失败提示（内容相同只提示一次）
+// 逻辑：ApplyConfig 在每次点击"应用/确定"时都会执行，若某热键被其他程序长期占用，
+//       反复弹窗会造成困扰；仅在提示内容发生变化时再次弹窗
+static void WarnHotkeyOnce(const std::wstring& msg) {
+    static std::wstring lastWarned;
+    if (msg == lastWarned) return;
+    lastWarned = msg;
+    MessageBoxW(g_mainWnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
 }
 
 // ===== ApplyConfig =====
@@ -631,6 +691,7 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
 static void ApplyConfig() {
     // --- 键盘钩子相关配置 ---
     g_hook.SetShowOverlay(g_config.showLockKeyOverlay);            // 是否显示锁定键状态提示
+    g_hook.SetShowMuteOverlay(g_config.showMuteOverlay);           // 是否显示静音状态提示
     g_overlay.SetPrimaryOnly(g_config.overlayPrimaryOnly);         // 提示是否仅在主显示器显示
     g_hook.SetDisableSpecifiedKeysEnabled(g_config.disableSpecifiedKeysEnabled);  // 是否启用禁用指定按键
     g_hook.SetDisableNumLock(g_config.disableNumLock);             // 是否禁用 NumLock 切换
@@ -638,14 +699,36 @@ static void ApplyConfig() {
     g_hook.SetDisabledKeys(g_config.disabledKeyCodes);             // 设置被禁用的按键列表
     g_hook.SetKeyRemapEnabled(g_config.keyRemapEnabled);           // 是否启用按键重映射
     g_hook.SetKeyRemappings(g_config.keyRemappings);               // 设置按键重映射表
-    g_hook.SetDisabledHotkeys(g_config.disabledHotkeys);           // 设置被禁用的系统热键列表
+
+    // 键盘钩子按需安装：所有键相关功能均关闭时卸载钩子，降低常驻开销
+    bool needsHook = g_config.showLockKeyOverlay || g_config.showMuteOverlay ||
+                     g_config.disableSpecifiedKeysEnabled || g_config.disableNumLock ||
+                     g_config.forceInsertMode || g_config.keyRemapEnabled;
+    if (needsHook) {
+        // 安装失败时仅提示一次，避免每次应用配置都弹窗
+        static bool hookWarned = false;
+        if (!g_hook.Install(g_mainWnd) && !hookWarned) {
+            hookWarned = true;
+            MessageBoxW(g_mainWnd, L"键盘钩子安装失败，部分功能可能不可用。\n请检查是否有安全软件拦截。", APP_NAME, MB_OK | MB_ICONWARNING);
+        }
+    } else {
+        g_hook.Uninstall();
+    }
 
     // --- NumLock 守护 ---
     // disableNumLock 隐含 forceNumLockOn 的功能（确保 NumLock 开启才能锁定），
     // 因此当两者同时启用时只需在 disableNumLock 分支处理
     // 使用延迟定时器，避免开机自启动时键盘子系统尚未初始化导致 keybd_event 失效
     if (g_config.disableNumLock || g_config.forceNumLockOn) {
-        SetTimer(g_mainWnd, TIMER_NUMLOCK_DELAY, TIMER_NUMLOCK_DELAY_MS, nullptr);
+        // 已启动则不重复 SetTimer：反复点击"应用"不应把强制开启 NumLock 无限推迟
+        if (!g_numLockTimerArmed) {
+            if (SetTimer(g_mainWnd, TIMER_NUMLOCK_DELAY, TIMER_NUMLOCK_DELAY_MS, nullptr)) {
+                g_numLockTimerArmed = true;
+            }
+        }
+    } else {
+        KillTimer(g_mainWnd, TIMER_NUMLOCK_DELAY);  // 功能关闭时清理可能残留的延迟定时器
+        g_numLockTimerArmed = false;
     }
 
     // --- 老板键和热键注册 ---
@@ -659,38 +742,51 @@ static void ApplyConfig() {
     }
 
     // 注册窗口隐藏热键（老板键）
-    if (g_config.bossKeyEnabled) {
+    // 兜底：mod/vk 为 0 时不注册，避免手改 INI 产生的裸键全局劫持普通按键
+    if (g_config.bossKeyEnabled && g_config.bossKeyMod != 0 && g_config.bossKeyVK != 0) {
         UINT bossMod = g_config.bossKeyMod | MOD_NOREPEAT;  // 优先带 MOD_NOREPEAT 注册
         if (!g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, bossMod, g_config.bossKeyVK)) {
             g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, g_config.bossKeyMod, g_config.bossKeyVK);  // 回退注册
         }
-        g_bossKey.SetWindows(g_config.bossKeyWindows);  // 设置老板键关联的窗口列表
     }
+    // 窗口列表始终同步：老板键还可由鼠标中键/侧键、屏幕角落触发，
+    // 即使热键无效（mod/vk 为 0）也必须更新，否则会沿用上一次的窗口列表
+    g_bossKey.SetWindows(g_config.bossKeyWindows);
 
-    // 注册一键关闭热键
-    if (g_config.bossKeyCloseMod != 0 || g_config.bossKeyCloseVK != 0) {
+    // 注册一键关闭热键（修饰键与主键缺一不可，裸键会全局劫持普通按键）
+    if (g_config.bossKeyCloseMod != 0 && g_config.bossKeyCloseVK != 0) {
         UINT closeMod = g_config.bossKeyCloseMod | MOD_NOREPEAT;
         if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, closeMod, g_config.bossKeyCloseVK)) {
             if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, g_config.bossKeyCloseMod, g_config.bossKeyCloseVK)) {
-                MessageBoxW(g_mainWnd, L"关闭热键注册失败，可能被其他程序占用", APP_NAME, MB_OK | MB_ICONWARNING);
+                WarnHotkeyOnce(L"关闭热键注册失败，可能被其他程序占用");
             }
         }
     }
 
     // 注册自定义热键
+    // 注册失败的条目聚合为一条提示，避免失效/冲突条目较多时连环弹窗
+    std::vector<std::wstring> failedHotkeys;
     if (g_config.customHotkeysEnabled) {
         for (size_t i = 0; i < g_config.customHotkeys.size() && i < MAX_CUSTOM_HOTKEYS; i++) {
             const auto& hk = g_config.customHotkeys[i];
-            if (hk.mod != 0 || hk.vk != 0) {
-                UINT customMod = hk.mod | MOD_NOREPEAT;
-                if (!RegisterHotKey(g_mainWnd, CUSTOM_HOTKEY_ID_START + (int)i, customMod, hk.vk)) {
-                    if (!RegisterHotKey(g_mainWnd, CUSTOM_HOTKEY_ID_START + (int)i, hk.mod, hk.vk)) {
-                        std::wstring msg = L"自定义热键 " + hk.DisplayName() + L" 注册失败，可能被其他程序占用";
-                        MessageBoxW(g_mainWnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
-                    }
+            if (hk.mod == 0 || hk.vk == 0) continue;  // 兜底：非法条目不注册
+            UINT customMod = hk.mod | MOD_NOREPEAT;
+            if (!RegisterHotKey(g_mainWnd, CUSTOM_HOTKEY_ID_START + (int)i, customMod, hk.vk)) {
+                if (!RegisterHotKey(g_mainWnd, CUSTOM_HOTKEY_ID_START + (int)i, hk.mod, hk.vk)) {
+                    std::wstring name = hk.DisplayName();
+                    failedHotkeys.push_back(name.empty() ? L"(未命名热键)" : name);
                 }
             }
         }
+    }
+    if (!failedHotkeys.empty()) {
+        std::wstring msg = L"以下自定义热键注册失败，可能与其他热键或程序冲突：\n";
+        size_t showCount = std::min(failedHotkeys.size(), (size_t)10);
+        for (size_t i = 0; i < showCount; ++i) msg += L"• " + failedHotkeys[i] + L"\n";
+        if (failedHotkeys.size() > showCount) {
+            msg += L"……等共 " + std::to_wstring(failedHotkeys.size()) + L" 个";
+        }
+        WarnHotkeyOnce(msg);
     }
 
     // --- 老板键附加功能配置 ---
@@ -945,7 +1041,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.10.0.0904",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.10.0.0905",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1056,42 +1152,19 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     // --- 锁定键状态通知 ---
-    // 由键盘钩子发送，wp 为虚拟键码，lp 为状态：
-    //   0=关闭, 1=开启, 2=查询当前状态, 3=已锁定且开启
+    // 由键盘钩子发送，wp 为虚拟键码，lp 为状态：0=关闭, 1=开启, 3=已锁定且开启
     case WM_LOCKKEY_NOTIFY: {
         int vkCode = (int)wp;
         bool locked = (lp == 3);
-        bool state;
-        if (lp == 2) {
-            state = (GetKeyState(vkCode) & 0x0001) != 0;
-        } else {
-            state = lp != 0;
-        }
+        bool state = lp != 0;
         g_overlay.Show(vkCode, state, locked);  // 显示锁定键状态悬浮提示
         return 0;
     }
 
     // --- 静音状态通知 ---
     case WM_MUTE_NOTIFY: {
-        if (g_config.showMuteOverlay) {
-            bool isMuted = false;
-            int volLevel = 0;
-            g_overlay.GetAudioState(isMuted, volLevel);  // 获取当前音频状态
-            g_overlay.ShowMute(isMuted);  // 显示静音状态悬浮提示
-        }
-        return 0;
-    }
-
-    // --- 热键被屏蔽通知 ---
-    // 来自 KeyboardHook 的延迟通知，wParam=修饰键，lParam=虚拟键码
-    case WM_HOTKEY_BLOCKED: {
-#ifdef _DEBUG
-        // 调试模式下记录被屏蔽的热键
-        wchar_t buf[64];
-        swprintf_s(buf, L"[KeySentry] Hotkey blocked: mod=0x%X, vk=0x%X\n",
-                   (UINT)wParam, (UINT)lParam);
-        OutputDebugStringW(buf);
-#endif
+        // 键盘钩子已按 showMuteOverlay 过滤，这里直接显示（内部仅查询一次音频状态）
+        g_overlay.ShowMute();
         return 0;
     }
 
@@ -1105,6 +1178,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CheckAutoHide();  // 自动隐藏：检查用户空闲时间是否超时
         } else if (wp == TIMER_NUMLOCK_DELAY) {
             KillTimer(g_mainWnd, TIMER_NUMLOCK_DELAY);  // 一次性定时器，执行后立即销毁
+            g_numLockTimerArmed = false;                // 允许下次启用时重新启动定时器
             ForceNumLockOn();
             if (g_config.disableNumLock && g_config.showLockKeyOverlay) {
                 PostMessageW(g_mainWnd, WM_LOCKKEY_NOTIFY, (WPARAM)VK_NUMLOCK, 3);
@@ -1225,6 +1299,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, TIMER_WIND_CHECK);
             KillTimer(hwnd, TIMER_CORNER_CHECK);
             KillTimer(hwnd, TIMER_AUTO_HIDE);
+            KillTimer(hwnd, TIMER_NUMLOCK_DELAY);  // 清理 NumLock 延迟定时器
             if (g_bossKey.IsActive()) {
                 if (g_config.bossKeyCloseOnExit) {
                     // 关机路径用短超时（500ms），避免阻塞系统关机
@@ -1253,6 +1328,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_WIND_CHECK);
         KillTimer(hwnd, TIMER_CORNER_CHECK);
         KillTimer(hwnd, TIMER_AUTO_HIDE);
+        KillTimer(hwnd, TIMER_NUMLOCK_DELAY);  // 清理 NumLock 延迟定时器
         if (g_bossKey.IsActive()) {
             if (g_config.bossKeyCloseOnExit) {
                 g_bossKey.CloseBoundProcesses();  // 配置了退出时关闭关联进程
@@ -1305,6 +1381,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     // --- 单实例检测 ---
+    // 创建失败（hMutex == NULL）时不视为致命错误，优雅降级为继续启动，
+    // 仅失去多开保护；后续所有使用点均需判空
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // 已有实例运行，尝试激活其托盘图标双击事件（打开设置）
@@ -1335,8 +1413,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
     if (!RegisterClassW(&wc)) {
         MessageBoxW(nullptr, L"窗口类注册失败", APP_NAME, MB_OK | MB_ICONERROR);
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
+        // 互斥体创建可能失败（返回 NULL），清理前需判空
+        if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
         return 1;
     }
 
@@ -1350,8 +1428,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     if (!g_mainWnd) {
         MessageBoxW(nullptr, L"主窗口创建失败", APP_NAME, MB_OK | MB_ICONERROR);
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
+        if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
         return 1;
     }
 
@@ -1360,12 +1437,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         MessageBoxW(nullptr, L"提示窗口创建失败", APP_NAME, MB_OK | MB_ICONERROR);
     }
 
-    // --- 安装键盘钩子 ---
-    if (!g_hook.Install(g_mainWnd)) {
-        MessageBoxW(nullptr, L"键盘钩子安装失败，部分功能可能不可用。\n请检查是否有安全软件拦截。", APP_NAME, MB_OK | MB_ICONWARNING);
-    }
-
     // --- 应用配置并添加托盘图标 ---
+    // 键盘钩子由 ApplyConfig 按需安装，此处不再无条件安装
     ApplyConfig();
     ApplyExplorerSettings();  // 启动时重置资源管理器文件夹选项
     AddTrayIcon(g_mainWnd);

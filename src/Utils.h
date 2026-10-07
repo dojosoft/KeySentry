@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 #include <Windows.h>
 #include <objbase.h>
 #include <Psapi.h>
@@ -13,19 +14,33 @@
 // ============================================================
 namespace ProcessUtils {
     // 根据进程ID获取进程完整路径，优先使用 QueryFullProcessImageNameW，失败则回退到 GetModuleFileNameExW
+    // 路径可能超过 MAX_PATH（Win10+ 长路径），故采用两段式查询
     inline std::wstring GetProcessPath(DWORD pid) {
         HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (!hProc) return L"";
+        std::wstring result;
+
+        // 第一段：按 MAX_PATH 缓冲查询；若路径更长，API 会在 size 中返回所需长度
         wchar_t path[MAX_PATH] = {};
         DWORD size = MAX_PATH;
-        std::wstring result;
         if (QueryFullProcessImageNameW(hProc, 0, path, &size)) {
-            result = path;
-        } else {
-            if (GetModuleFileNameExW(hProc, nullptr, path, MAX_PATH)) {
-                result = path;
+            result.assign(path, size);
+        } else if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && size > MAX_PATH) {
+            // 第二段：按所需长度重新分配并查询
+            std::wstring big(size, L'\0');
+            DWORD size2 = (DWORD)big.size();
+            if (QueryFullProcessImageNameW(hProc, 0, &big[0], &size2)) {
+                result.assign(big.c_str(), size2);
             }
         }
+
+        // 回退：GetModuleFileNameExW（缓冲同样放大，避免长路径再次失败）
+        if (result.empty()) {
+            std::wstring big(1024, L'\0');
+            DWORD len = GetModuleFileNameExW(hProc, nullptr, &big[0], (DWORD)big.size());
+            if (len > 0 && len < big.size()) result.assign(big.c_str(), len);
+        }
+
         CloseHandle(hProc);
         return result;
     }
@@ -37,23 +52,34 @@ namespace ProcessUtils {
         size_t pos = fullPath.find_last_of(L"\\/");
         return (pos != std::wstring::npos) ? fullPath.substr(pos + 1) : fullPath;
     }
-}
 
-// ============================================================
-// HandleGuard: Windows HANDLE 的 RAII 包装，自动关闭句柄
-// ============================================================
-class HandleGuard {
-    HANDLE m_h;
-public:
-    explicit HandleGuard(HANDLE h = nullptr) : m_h(h) {}
-    ~HandleGuard() { if (m_h && m_h != INVALID_HANDLE_VALUE) CloseHandle(m_h); }
-    HandleGuard(const HandleGuard&) = delete;
-    HandleGuard& operator=(const HandleGuard&) = delete;
-    HandleGuard(HandleGuard&& o) noexcept : m_h(o.m_h) { o.m_h = nullptr; }
-    HandleGuard& operator=(HandleGuard&& o) noexcept { if (this != &o) { if (m_h) CloseHandle(m_h); m_h = o.m_h; o.m_h = nullptr; } return *this; }
-    HANDLE get() const { return m_h; }
-    operator bool() const { return m_h != nullptr && m_h != INVALID_HANDLE_VALUE; }
-};
+    // 进程路径信息（含可执行文件名与完整路径）
+    struct ProcPathInfo {
+        std::wstring name;      // 可执行文件名（不含路径）
+        std::wstring path;      // 进程完整路径
+        bool resolved = false;  // 是否成功解析到路径
+    };
+
+    // 进程路径缓存：单次窗口枚举期间缓存 pid->路径，避免每个窗口重复 OpenProcess
+    class PathCache {
+    public:
+        // 获取指定进程的路径信息（首次查询后缓存，后续直接命中）
+        const ProcPathInfo& Get(DWORD pid) {
+            auto it = m_map.find(pid);
+            if (it != m_map.end()) return it->second;
+            ProcPathInfo info;
+            info.path = GetProcessPath(pid);
+            if (!info.path.empty()) {
+                size_t pos = info.path.find_last_of(L"\\/");
+                info.name = (pos != std::wstring::npos) ? info.path.substr(pos + 1) : info.path;
+                info.resolved = true;
+            }
+            return m_map.emplace(pid, std::move(info)).first->second;
+        }
+    private:
+        std::unordered_map<DWORD, ProcPathInfo> m_map;
+    };
+}
 
 // ============================================================
 // GdiObjectGuard: GDI 对象的 RAII 包装，自动删除 GDI 对象
@@ -99,10 +125,15 @@ public:
 
 // 主窗口句柄，全局共享
 extern HWND g_mainWnd;
+// 按键捕获期间为 true：各处模态消息循环据此丢弃 WM_HOTKEY，
+// 避免捕获操作本身触发热键动作（如老板键隐藏窗口）打断捕获
+extern bool g_suppressHotkeys;
 
 struct AppConfig;
 // 预检查热键冲突（在设置对话框中应用前调用）
 extern std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig);
+// 弹出托盘气泡通知（warning 为 true 时用警告图标）；实现见 Main.cpp
+extern void ShowTrayNotification(const std::wstring& text, bool warning);
 
 // ============================================================
 // RunModalLoop: 模态消息循环，用于模态对话框
@@ -114,8 +145,13 @@ inline int RunModalLoop(HWND dlg) {
         BOOL ret = GetMessageW(&msg, nullptr, 0, 0);
         if (ret <= 0) { if (ret == 0) PostQuitMessage((int)msg.wParam); break; }
         if (!IsWindow(dlg)) break;
-        // 热键消息转发给主窗口处理，避免在模态对话框中被吞掉
-        if (msg.message == WM_HOTKEY) { if (g_mainWnd && IsWindow(g_mainWnd)) SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam); continue; }
+        // 热键消息转发给主窗口处理，避免在模态对话框中被吞掉；
+        // 按键捕获期间丢弃 WM_HOTKEY，避免触发热键动作打断捕获
+        if (msg.message == WM_HOTKEY) {
+            if (!g_suppressHotkeys && g_mainWnd && IsWindow(g_mainWnd))
+                SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -146,53 +182,8 @@ namespace IniUtils {
     inline std::wstring BoolToStr(bool v) { return std::to_wstring(v ? 1 : 0); }
 }
 
-// ============================================================
-// DpiUtils: DPI 缩放工具，支持高 DPI 显示
-// ============================================================
-namespace DpiUtils {
-    // 获取指定窗口的 DPI 缩放比例（相对于 96 DPI）
-    inline float GetDpiScale(HWND hwnd) {
-        // 优先使用 Win10+ 的 GetDpiForWindow API
-        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
-        if (hUser32) {
-            typedef UINT(WINAPI* GetDpiForWindow_t)(HWND);
-            auto pGetDpiForWindow = reinterpret_cast<GetDpiForWindow_t>(
-                GetProcAddress(hUser32, "GetDpiForWindow"));
-            if (pGetDpiForWindow && hwnd) {
-                UINT dpi = pGetDpiForWindow(hwnd);
-                if (dpi > 0) return dpi / 96.0f;
-            }
-        }
-        // 回退方案：使用 DC 的 LOGPIXELSY
-        HDC hdc = GetDC(hwnd);
-        float scale = GetDeviceCaps(hdc, LOGPIXELSY) / 96.0f;
-        ReleaseDC(hwnd, hdc);
-        return scale;
-    }
-
-    // 按缩放比例换算像素值
-    inline int Scale(int px, float scale) { return (int)(px * scale + 0.5f); }
-}
-
-// ============================================================
-// WindowUtils: 窗口相关工具
-// ============================================================
-namespace WindowUtils {
-    // 获取当前按下的修饰键组合（Ctrl/Shift/Alt/Win）
-    inline UINT GetCurrentModifiers() {
-        UINT mod = 0;
-        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mod |= MOD_CONTROL;
-        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mod |= MOD_SHIFT;
-        if (GetAsyncKeyState(VK_MENU) & 0x8000) mod |= MOD_ALT;
-        if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) mod |= MOD_WIN;
-        return mod;
-    }
-}
-
 // 关闭进程的超时时间（毫秒），超时后强制终止
 static constexpr DWORD PROCESS_CLOSE_TIMEOUT_MS = 3000;
-// 窗口标题缓冲区大小
-static constexpr int WINDOW_TITLE_BUFFER_SIZE = 512;
 
 // 判断指定虚拟键码是否需要 KEYEVENTF_EXTENDEDKEY 标志
 // 包括导航键、NumLock、右 Ctrl/Alt、Win 键等

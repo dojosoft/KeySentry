@@ -224,14 +224,15 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
 // OverlayWindow::ShowMute - 显示静音状态浮层
 // 显示喇叭图标、静音/取消静音标签、音量百分比和音量条
 // ============================================================
-void OverlayWindow::ShowMute(bool muted) {
+void OverlayWindow::ShowMute() {
     if (m_hwnds.empty()) return;
 
     m_showMuteOverlay = true;
 
-    bool isMuted;
+    // 一次查询同时获取静音状态与音量，避免调用方重复查询音频状态
+    bool isMuted = false;
     GetAudioState(isMuted, m_audioVolume);
-    m_audioMuted = muted;
+    m_audioMuted = isMuted;
 
     auto monitors = GetTargetMonitors();
     EnsureWindowCount((int)monitors.size());

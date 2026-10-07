@@ -3,6 +3,7 @@
 #include "Utils.h"
 #include <algorithm>
 #include <unordered_set>
+#include <ShlObj.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 
@@ -49,6 +50,7 @@ void BossKey::SetSendPauseBeforeHide(bool enabled) { m_sendPauseBeforeHide = ena
 struct EnumBossData {
     const std::vector<BoundWindowInfo>* boundWindows;
     std::vector<HWND>* results;
+    ProcessUtils::PathCache* cache;  // 单次枚举内复用进程路径，避免同一 pid 重复 OpenProcess
 };
 
 // EnumWindows 回调：收集匹配绑定规则的可见窗口
@@ -57,7 +59,8 @@ static BOOL CALLBACK EnumBossWindowsProc(HWND hwnd, LPARAM lParam) {
     auto* data = reinterpret_cast<EnumBossData*>(lParam);
 
     for (const auto& info : *data->boundWindows) {
-        if (info.Matches(hwnd)) {
+        // 使用带缓存的匹配：进程匹配模式下按 pid 复用路径查询结果
+        if (info.Matches(hwnd, *data->cache)) {
             data->results->push_back(hwnd);
             return TRUE;
         }
@@ -77,9 +80,10 @@ static BOOL CALLBACK EnumBossWindowsProc(HWND hwnd, LPARAM lParam) {
 void BossKey::HideWindows() {
     m_hiddenWindows.clear();
 
-    // 枚举匹配绑定规则的窗口
+    // 枚举匹配绑定规则的窗口（枚举期间复用进程路径缓存）
     std::vector<HWND> matching;
-    EnumBossData data{ &m_boundWindows, &matching };
+    ProcessUtils::PathCache cache;
+    EnumBossData data{ &m_boundWindows, &matching, &cache };
     EnumWindows(EnumBossWindowsProc, reinterpret_cast<LPARAM>(&data));
 
     // 保存窗口信息（显示状态、进程ID、路径），用于恢复
@@ -231,9 +235,10 @@ void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
         closedPids.insert(pid);
     }
 
-    // 收集可见匹配窗口的进程ID（复用 EnumBossData 结构）
+    // 收集可见匹配窗口的进程ID（复用 EnumBossData 结构，同样复用进程路径缓存）
     std::vector<HWND> visibleMatching;
-    EnumBossData cdata{ &m_boundWindows, &visibleMatching };
+    ProcessUtils::PathCache cache;
+    EnumBossData cdata{ &m_boundWindows, &visibleMatching, &cache };
     EnumWindows(EnumBossWindowsProc, reinterpret_cast<LPARAM>(&cdata));
 
     for (HWND hwnd : visibleMatching) {
@@ -310,10 +315,28 @@ void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
 std::wstring BossKey::GetRecoverFilePath() {
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring path(exePath);
-    size_t pos = path.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) path = path.substr(0, pos + 1);
-    return path + L"KeySentry.recover";
+    std::wstring dir(exePath);
+    size_t pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) dir = dir.substr(0, pos + 1);
+
+    // 目录策略与 INI 一致：优先 exe 同目录（便携模式）；
+    // 目录只读（如 Program Files）时回退 %APPDATA%\KeySentry，
+    // 避免恢复文件写入静默失败导致崩溃后无法恢复被隐藏的窗口
+    std::wstring testPath = dir + L".~rtest.tmp";
+    HANDLE hTest = CreateFileW(testPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (hTest != INVALID_HANDLE_VALUE) {
+        CloseHandle(hTest);  // 关闭即自动删除测试文件
+        return dir + L"KeySentry.recover";
+    }
+
+    wchar_t appData[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
+        std::wstring ad = std::wstring(appData) + L"\\KeySentry";
+        CreateDirectoryW(ad.c_str(), nullptr);
+        return ad + L"\\KeySentry.recover";
+    }
+    return dir + L"KeySentry.recover";  // 获取 AppData 失败时仍返回原路径
 }
 
 void BossKey::SaveRecoverFile() {

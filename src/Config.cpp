@@ -5,10 +5,17 @@
 
 // ============================================================
 // BoundWindowInfo::Matches
-// 判断指定窗口是否匹配此绑定信息
+// 窗口/进程匹配相关实现
 //   - Process 模式：按进程名或完整路径匹配（不区分大小写）
 //   - Window 模式：按窗口标题子串匹配
 // ============================================================
+// 判断进程可执行名/完整路径是否匹配（进程名或完整路径任一相同即视为匹配）
+bool BoundWindowInfo::MatchesProcessInfo(const std::wstring& exeName, const std::wstring& fullPath) const {
+    if (!processName.empty() && _wcsicmp(exeName.c_str(), processName.c_str()) == 0) return true;
+    if (!processPath.empty() && _wcsicmp(fullPath.c_str(), processPath.c_str()) == 0) return true;
+    return false;
+}
+
 bool BoundWindowInfo::Matches(HWND hwnd, bool requireVisible) const {
     if (!IsWindow(hwnd)) return false;
     if (requireVisible && !IsWindowVisible(hwnd)) return false;
@@ -23,9 +30,7 @@ bool BoundWindowInfo::Matches(HWND hwnd, bool requireVisible) const {
         // 提取可执行文件名用于匹配
         size_t pos = fullPath.find_last_of(L"\\/");
         std::wstring exeName = (pos != std::wstring::npos) ? fullPath.substr(pos + 1) : fullPath;
-        if (!processName.empty() && _wcsicmp(exeName.c_str(), processName.c_str()) == 0) return true;
-        if (!processPath.empty() && _wcsicmp(fullPath.c_str(), processPath.c_str()) == 0) return true;
-        return false;
+        return MatchesProcessInfo(exeName, fullPath);
     }
 
     // Window 模式：标题子串匹配
@@ -38,6 +43,19 @@ bool BoundWindowInfo::Matches(HWND hwnd, bool requireVisible) const {
     }
 
     return false;
+}
+
+// 带进程路径缓存的匹配：仅 Process 模式走缓存，避免每个窗口都 OpenProcess 查询路径
+bool BoundWindowInfo::Matches(HWND hwnd, ProcessUtils::PathCache& cache, bool requireVisible) const {
+    if (matchMode != MatchMode::Process) return Matches(hwnd, requireVisible);
+    if (!IsWindow(hwnd)) return false;
+    if (requireVisible && !IsWindowVisible(hwnd)) return false;
+    DWORD hwndPid = 0;
+    GetWindowThreadProcessId(hwnd, &hwndPid);
+    if (hwndPid == 0) return false;
+    const auto& info = cache.Get(hwndPid);
+    if (!info.resolved) return false;
+    return MatchesProcessInfo(info.name, info.path);
 }
 
 // ============================================================
@@ -114,6 +132,11 @@ static std::vector<std::wstring> ParsePipes(const std::wstring& csv) {
 // AppConfig::Load - 从 INI 文件加载所有配置项
 // ============================================================
 void AppConfig::Load(const std::wstring& iniPath) {
+    // --- 加载策略说明 ---
+    // 采取「尽力读取」：无论 INI 由哪个版本写入，都按当前已知字段逐个读取，
+    // 未知或已废弃的字段自然被忽略，不会因版本号更高而整体放弃配置。
+    // 保存时再按最新配置规范重写（见 Save），实现配置格式的自动收敛。
+
     // --- 通用设置 ---
     autoStart = GetPrivateProfileIntW(L"General", L"AutoStart", 0, iniPath.c_str()) != 0;
     showLockKeyOverlay = GetPrivateProfileIntW(L"General", L"ShowOverlay", 1, iniPath.c_str()) != 0;
@@ -139,15 +162,9 @@ void AppConfig::Load(const std::wstring& iniPath) {
     auto remapStr = IniUtils::Read(iniPath, L"KeyRemap", L"Mappings");
     auto remapInts = ParseCSVInts(remapStr);
     // 重映射以成对形式存储：{源键, 目标键}
+    keyRemappings.clear();   // 重复载入时避免沿用上一次的映射项
     for (size_t i = 0; i + 1 < remapInts.size(); i += 2) {
         keyRemappings.push_back({remapInts[i], remapInts[i + 1]});
-    }
-
-    // --- 热键屏蔽 ---
-    auto hkStr = IniUtils::Read(iniPath, L"HotkeyBlock", L"DisabledHotkeys");
-    auto hkInts = ParseCSVInts(hkStr);
-    for (size_t i = 0; i + 1 < hkInts.size(); i += 2) {
-        disabledHotkeys.push_back({(UINT)hkInts[i], (UINT)hkInts[i + 1]});
     }
 
     // --- 自定义热键 ---
@@ -157,7 +174,19 @@ void AppConfig::Load(const std::wstring& iniPath) {
         auto parts = ParseEntryList(customStr);
         customHotkeys.clear();
         for (const auto& p : parts) {
-            if (!p.empty()) customHotkeys.push_back(CustomHotkey::Deserialize(p));
+            if (p.empty()) continue;
+            CustomHotkey hk = CustomHotkey::Deserialize(p);
+            // 丢弃手改 INI 产生的非法条目：无修饰键或无主键时注册会全局劫持普通按键
+            if (hk.mod == 0 || hk.vk == 0) continue;
+            // 丢弃重复组合（mod+vk 相同只保留第一条），避免注册失败连环弹窗
+            bool duplicated = false;
+            for (const auto& existing : customHotkeys) {
+                if (existing.mod == hk.mod && existing.vk == hk.vk) { duplicated = true; break; }
+            }
+            if (duplicated) continue;
+            customHotkeys.push_back(hk);
+            // 超出注册上限的条目直接丢弃（保存时即收敛为合法配置）
+            if ((int)customHotkeys.size() >= MAX_CUSTOM_HOTKEYS) break;
         }
     }
 
@@ -267,12 +296,8 @@ void AppConfig::Save(const std::wstring& iniPath) const {
     for (auto& p : keyRemappings) { remapFlat.push_back(p.first); remapFlat.push_back(p.second); }
     IniUtils::Write(iniPath, L"KeyRemap", L"Mappings", IntsToCSV(remapFlat));
 
-    // 热键屏蔽
-    std::vector<int> hkFlat;
-    for (auto& p : disabledHotkeys) { hkFlat.push_back((int)p.first); hkFlat.push_back((int)p.second); }
-    IniUtils::Write(iniPath, L"HotkeyBlock", L"DisabledHotkeys", IntsToCSV(hkFlat));
-
-    // 自定义热键
+    // 自定义热键：始终按当前序列化规范整体重写，
+    // 旧版本遗留的废弃字段（sound/opacity/autoStart）在此被丢弃
     IniUtils::Write(iniPath, L"CustomHotkeys", L"Enabled", IniUtils::BoolToStr(customHotkeysEnabled));
     {
         std::vector<std::wstring> serialized;
@@ -315,12 +340,6 @@ void AppConfig::Save(const std::wstring& iniPath) const {
 
     // 刷新 INI 文件缓存，确保写入磁盘
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, iniPath.c_str());
-}
-
-// 判断指定虚拟键码是否被禁用（包括 NumLock 特殊处理）
-bool AppConfig::IsKeyDisabled(int vkCode) const {
-    if (disableNumLock && vkCode == VK_NUMLOCK) return true;
-    return std::find(disabledKeyCodes.begin(), disabledKeyCodes.end(), vkCode) != disabledKeyCodes.end();
 }
 
 // ============================================================

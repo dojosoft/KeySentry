@@ -75,7 +75,7 @@ private:
     // 鼠标低级钩子回调
     static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-    // 获取恢复文件路径（exe 同目录下 KeySentry.recover）
+    // 获取恢复文件路径（优先 exe 同目录的 KeySentry.recover，目录只读时回退 %APPDATA%\KeySentry）
     static std::wstring GetRecoverFilePath();
     // 删除恢复文件（窗口恢复/进程关闭后调用）
     void ClearRecoverFile();

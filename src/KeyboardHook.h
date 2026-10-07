@@ -10,7 +10,6 @@
 //   - 禁用 NumLock 键
 //   - 强制 Insert 模式（屏蔽 Insert 键）
 //   - 按键重映射
-//   - 屏蔽系统热键
 //   - 锁键状态浮层通知
 //   - 静音状态浮层通知
 // ============================================================
@@ -34,12 +33,12 @@ public:
     void SetForceInsertMode(bool force);
     // 启用/禁用锁键状态浮层通知
     void SetShowOverlay(bool show);
+    // 启用/禁用静音状态浮层通知（与锁键浮层相互独立）
+    void SetShowMuteOverlay(bool show);
     // 启用/禁用按键重映射
     void SetKeyRemapEnabled(bool enabled);
     // 设置按键重映射表：{源键虚拟码, 目标键虚拟码}
     void SetKeyRemappings(const std::vector<std::pair<int, int>>& remappings);
-    // 设置被屏蔽的系统热键列表：{修饰键, 虚拟键}
-    void SetDisabledHotkeys(const std::vector<std::pair<UINT, UINT>>& hotkeys);
     // 标记当前正在模拟输入（避免钩子递归拦截自己发送的按键）
     void SetSimulatingInput(bool sim);
     // 启用/禁用热键捕获模式（捕获模式下不拦截任何按键）
@@ -49,9 +48,6 @@ private:
     // 低级键盘钩子回调函数
     static LRESULT CALLBACK LowLevelProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-    // 延迟处理热键屏蔽（从钩子回调 PostMessage 到主窗口执行）
-    void ProcessBlockedHotkey(UINT mod, UINT vk);
-
     HHOOK m_hook = nullptr;            // 钩子句柄
     HWND m_notifyWnd = nullptr;        // 通知窗口句柄
     std::vector<int> m_disabledKeys;   // 被禁用的按键虚拟码列表
@@ -59,9 +55,9 @@ private:
     bool m_disableNumLock = false;     // 是否禁用 NumLock 键
     bool m_forceInsert = false;        // 是否强制 Insert 模式
     bool m_showOverlay = true;         // 是否显示锁键状态浮层
+    bool m_showMuteOverlay = false;    // 是否显示静音状态浮层
     bool m_keyRemapEnabled = false;    // 是否启用按键重映射
     std::vector<std::pair<int, int>> m_remappings; // 按键重映射表
-    std::vector<std::pair<UINT, UINT>> m_disabledHotkeys; // 被屏蔽的系统热键
     bool m_simulatingInput = false;    // 正在模拟输入（用于防止递归拦截）
     bool m_captureMode = false;        // 热键捕获模式（不拦截任何按键）
 

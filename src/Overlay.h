@@ -19,8 +19,8 @@ public:
     void Destroy();
     // 显示锁键状态浮层（CapsLock/NumLock/ScrollLock）
     void Show(int vkCode, bool state, bool locked = false);
-    // 显示静音状态浮层
-    void ShowMute(bool muted);
+    // 显示静音状态浮层（内部自行查询当前静音状态与音量）
+    void ShowMute();
     // 获取当前系统音频状态（是否静音、音量百分比）
     void GetAudioState(bool& isMuted, int& volumeLevel);
     // 设置是否仅在主显示器显示浮层
