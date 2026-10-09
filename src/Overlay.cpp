@@ -190,6 +190,16 @@ void OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
 void OverlayWindow::Show(int vkCode, bool state, bool locked) {
     if (m_hwnds.empty()) return;
 
+    // 连发/重复通知防护：内容完全一致，或距上次显示不足去抖间隔时直接返回，
+    // 不再执行置顶重排、重绘与定时器重置（否则会使浮层闪烁并拖垮任务栏/DWM）
+    bool visible = IsWindowVisible(m_hwnds[0]) != FALSE;
+    ULONGLONG now = GetTickCount64();
+    bool sameContent = (!m_showMuteOverlay && m_vkCode == vkCode &&
+                        m_state == state && m_locked == locked);
+    bool tooSoon = (m_lastShowTick != 0) && (now - m_lastShowTick < OVERLAY_MIN_REPEAT_MS);
+    if (visible && (sameContent || tooSoon)) return;
+    m_lastShowTick = now;
+
     m_vkCode = vkCode;
     m_state = state;
     m_locked = locked;
@@ -206,9 +216,13 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
         int x = (screenW - OVERLAY_SIZE) / 2 + mi.rcWork.left;
         int y = mi.rcWork.bottom - OVERLAY_KEY_HEIGHT - OVERLAY_BOTTOM_MARGIN;
 
-        SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_KEY_HEIGHT,
-                     SWP_SHOWWINDOW | SWP_NOACTIVATE);
-        InvalidateRect(m_hwnds[i], nullptr, TRUE);
+        // 仅在窗口原本隐藏时才重新置顶显示，避免可见状态下的重复 SetWindowPos
+        if (!IsWindowVisible(m_hwnds[i])) {
+            SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_KEY_HEIGHT,
+                         SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        }
+        // bErase=FALSE：WM_PAINT 已整窗填充背景，且 WM_ERASEBKGND 已返回 1
+        InvalidateRect(m_hwnds[i], nullptr, FALSE);
         KillTimer(m_hwnds[i], TIMER_OVERLAY);
         SetTimer(m_hwnds[i], TIMER_OVERLAY, OVERLAY_SHOW_DURATION_MS, nullptr);
     }
@@ -227,6 +241,13 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
 void OverlayWindow::ShowMute() {
     if (m_hwnds.empty()) return;
 
+    // 连发去抖：静音键被按住时系统会持续产生 keydown，此处丢弃过密的重复通知
+    bool visible = IsWindowVisible(m_hwnds[0]) != FALSE;
+    ULONGLONG now = GetTickCount64();
+    bool tooSoon = (m_lastShowTick != 0) && (now - m_lastShowTick < OVERLAY_MIN_REPEAT_MS);
+    if (visible && tooSoon) return;
+    m_lastShowTick = now;
+
     m_showMuteOverlay = true;
 
     // 一次查询同时获取静音状态与音量，避免调用方重复查询音频状态
@@ -244,9 +265,12 @@ void OverlayWindow::ShowMute() {
         int x = (screenW - OVERLAY_SIZE) / 2 + mi.rcWork.left;
         int y = mi.rcWork.bottom - OVERLAY_SIZE - OVERLAY_BOTTOM_MARGIN;
 
-        SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_SIZE,
-                     SWP_SHOWWINDOW | SWP_NOACTIVATE);
-        InvalidateRect(m_hwnds[i], nullptr, TRUE);
+        // 仅在窗口原本隐藏时才重新置顶显示
+        if (!IsWindowVisible(m_hwnds[i])) {
+            SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_SIZE,
+                         SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        }
+        InvalidateRect(m_hwnds[i], nullptr, FALSE);
         KillTimer(m_hwnds[i], TIMER_OVERLAY);
         SetTimer(m_hwnds[i], TIMER_OVERLAY, OVERLAY_SHOW_DURATION_MS, nullptr);
     }

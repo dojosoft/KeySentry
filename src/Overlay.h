@@ -54,6 +54,7 @@ private:
     bool m_showMuteOverlay = false; // 是否显示静音浮层（而非锁键浮层）
     bool m_primaryOnly = false;     // 是否仅在主显示器显示
     HINSTANCE m_hInst = nullptr;    // 应用实例句柄
+    ULONGLONG m_lastShowTick = 0;   // 上次真正显示浮层的时刻（用于连发去抖）
 
     static const wchar_t* CLASS_NAME; // 浮层窗口类名
 
@@ -63,6 +64,9 @@ private:
     static const int OVERLAY_SHOW_DURATION_MS = 1000; // 浮层显示持续时间（毫秒）
     static const int OVERLAY_KEY_HEIGHT = 98;         // 锁键浮层高度（比静音浮层矮）
     static const int OVERLAY_BOTTOM_MARGIN = 50;      // 浮层距屏幕底部的边距
+    // 连发去抖：距上次真正显示不足该毫秒数的重复通知直接丢弃，
+    // 防止按键连发时高频置顶重绘（浮层闪烁、任务栏卡顿）
+    static const ULONGLONG OVERLAY_MIN_REPEAT_MS = 80;
     static const int OVERLAY_BAR_MARGIN = 12;         // 音量条左右边距
     static const int OVERLAY_BAR_HEIGHT = 10;         // 音量条高度
     static const int OVERLAY_ICON_Y = 30;             // 喇叭图标中心 Y 坐标

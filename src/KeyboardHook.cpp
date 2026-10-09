@@ -5,6 +5,10 @@
 
 KeyboardHook* KeyboardHook::s_instance = nullptr;
 
+// 锁键「已按下」标志的超时兜底时长：若超过该时长仍未收到 keyup（例如 keyup 丢失），
+// 视为标志失效并允许重新通知，避免按一次之后再也收不到浮层。
+static const ULONGLONG LOCK_KEY_HOLD_TIMEOUT_MS = 3000;
+
 KeyboardHook::KeyboardHook() {
     s_instance = this;
 }
@@ -12,6 +16,16 @@ KeyboardHook::KeyboardHook() {
 KeyboardHook::~KeyboardHook() {
     Uninstall();
     s_instance = nullptr;
+}
+
+// 锁键虚拟码 -> 下标（配合 m_lockKeyHeld / m_lockKeyHeldTick 使用）
+int KeyboardHook::LockKeyIndex(UINT vk) {
+    switch (vk) {
+    case VK_CAPITAL: return 0;
+    case VK_NUMLOCK: return 1;
+    case VK_SCROLL:  return 2;
+    default:         return -1;
+    }
 }
 
 // 安装 WH_KEYBOARD_LL 低级键盘钩子
@@ -132,17 +146,30 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                     return CallNextHookEx(s_instance->m_hook, nCode, wParam, lParam);
                 }
                 if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-                    // 发送两次切换：Windows ON→OFF→ON，键盘固件收到 ON 指示
-                    BYTE scanCode = (BYTE)MapVirtualKeyW(VK_NUMLOCK, MAPVK_VK_TO_VSC);
-                    keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);
-                    keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                    keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);
-                    keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                    // 显示 NumLock 已锁定的浮层提示（lp=3 表示已锁定且开启）
-                    if (s_instance->m_showOverlay) {
-                        PostMessageW(s_instance->m_notifyWnd, WM_LOCKKEY_NOTIFY,
-                                     (WPARAM)VK_NUMLOCK, 3);
+                    // 仅在物理按下的第一次 keydown 处理：连发时重复注入会造成
+                    // 大量 keybd_event 与浮层通知，拖垮系统
+                    int idx = LockKeyIndex(VK_NUMLOCK);
+                    ULONGLONG now = GetTickCount64();
+                    bool firstPress = !s_instance->m_lockKeyHeld[idx] ||
+                                      (now - s_instance->m_lockKeyHeldTick[idx]) > LOCK_KEY_HOLD_TIMEOUT_MS;
+                    if (firstPress) {
+                        s_instance->m_lockKeyHeld[idx] = true;
+                        s_instance->m_lockKeyHeldTick[idx] = now;
+                        // 发送两次切换：Windows ON→OFF→ON，键盘固件收到 ON 指示
+                        BYTE scanCode = (BYTE)MapVirtualKeyW(VK_NUMLOCK, MAPVK_VK_TO_VSC);
+                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);
+                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);
+                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+                        // 显示 NumLock 已锁定的浮层提示（lp=3 表示已锁定且开启）
+                        if (s_instance->m_showOverlay) {
+                            PostMessageW(s_instance->m_notifyWnd, WM_LOCKKEY_NOTIFY,
+                                         (WPARAM)VK_NUMLOCK, 3);
+                        }
                     }
+                } else {
+                    // keyup：清除按下标志，下次按下才会再次通知
+                    s_instance->m_lockKeyHeld[LockKeyIndex(VK_NUMLOCK)] = false;
                 }
                 return 1; // 屏蔽物理按键
             }
@@ -165,11 +192,19 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
             if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
                 // CapsLock / NumLock / ScrollLock 状态变化通知（受锁键浮层开关控制）
                 if (s_instance->m_showOverlay) {
-                    if (kb->vkCode == VK_CAPITAL || kb->vkCode == VK_NUMLOCK || kb->vkCode == VK_SCROLL) {
-                        // NumLock 禁用时，已在上面的专用段发送了通知，此处跳过避免双重发送
-                        if (kb->vkCode == VK_NUMLOCK && s_instance->m_disableNumLock) {
-                            // 已由 NumLock 专用段处理
-                        } else {
+                    int idx = LockKeyIndex(kb->vkCode);
+                    // NumLock 禁用时已在上面的专用段发送通知，此处跳过避免双重发送
+                    bool handledByNumLockBranch =
+                        (kb->vkCode == VK_NUMLOCK && s_instance->m_disableNumLock);
+                    if (idx >= 0 && !handledByNumLockBranch) {
+                        // 仅在物理按下的第一次 keydown 通知：连发时状态取反推算会失真，
+                        // 且高频重绘会使浮层闪烁并拖垮任务栏/DWM
+                        ULONGLONG now = GetTickCount64();
+                        bool firstPress = !s_instance->m_lockKeyHeld[idx] ||
+                                          (now - s_instance->m_lockKeyHeldTick[idx]) > LOCK_KEY_HOLD_TIMEOUT_MS;
+                        if (firstPress) {
+                            s_instance->m_lockKeyHeld[idx] = true;
+                            s_instance->m_lockKeyHeldTick[idx] = now;
                             bool oldState = (GetKeyState((int)kb->vkCode) & 0x0001) != 0;
                             bool newState = !oldState;
                             PostMessageW(s_instance->m_notifyWnd, WM_LOCKKEY_NOTIFY,
@@ -181,6 +216,10 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                 if (s_instance->m_showMuteOverlay && kb->vkCode == VK_VOLUME_MUTE) {
                     PostMessageW(s_instance->m_notifyWnd, WM_MUTE_NOTIFY, 0, 0);
                 }
+            } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+                // 锁键抬起：清除按下标志，使下一次按下能再次通知
+                int idx = LockKeyIndex(kb->vkCode);
+                if (idx >= 0) s_instance->m_lockKeyHeld[idx] = false;
             }
         }
     }

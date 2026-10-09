@@ -61,5 +61,13 @@ private:
     bool m_simulatingInput = false;    // 正在模拟输入（用于防止递归拦截）
     bool m_captureMode = false;        // 热键捕获模式（不拦截任何按键）
 
+    // 锁键连发抑制：只在物理按下的第一次 keydown 通知，keyup 时清除标志。
+    // 锁键被按住时系统会持续产生 keydown 连发消息，若不抑制会高频触发浮层
+    // 置顶重排与重绘，导致浮层闪烁并使任务栏/DWM 卡顿。
+    bool m_lockKeyHeld[3] = { false, false, false }; // Caps/Num/Scroll 是否已按下
+    ULONGLONG m_lockKeyHeldTick[3] = { 0, 0, 0 };    // 按下时刻（超时兜底，防止标志卡住）
+    // 锁键虚拟码 -> 下标：CAPITAL->0, NUMLOCK->1, SCROLL->2，其他返回 -1
+    static int LockKeyIndex(UINT vk);
+
     static KeyboardHook* s_instance;   // 单例指针，供静态回调使用
 };
