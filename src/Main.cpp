@@ -32,6 +32,10 @@ static constexpr UINT TIMER_WIND_CHECK_MS = 3000;    // Win+D 守护检查间隔
 static constexpr UINT TIMER_CORNER_CHECK_MS = 2000;  // 鼠标角落检测间隔（毫秒）
 static constexpr UINT TIMER_AUTO_HIDE_MS = 5000;     // 自动隐藏空闲检测间隔（毫秒）
 static constexpr UINT TIMER_NUMLOCK_DELAY_MS = 2000;  // 启动后延迟开启 NumLock 的时间（毫秒）
+// 静音键按下后，键盘钩子早于系统完成静音切换，故轮询等待系统真正生效后再显示浮层，
+// 保证浮层显示的静音状态与系统实际状态一致（约 500ms 上限后强制按真实状态显示）
+static constexpr UINT TIMER_MUTE_REFRESH_MS = 50;     // 静音状态轮询间隔（毫秒）
+static constexpr int  MUTE_REFRESH_MAX_TRIES = 10;    // 最大轮询次数
 
 // ===== 角落检测常量 =====
 static constexpr int CORNER_THRESHOLD = 10;              // 鼠标距屏幕角落的像素阈值
@@ -54,6 +58,8 @@ static bool g_trayIconVisible = true;  // 托盘图标是否可见
 static ULONGLONG g_lastCornerTick = 0; // 上次角落触发的时间戳，用于防抖
 static UINT g_msgTaskbarCreated = 0;  // TaskbarCreated 消息ID，用于 explorer 重启后恢复托盘图标
 static bool g_numLockTimerArmed = false; // NumLock 延迟定时器是否已启动，避免反复"应用"不断推迟
+static bool g_muteExpectState = false;   // 静音键按下后，系统应达到的目标静音状态
+static int  g_muteRefreshTries = 0;      // 静音状态轮询已尝试次数
 static bool g_numLockFeatureWasOn = false; // 上次应用配置时 NumLock 守护（禁用 NumLock / 强制开启）是否已启用
 
 // ===== SetSettingsWnd =====
@@ -1064,7 +1070,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.30.0.1011",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.30.1.1011",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1186,8 +1192,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     // --- 静音状态通知 ---
     case WM_MUTE_NOTIFY: {
-        // 键盘钩子已按 showMuteOverlay 过滤，这里直接显示（内部仅查询一次音频状态）
-        g_overlay.ShowMute();
+        // 键盘钩子在系统应用静音切换之前触发，此刻查询到的仍是切换前的旧状态；
+        // 先算出切换后的目标状态，再轮询等待系统真正生效后再显示，避免浮层与系统不一致
+        bool preMuted = false;
+        int preVolume = 0;
+        g_overlay.GetAudioState(preMuted, preVolume);
+        g_muteExpectState = !preMuted;
+        g_muteRefreshTries = 0;
+        SetTimer(g_mainWnd, TIMER_MUTE_REFRESH, TIMER_MUTE_REFRESH_MS, nullptr);
         return 0;
     }
 
@@ -1205,6 +1217,15 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ForceNumLockOn();
             if (g_config.disableNumLock && g_config.showLockKeyOverlay) {
                 PostMessageW(g_mainWnd, WM_LOCKKEY_NOTIFY, (WPARAM)VK_NUMLOCK, 3);
+            }
+        } else if (wp == TIMER_MUTE_REFRESH) {
+            // 轮询等待系统完成静音切换：状态达到目标值（或超时）后按真实状态显示浮层
+            bool curMuted = false;
+            int curVolume = 0;
+            g_overlay.GetAudioState(curMuted, curVolume);
+            if (curMuted == g_muteExpectState || ++g_muteRefreshTries >= MUTE_REFRESH_MAX_TRIES) {
+                KillTimer(g_mainWnd, TIMER_MUTE_REFRESH);
+                g_overlay.ShowMute();
             }
         } else {
             break;  // 未知定时器，交给 DefWindowProcW 处理
@@ -1323,6 +1344,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, TIMER_CORNER_CHECK);
             KillTimer(hwnd, TIMER_AUTO_HIDE);
             KillTimer(hwnd, TIMER_NUMLOCK_DELAY);  // 清理 NumLock 延迟定时器
+            KillTimer(hwnd, TIMER_MUTE_REFRESH);   // 清理静音状态刷新定时器
             if (g_bossKey.IsActive()) {
                 if (g_config.bossKeyCloseOnExit) {
                     // 关机路径用短超时（500ms），避免阻塞系统关机
@@ -1352,6 +1374,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_CORNER_CHECK);
         KillTimer(hwnd, TIMER_AUTO_HIDE);
         KillTimer(hwnd, TIMER_NUMLOCK_DELAY);  // 清理 NumLock 延迟定时器
+        KillTimer(hwnd, TIMER_MUTE_REFRESH);   // 清理静音状态刷新定时器
         if (g_bossKey.IsActive()) {
             if (g_config.bossKeyCloseOnExit) {
                 g_bossKey.CloseBoundProcesses();  // 配置了退出时关闭关联进程

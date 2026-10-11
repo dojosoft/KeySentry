@@ -127,6 +127,7 @@
 #define TIMER_CORNER_CHECK  4
 #define TIMER_AUTO_HIDE     5
 #define TIMER_NUMLOCK_DELAY 6
+#define TIMER_MUTE_REFRESH  7
 
 #ifndef IDAPPLY
 #define IDAPPLY             0x3021
