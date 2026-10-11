@@ -144,9 +144,13 @@ void AppConfig::Load(const std::wstring& iniPath) {
     overlayPrimaryOnly = GetPrivateProfileIntW(L"General", L"OverlayPrimaryOnly", 0, iniPath.c_str()) != 0;
     forceNumLockOn = GetPrivateProfileIntW(L"General", L"ForceNumLockOn", 0, iniPath.c_str()) != 0;
     disableStartupNotification = GetPrivateProfileIntW(L"General", L"DisableStartupNotification", 0, iniPath.c_str()) != 0;
-    explorerHideHidden = GetPrivateProfileIntW(L"General", L"ExplorerHideHidden", 0, iniPath.c_str());
-    explorerHideExt = GetPrivateProfileIntW(L"General", L"ExplorerHideExt", 0, iniPath.c_str());
-    explorerHideOS = GetPrivateProfileIntW(L"General", L"ExplorerHideOS", 0, iniPath.c_str());
+    // 资源管理器选项：合法值 0=保持原状 / 1=开启隐藏 / 2=关闭隐藏。
+    // 越界值（手改 INI 等）一律归零：否则下拉框无选中项，CB_GETCURSEL 回写 -1，
+    // 会让 ApplyExplorerSettings 的"三项均为 0 则跳过"判断失效，多一次注册表打开与广播
+    auto clampExplorerOpt = [](int v) { return (v >= 0 && v <= 2) ? v : 0; };
+    explorerHideHidden = clampExplorerOpt(GetPrivateProfileIntW(L"General", L"ExplorerHideHidden", 0, iniPath.c_str()));
+    explorerHideExt = clampExplorerOpt(GetPrivateProfileIntW(L"General", L"ExplorerHideExt", 0, iniPath.c_str()));
+    explorerHideOS = clampExplorerOpt(GetPrivateProfileIntW(L"General", L"ExplorerHideOS", 0, iniPath.c_str()));
     tabState = GetPrivateProfileIntW(L"General", L"TabState", 0, iniPath.c_str());
     if (tabState < 0 || tabState > 5) tabState = 0;
 
@@ -405,7 +409,8 @@ std::wstring AppConfig::VKToName(int vk) {
     // 回退方案：通过扫描码获取键名
     UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     if (scanCode == 0) return L"Key 0x" + std::to_wstring(vk);
-    LPARAM lParam = (LPARAM)scanCode << 16;
+    // GetKeyNameTextW 的 lParam 形参为 LONG，此处用 LONG 构造避免 64 位下的截断告警
+    LONG lParam = (LONG)scanCode << 16;
     if (NeedsExtendedKeyFlag(vk)) lParam |= (1 << 24);
     wchar_t name[64] = {};
     if (GetKeyNameTextW(lParam, name, 64) > 0) return name;

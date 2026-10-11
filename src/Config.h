@@ -33,13 +33,17 @@ enum class HotkeyWindowState {
 // ConfigUtils: 配置序列化/反序列化的辅助工具
 // ============================================================
 namespace ConfigUtils {
-    // 转义字段中的特殊字符（| -> \p, ; -> \s, \ -> \\），用于序列化
+    // 转义字段中的特殊字符（| -> \p, ; -> \s, \ -> \\, 换行 -> \r/\n, = -> \e），用于序列化
+    // 换行与 = 会破坏 INI 的单行键值结构，必须转义
     static inline std::wstring EscapeField(const std::wstring& s) {
         std::wstring r;
         for (wchar_t c : s) {
             if (c == L'|') r += L"\\p";
             else if (c == L';') r += L"\\s";
             else if (c == L'\\') r += L"\\\\";
+            else if (c == L'\r') r += L"\\r";
+            else if (c == L'\n') r += L"\\n";
+            else if (c == L'=') r += L"\\e";
             else r += c;
         }
         return r;
@@ -53,6 +57,9 @@ namespace ConfigUtils {
                 if (s[i + 1] == L'p') { r += L'|'; ++i; }
                 else if (s[i + 1] == L's') { r += L';'; ++i; }
                 else if (s[i + 1] == L'\\') { r += L'\\'; ++i; }
+                else if (s[i + 1] == L'r') { r += L'\r'; ++i; }
+                else if (s[i + 1] == L'n') { r += L'\n'; ++i; }
+                else if (s[i + 1] == L'e') { r += L'='; ++i; }
                 else r += s[i];
             } else {
                 r += s[i];

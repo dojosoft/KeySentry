@@ -24,6 +24,11 @@ public:
     // 清理：移除所有保护并禁用功能
     void Cleanup();
 
+    // 读取上一次运行遗留的窗口样式记录并恢复（程序异常退出时的兜底）。
+    // removeFile=true 表示恢复后删除记录文件（启动路径使用）；
+    // removeFile=false 用于“修复窗口堆叠”，保留记录文件以免影响运行中实例的崩溃恢复。
+    static void RecoverOrphanedStyles(bool removeFile = true);
+
 private:
     // 被锁定保护的窗口信息
     struct LockedWindow {
@@ -43,6 +48,13 @@ private:
     void ReLockWindow(LockedWindow& lw);
     // 检查指定窗口是否匹配保护规则（cache 用于复用进程路径查询结果）
     bool IsWindowMatched(HWND hwnd, ProcessUtils::PathCache& cache) const;
+
+    // 将当前已锁定窗口的原始样式落盘（用于崩溃后恢复，防止永久破坏其他进程窗口样式）
+    void SaveLockFile();
+    // 删除落盘的窗口样式记录
+    void ClearLockFile();
+    // 获取窗口样式记录文件路径（优先 exe 同目录，目录只读时回退 %APPDATA%\KeySentry）
+    static std::wstring GetLockFilePath();
 
     bool m_enabled = false;                             // 是否启用
     std::vector<BoundWindowInfo> m_protectedWindows;    // 受保护窗口匹配规则

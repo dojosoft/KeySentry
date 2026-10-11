@@ -54,6 +54,7 @@ static bool g_trayIconVisible = true;  // 托盘图标是否可见
 static ULONGLONG g_lastCornerTick = 0; // 上次角落触发的时间戳，用于防抖
 static UINT g_msgTaskbarCreated = 0;  // TaskbarCreated 消息ID，用于 explorer 重启后恢复托盘图标
 static bool g_numLockTimerArmed = false; // NumLock 延迟定时器是否已启动，避免反复"应用"不断推迟
+static bool g_numLockFeatureWasOn = false; // 上次应用配置时 NumLock 守护（禁用 NumLock / 强制开启）是否已启用
 
 // ===== SetSettingsWnd =====
 // 功能：设置设置对话框的窗口句柄，供外部模块调用
@@ -117,14 +118,17 @@ static void SimulateTargetKeyPress(UINT vk) {
     key[1] = key[0];
     key[1].ki.dwFlags |= KEYEVENTF_KEYUP;
     SendInput(2, key, sizeof(INPUT));
-    Sleep(30);
 
     // 第三步：恢复 Ctrl/Shift（仅限仍需保持的聚合修饰键，Alt/Win 见函数头注释）
     INPUT re[2] = {};
     int m = 0;
     if (heldAgg[0]) { re[m].type = INPUT_KEYBOARD; re[m].ki.wVk = VK_CONTROL; m++; }
     if (heldAgg[1]) { re[m].type = INPUT_KEYBOARD; re[m].ki.wVk = VK_SHIFT; m++; }
-    if (m > 0) SendInput((UINT)m, re, sizeof(INPUT));
+    // 仅在确实需要恢复修饰键时才等待：无修饰键场景无需阻塞 UI 线程
+    if (m > 0) {
+        Sleep(30);
+        SendInput((UINT)m, re, sizeof(INPUT));
+    }
 
     SetHookSimulating(false);
 }
@@ -297,24 +301,37 @@ static void ApplyExplorerSettings() {
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-                      0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+                      0, KEY_QUERY_VALUE | KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
         return;  // 静默失败，不阻塞启动
     }
 
     bool changed = false;
-    DWORD val;
+
+    // 仅当当前注册表值与目标值不同时才写入，避免每次启动都无谓写注册表并全系统广播
+    auto applyDword = [&](const wchar_t* name, DWORD target) {
+        DWORD cur = 0, curSize = sizeof(cur), curType = 0;
+        bool needWrite = true;
+        if (RegQueryValueExW(hKey, name, nullptr, &curType, (BYTE*)&cur, &curSize) == ERROR_SUCCESS &&
+            curType == REG_DWORD && cur == target) {
+            needWrite = false;  // 值已符合预期，无需改动
+        }
+        if (needWrite) {
+            RegSetValueExW(hKey, name, 0, REG_DWORD, (BYTE*)&target, sizeof(target));
+            changed = true;
+        }
+    };
 
     // 隐藏文件和文件夹：Hidden=2(隐藏) / 1(显示)
-    if (g_config.explorerHideHidden == 1) { val = 2; changed = true; RegSetValueExW(hKey, L"Hidden", 0, REG_DWORD, (BYTE*)&val, sizeof(val)); }
-    else if (g_config.explorerHideHidden == 2) { val = 1; changed = true; RegSetValueExW(hKey, L"Hidden", 0, REG_DWORD, (BYTE*)&val, sizeof(val)); }
+    if (g_config.explorerHideHidden == 1) applyDword(L"Hidden", 2);
+    else if (g_config.explorerHideHidden == 2) applyDword(L"Hidden", 1);
 
     // 隐藏已知文件类型扩展名：HideFileExt=1(隐藏) / 0(显示)
-    if (g_config.explorerHideExt == 1) { val = 1; changed = true; RegSetValueExW(hKey, L"HideFileExt", 0, REG_DWORD, (BYTE*)&val, sizeof(val)); }
-    else if (g_config.explorerHideExt == 2) { val = 0; changed = true; RegSetValueExW(hKey, L"HideFileExt", 0, REG_DWORD, (BYTE*)&val, sizeof(val)); }
+    if (g_config.explorerHideExt == 1) applyDword(L"HideFileExt", 1);
+    else if (g_config.explorerHideExt == 2) applyDword(L"HideFileExt", 0);
 
     // 隐藏受保护的操作系统文件：ShowSuperHidden=0(隐藏) / 1(显示)
-    if (g_config.explorerHideOS == 1) { val = 0; changed = true; RegSetValueExW(hKey, L"ShowSuperHidden", 0, REG_DWORD, (BYTE*)&val, sizeof(val)); }
-    else if (g_config.explorerHideOS == 2) { val = 1; changed = true; RegSetValueExW(hKey, L"ShowSuperHidden", 0, REG_DWORD, (BYTE*)&val, sizeof(val)); }
+    if (g_config.explorerHideOS == 1) applyDword(L"ShowSuperHidden", 0);
+    else if (g_config.explorerHideOS == 2) applyDword(L"ShowSuperHidden", 1);
 
     RegCloseKey(hKey);
 
@@ -640,7 +657,9 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
         }
     }
 
-    if (g_config.bossKeyCloseMod != 0 || g_config.bossKeyCloseVK != 0) {
+    // 与 ApplyConfig 保持一致：仅当修饰键与主键均有效时才视为已配置，
+    // 否则 CloseVK==0 时注册必然失败，会误报"未能重新注册"警告
+    if (g_config.bossKeyCloseMod != 0 && g_config.bossKeyCloseVK != 0) {
         UINT closeMod = g_config.bossKeyCloseMod | MOD_NOREPEAT;
         if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, closeMod, g_config.bossKeyCloseVK)) {
             if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, g_config.bossKeyCloseMod, g_config.bossKeyCloseVK)) {
@@ -652,7 +671,8 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
     if (g_config.customHotkeysEnabled) {
         for (size_t i = 0; i < g_config.customHotkeys.size() && i < MAX_CUSTOM_HOTKEYS; i++) {
             const auto& hk = g_config.customHotkeys[i];
-            if (hk.mod != 0 || hk.vk != 0) {
+            // 与预检/ApplyConfig 保持一致：mod/vk 缺一即视为未配置，避免对无效条目注册失败误报
+            if (hk.mod != 0 && hk.vk != 0) {
                 UINT customMod = hk.mod | MOD_NOREPEAT;
                 int id = CUSTOM_HOTKEY_ID_START + (int)i;
                 if (!RegisterHotKey(g_mainWnd, id, customMod, hk.vk)) {
@@ -719,9 +739,11 @@ static void ApplyConfig() {
     // disableNumLock 隐含 forceNumLockOn 的功能（确保 NumLock 开启才能锁定），
     // 因此当两者同时启用时只需在 disableNumLock 分支处理
     // 使用延迟定时器，避免开机自启动时键盘子系统尚未初始化导致 keybd_event 失效
-    if (g_config.disableNumLock || g_config.forceNumLockOn) {
-        // 已启动则不重复 SetTimer：反复点击"应用"不应把强制开启 NumLock 无限推迟
-        if (!g_numLockTimerArmed) {
+    bool numLockFeatureOn = g_config.disableNumLock || g_config.forceNumLockOn;
+    if (numLockFeatureOn) {
+        // 仅在开关从关→开（或启动首次）时武装定时器：否则每次点击"应用"都会在
+        // 2 秒后强制开启 NumLock，即使本次修改的是毫不相关的设置
+        if (!g_numLockFeatureWasOn && !g_numLockTimerArmed) {
             if (SetTimer(g_mainWnd, TIMER_NUMLOCK_DELAY, TIMER_NUMLOCK_DELAY_MS, nullptr)) {
                 g_numLockTimerArmed = true;
             }
@@ -730,6 +752,7 @@ static void ApplyConfig() {
         KillTimer(g_mainWnd, TIMER_NUMLOCK_DELAY);  // 功能关闭时清理可能残留的延迟定时器
         g_numLockTimerArmed = false;
     }
+    g_numLockFeatureWasOn = numLockFeatureOn;
 
     // --- 老板键和热键注册 ---
     g_bossKey.Unregister();  // 先注销旧的老板键注册
@@ -1041,17 +1064,17 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.21.0.1009",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.30.0.1011",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      80, 55, 260, 24,
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(verCtrl, WM_SETFONT, (WPARAM)fontNormal.get(), TRUE);
 
     // 分隔线
-    HWND lineCtrl = CreateWindowExW(0, L"STATIC", L"",
-                                      WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                                      20, 88, 320, 2,
-                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CreateWindowExW(0, L"STATIC", L"",
+                    WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+                    20, 88, 320, 2,
+                    hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     // 应用描述（横向居中）
     HWND descCtrl = CreateWindowExW(0, L"STATIC",
@@ -1209,8 +1232,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (!hk.command.empty()) {
                     // 若配置了运行前确认，弹出确认对话框
                     if (hk.confirmBeforeRun) {
-                        std::wstring msg = L"确定要执行: " + hk.DisplayName() + L" ?";
-                        if (MessageBoxW(hwnd, msg.c_str(), L"确认", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                        std::wstring confirmMsg = L"确定要执行: " + hk.DisplayName() + L" ?";
+                        if (MessageBoxW(hwnd, confirmMsg.c_str(), L"确认", MB_YESNO | MB_ICONQUESTION) != IDYES)
                             return 0;
                     }
 
@@ -1256,8 +1279,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             showCmd);
                         if (result <= 32) {
                             // ShellExecute 返回值 <= 32 表示执行失败
-                            std::wstring msg = L"执行失败: " + hk.command;
-                            MessageBoxW(hwnd, msg.c_str(), L"错误", MB_OK | MB_ICONERROR);
+                            std::wstring errMsg = L"执行失败: " + hk.command;
+                            MessageBoxW(hwnd, errMsg.c_str(), L"错误", MB_OK | MB_ICONERROR);
                         }
                     }
                 }
@@ -1305,7 +1328,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // 关机路径用短超时（500ms），避免阻塞系统关机
                     g_bossKey.CloseBoundProcesses(500);
                 } else {
-                    // Deactivate() 内部已调用 SaveRecoverFile()，无需重复
+                    // Deactivate() 内部会调用 ShowWindows() 完成窗口恢复并清除恢复文件
                     g_bossKey.Deactivate();
                 }
             }
@@ -1333,7 +1356,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_config.bossKeyCloseOnExit) {
                 g_bossKey.CloseBoundProcesses();  // 配置了退出时关闭关联进程
             } else {
-                g_bossKey.Deactivate();  // Deactivate() 内部已调用 SaveRecoverFile()，无需重复
+                g_bossKey.Deactivate();  // Deactivate() 内部会调用 ShowWindows() 并清除恢复文件
             }
         }
         g_winDGuard.Cleanup();
@@ -1439,6 +1462,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     // --- 应用配置并添加托盘图标 ---
     // 键盘钩子由 ApplyConfig 按需安装，此处不再无条件安装
+    // 先恢复上次异常退出遗留的窗口样式（Win+D 守护移除了 WS_MINIMIZEBOX，
+    // 程序被强杀时析构不会执行，需在启动时兜底还原，避免永久破坏其他进程窗口）
+    WinDGuard::RecoverOrphanedStyles();
     ApplyConfig();
     ApplyExplorerSettings();  // 启动时重置资源管理器文件夹选项
     AddTrayIcon(g_mainWnd);

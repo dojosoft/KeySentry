@@ -4,6 +4,9 @@
 #include <string>
 #include "Config.h"
 
+// 前向声明：仅在成员中作指针使用，避免头文件引入 COM 头
+struct IMMDeviceEnumerator;
+
 // ============================================================
 // BossKey: 老板键管理器
 // 核心功能：一键隐藏/恢复指定窗口，支持以下触发方式：
@@ -69,8 +72,6 @@ private:
     void SetMute(bool mute, bool forceUnmute = false);
     // 发送媒体暂停/播放按键
     void SendMediaPause();
-    // 获取进程完整路径（委托给 ProcessUtils）
-    static std::wstring GetProcessPath(DWORD pid) { return ProcessUtils::GetProcessPath(pid); }
 
     // 鼠标低级钩子回调
     static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
@@ -95,11 +96,11 @@ private:
         HWND hwnd;                  // 窗口句柄
         int showCmd;                // 隐藏前的窗口显示状态（正常/最小化/最大化）
         DWORD pid;                  // 进程ID
-        std::wstring processPath;   // 进程路径
     };
     std::vector<HiddenWindow> m_hiddenWindows; // 被隐藏的窗口列表
     std::vector<BoundWindowInfo> m_boundWindows; // 绑定的窗口匹配规则
     bool m_wasMuted = false;        // 隐藏前系统是否已静音
+    bool m_mutedByUs = false;       // 本次静音是否由本程序发起（据此决定恢复时是否解除静音）
     ULONGLONG m_lastDeactivateTick = 0; // 上次停用的时间戳
 
     HHOOK m_mouseHook = nullptr;    // 鼠标低级钩子句柄
@@ -107,5 +108,8 @@ private:
     bool m_middleBtnEnabled = false; // 中键触发老板键
     bool m_sideBtn1Enabled = false;  // 侧键1触发老板键
     bool m_sideBtn2Enabled = false;  // 侧键2触发老板键
+    // 缓存的音频设备枚举器：老板键可被鼠标中键/侧键频繁切换，
+    // 复用实例避免每次隐藏/恢复都 CoCreateInstance
+    IMMDeviceEnumerator* m_pEnumerator = nullptr;
     static BossKey* s_instance;     // 单例指针，供静态回调使用
 };

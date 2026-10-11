@@ -133,6 +133,13 @@ bool OverlayWindow::Create(HINSTANCE hInst) {
 
 // 销毁所有浮层窗口和 GDI 资源
 void OverlayWindow::Destroy() {
+    // 先销毁窗口再释放 GDI/COM 资源：窗口过程仍会引用画刷与字体，
+    // 若在此期间触发 WM_PAINT 会造成已释放对象被引用
+    for (HWND hwnd : m_hwnds) {
+        if (hwnd) DestroyWindow(hwnd);
+    }
+    m_hwnds.clear();
+    if (m_pEnumerator) { m_pEnumerator->Release(); m_pEnumerator = nullptr; }
     if (m_fontLarge) { DeleteObject(m_fontLarge); m_fontLarge = nullptr; }
     if (m_fontMedium) { DeleteObject(m_fontMedium); m_fontMedium = nullptr; }
     if (m_fontSmall) { DeleteObject(m_fontSmall); m_fontSmall = nullptr; }
@@ -140,10 +147,6 @@ void OverlayWindow::Destroy() {
     if (m_barBgBrush) { DeleteObject(m_barBgBrush); m_barBgBrush = nullptr; }
     if (m_barFillBrush) { DeleteObject(m_barFillBrush); m_barFillBrush = nullptr; }
     if (m_barMuteBrush) { DeleteObject(m_barMuteBrush); m_barMuteBrush = nullptr; }
-    for (HWND hwnd : m_hwnds) {
-        if (hwnd) DestroyWindow(hwnd);
-    }
-    m_hwnds.clear();
 }
 
 // ============================================================
@@ -156,14 +159,19 @@ void OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
 
     // COM 已在主线程 wWinMain 中初始化，无需重复初始化
 
-    IMMDeviceEnumerator* pEnumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                           __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnumerator));
-    if (FAILED(hr)) return;
+    // 复用缓存的设备枚举器，避免每次查询都 CoCreateInstance（枚举器与具体设备无关，
+    // 默认设备切换后 GetDefaultAudioEndpoint 会返回新的默认设备，无需重建）
+    if (!m_pEnumerator) {
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                               __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&m_pEnumerator));
+        if (FAILED(hr)) {
+            m_pEnumerator = nullptr;
+            return;
+        }
+    }
 
     IMMDevice* pDevice = nullptr;
-    hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    pEnumerator->Release();
+    HRESULT hr = m_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
     if (FAILED(hr)) return;
 
     IAudioEndpointVolume* pVolume = nullptr;
@@ -190,14 +198,16 @@ void OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
 void OverlayWindow::Show(int vkCode, bool state, bool locked) {
     if (m_hwnds.empty()) return;
 
-    // 连发/重复通知防护：内容完全一致，或距上次显示不足去抖间隔时直接返回，
+    // 连发/重复通知防护：内容完全一致且距上次显示不足去抖间隔时直接返回，
     // 不再执行置顶重排、重绘与定时器重置（否则会使浮层闪烁并拖垮任务栏/DWM）
     bool visible = IsWindowVisible(m_hwnds[0]) != FALSE;
     ULONGLONG now = GetTickCount64();
     bool sameContent = (!m_showMuteOverlay && m_vkCode == vkCode &&
                         m_state == state && m_locked == locked);
     bool tooSoon = (m_lastShowTick != 0) && (now - m_lastShowTick < OVERLAY_MIN_REPEAT_MS);
-    if (visible && (sameContent || tooSoon)) return;
+    // 仅在"内容一致且过密"时丢弃（连发抑制）；内容确实变化时即使很近也照常显示，
+    // 避免快速切换不同锁键状态被误当作连发丢弃
+    if (visible && sameContent && tooSoon) return;
     m_lastShowTick = now;
 
     m_vkCode = vkCode;
@@ -220,6 +230,11 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
         if (!IsWindowVisible(m_hwnds[i])) {
             SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_KEY_HEIGHT,
                          SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        } else {
+            // 已可见时仍校正位置/尺寸（锁键与静音浮层高度不同、显示器布局可能变化），
+            // 但不改变 Z-order，避免重复置顶重排
+            SetWindowPos(m_hwnds[i], nullptr, x, y, OVERLAY_SIZE, OVERLAY_KEY_HEIGHT,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
         }
         // bErase=FALSE：WM_PAINT 已整窗填充背景，且 WM_ERASEBKGND 已返回 1
         InvalidateRect(m_hwnds[i], nullptr, FALSE);
@@ -241,18 +256,22 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
 void OverlayWindow::ShowMute() {
     if (m_hwnds.empty()) return;
 
-    // 连发去抖：静音键被按住时系统会持续产生 keydown，此处丢弃过密的重复通知
+    // 先查询当前音频状态，用于判断浮层内容是否真的变化
+    bool isMuted = false;
+    int volume = 0;
+    GetAudioState(isMuted, volume);
+
+    // 连发去抖：静音键被按住时系统会持续产生 keydown，仅在"内容一致且过密"时丢弃；
+    // 静音状态确实切换时即使间隔很近也照常显示，避免真实状态变化被误丢
     bool visible = IsWindowVisible(m_hwnds[0]) != FALSE;
     ULONGLONG now = GetTickCount64();
+    bool sameContent = (m_showMuteOverlay && m_audioMuted == isMuted && m_audioVolume == volume);
     bool tooSoon = (m_lastShowTick != 0) && (now - m_lastShowTick < OVERLAY_MIN_REPEAT_MS);
-    if (visible && tooSoon) return;
+    if (visible && sameContent && tooSoon) return;
     m_lastShowTick = now;
 
     m_showMuteOverlay = true;
-
-    // 一次查询同时获取静音状态与音量，避免调用方重复查询音频状态
-    bool isMuted = false;
-    GetAudioState(isMuted, m_audioVolume);
+    m_audioVolume = volume;
     m_audioMuted = isMuted;
 
     auto monitors = GetTargetMonitors();
@@ -269,6 +288,10 @@ void OverlayWindow::ShowMute() {
         if (!IsWindowVisible(m_hwnds[i])) {
             SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_SIZE,
                          SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        } else {
+            // 已可见时仍校正位置/尺寸（从锁键浮层切换过来时高度不同），不改变 Z-order
+            SetWindowPos(m_hwnds[i], nullptr, x, y, OVERLAY_SIZE, OVERLAY_SIZE,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
         }
         InvalidateRect(m_hwnds[i], nullptr, FALSE);
         KillTimer(m_hwnds[i], TIMER_OVERLAY);
@@ -362,7 +385,6 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         RECT rc;
         GetClientRect(hwnd, &rc);
         int W = rc.right;
-        int H = rc.bottom;
 
         // 填充深色背景
         FillRect(hdc, &rc, self->m_bgBrush);
@@ -437,7 +459,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         } else {
             // --- 锁键浮层绘制 ---
             const wchar_t* iconText = L"";
-            COLORREF iconColor;
+            COLORREF iconColor = RGB(160, 160, 180);  // 默认非激活色，避免未初始化
             // 根据锁键类型和状态选择图标文字和颜色
             if (self->m_vkCode == VK_CAPITAL) {
                 iconText = self->m_state ? L"AA" : L"aa";

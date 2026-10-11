@@ -28,6 +28,17 @@ int KeyboardHook::LockKeyIndex(UINT vk) {
     }
 }
 
+// 复位所有连发抑制标志：捕获模式开始时用户可能正按住某键，
+// 钩子卸载后重新安装也应视为「全新状态」，避免沿用陈旧标志而漏发通知
+void KeyboardHook::ResetHeldInputState() {
+    for (int i = 0; i < 3; i++) {
+        m_lockKeyHeld[i] = false;
+        m_lockKeyHeldTick[i] = 0;
+    }
+    m_muteKeyHeld = false;
+    m_muteKeyHeldTick = 0;
+}
+
 // 安装 WH_KEYBOARD_LL 低级键盘钩子
 bool KeyboardHook::Install(HWND notifyWnd) {
     if (m_hook) return true;
@@ -43,6 +54,7 @@ void KeyboardHook::Uninstall() {
         UnhookWindowsHookEx(m_hook);
         m_hook = nullptr;
     }
+    ResetHeldInputState();
 }
 
 void KeyboardHook::SetDisabledKeys(const std::vector<int>& codes) {
@@ -83,6 +95,9 @@ void KeyboardHook::SetSimulatingInput(bool sim) {
 
 void KeyboardHook::SetCaptureMode(bool enabled) {
     m_captureMode = enabled;
+    // 进入捕获模式时复位连发标志：捕获期间钩子放行所有按键（不更新标志），
+    // 若不复位，退出捕获后可能沿用捕获前的旧标志而漏发一次通知
+    if (enabled) ResetHeldInputState();
 }
 
 // ============================================================
@@ -213,13 +228,24 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                     }
                 }
                 // 静音键状态变化通知（受静音浮层开关控制，与锁键浮层解耦）
+                // 仅在物理按下的第一次 keydown 通知：连发时 ShowMute 会反复
+                // CoCreateInstance 枚举音频设备并重绘浮层，造成资源浪费与闪烁
                 if (s_instance->m_showMuteOverlay && kb->vkCode == VK_VOLUME_MUTE) {
-                    PostMessageW(s_instance->m_notifyWnd, WM_MUTE_NOTIFY, 0, 0);
+                    ULONGLONG now = GetTickCount64();
+                    bool firstPress = !s_instance->m_muteKeyHeld ||
+                                      (now - s_instance->m_muteKeyHeldTick) > LOCK_KEY_HOLD_TIMEOUT_MS;
+                    if (firstPress) {
+                        s_instance->m_muteKeyHeld = true;
+                        s_instance->m_muteKeyHeldTick = now;
+                        PostMessageW(s_instance->m_notifyWnd, WM_MUTE_NOTIFY, 0, 0);
+                    }
                 }
             } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
                 // 锁键抬起：清除按下标志，使下一次按下能再次通知
                 int idx = LockKeyIndex(kb->vkCode);
                 if (idx >= 0) s_instance->m_lockKeyHeld[idx] = false;
+                // 静音键抬起：同样清除标志
+                if (kb->vkCode == VK_VOLUME_MUTE) s_instance->m_muteKeyHeld = false;
             }
         }
     }

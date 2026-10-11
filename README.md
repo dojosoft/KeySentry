@@ -39,14 +39,33 @@
 
 ## 下载使用
 
-前往 [Releases](../../releases) 页面下载最新版本（当前 **v1.21.0.1009**），解压后直接运行：
+前往 [Releases](../../releases) 页面下载最新版本（当前 **v1.30.0.1011**），解压后直接运行：
 
 | 文件 | 适用系统 |
 |------|---------|
-| `KeySentry.exe`（32 位，366KB）**推荐** | Windows 7 SP1 及更高（32/64 位通用） |
-| `KeySentry-x64.exe`（64 位，457KB） | Windows 10/11（64 位） |
+| `KeySentry.exe`（32 位，380KB）**推荐** | Windows 7 SP1 及更高（32/64 位通用） |
+| `KeySentry-x64.exe`（64 位，476KB） | Windows 10/11（64 位） |
 
 两版本功能完全一致，均无需安装任何运行库。不确定选哪个？直接下载 `KeySentry.exe` 即可。
+
+## 验证下载文件与安全说明
+
+本工具的 exe 若**尚未进行代码签名**，从浏览器下载后可能被 Microsoft SmartScreen 拦截，属正常现象：
+
+- **浏览器下载提示"可能有害/不常见"**：文件来自网络且无下载信誉，SmartScreen 会对未签名文件一律拦截
+- **首次运行出现"Windows 已保护你的电脑 / 未知发布者"**：点击「更多信息 → 仍要运行」即可
+- **解除单个文件拦截**：右键文件 → 属性 → 勾选「解除锁定」；或执行 `Unblock-File .\KeySentry.exe`
+
+**校验下载完整性（SHA-256）**：Releases 页面为每个文件附有 SHA-256 值，下载后可比对：
+
+```powershell
+Get-FileHash .\KeySentry.exe -Algorithm SHA256
+```
+
+若确认是安全软件误报，可向微软提交申诉（类型选 "Software developer" → 误报），有助于清除该文件的判定：
+<https://www.microsoft.com/en-us/wdsi/filesubmission>
+
+> 本项目正在接入受信任的代码签名证书（OV/EV）。完成签名后的版本将不再出现上述下载与启动提示。
 
 ## 从源码构建
 
@@ -60,12 +79,27 @@ cmake --build build --config Release
 # 产物位于 release\KeySentry.exe
 ```
 
+如需对产物进行代码签名（消除下载与启动时的 SmartScreen 提示），在配置阶段传入证书即可自动签名，未传入则跳过：
+
+```powershell
+cmake -S . -B build -DKS_SIGN_PFX="D:/cert/KeySentry.pfx" -DKS_SIGN_PWD="证书密码"
+cmake --build build --config Release
+# 签名参数：SHA-256 + RFC3161 时间戳
+```
+
+发布时建议同时生成校验值并附在 Release 说明中：
+
+```powershell
+Get-FileHash .\release\KeySentry.exe, .\release\KeySentry-x64.exe -Algorithm SHA256 |
+  Format-Table Hash, Path -AutoSize
+```
+
 ## 使用注意事项
 
 - **管理员权限**：键客本身**不需要**管理员权限，所有功能（热键注册、全局钩子、窗口置顶等）在普通用户权限下即可正常工作。仅在自定义热键中勾选"以管理员运行"时，会触发 UAC 提权启动子进程
 - **单实例**：重复启动会自动激活已运行实例的设置窗口
 - **配置文件**：默认为程序同目录的 `KeySentry.ini`；目录不可写时自动回退到 `%APPDATA%\KeySentry\`
-- **安全软件**：如遇功能异常，请将键客添加到安全软件信任列表
+- **安全软件**：如遇弹窗拦截或功能异常，请将键客添加到安全软件信任列表；浏览器下载拦截与启动提示的说明见[验证下载文件与安全说明](#验证下载文件与安全说明)
 
 ## 支持系统
 

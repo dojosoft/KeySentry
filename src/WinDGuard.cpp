@@ -1,7 +1,11 @@
 #include "WinDGuard.h"
 #include "Utils.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <unordered_set>
+#include <ShlObj.h>
 
 WinDGuard::WinDGuard() = default;
 
@@ -30,6 +34,144 @@ static void WarnLockFailedOnce() {
     if (warned) return;
     warned = true;
     ShowTrayNotification(L"部分目标窗口以管理员权限运行，置顶/禁止最小化保护无法生效。", true);
+}
+
+// ============================================================
+// 窗口样式落盘：防止程序异常退出后，被移除的 WS_MINIMIZEBOX 永久残留
+// 在其他进程的窗口上（KeySentry 崩溃/被强杀时析构不会执行）
+//   - 文件路径策略与 INI/恢复文件一致：exe 同目录优先，只读时回退 %APPDATA%
+//   - 每行格式：pid \t hwnd \t originalStyle \t originalExStyle（均为十进制）
+// ============================================================
+std::wstring WinDGuard::GetLockFilePath() {
+    // 路径在进程生命周期内固定（exe 目录与可写性不变），缓存探测结果，
+    // 避免每次保存/删除记录文件都创建一个临时探测文件
+    static const std::wstring cachedPath = []() -> std::wstring {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring dir(exePath);
+        size_t pos = dir.find_last_of(L"\\/");
+        if (pos != std::wstring::npos) dir = dir.substr(0, pos + 1);
+
+        // 用自动删除的临时文件探测目录可写性（与 INI 回退策略一致）
+        std::wstring testPath = dir + L".~wgtest.tmp";
+        HANDLE hTest = CreateFileW(testPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (hTest != INVALID_HANDLE_VALUE) {
+            CloseHandle(hTest);  // 关闭即自动删除测试文件
+            return dir + L"KeySentry.wguard";
+        }
+
+        wchar_t appData[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
+            std::wstring ad = std::wstring(appData) + L"\\KeySentry";
+            CreateDirectoryW(ad.c_str(), nullptr);
+            return ad + L"\\KeySentry.wguard";
+        }
+        return dir + L"KeySentry.wguard";
+    }();
+    return cachedPath;
+}
+
+void WinDGuard::SaveLockFile() {
+    if (m_lockedWindows.empty()) {
+        ClearLockFile();
+        return;
+    }
+
+    std::string content;
+    for (const auto& lw : m_lockedWindows) {
+        char line[128] = {};
+        snprintf(line, sizeof(line), "%lu\t%llu\t%lld\t%lld\n",
+                 (unsigned long)lw.processId,
+                 (unsigned long long)(uintptr_t)lw.hwnd,
+                 (long long)lw.originalStyle,
+                 (long long)lw.originalExStyle);
+        content += line;
+    }
+
+    // 原子写入：先写临时文件再重命名替换，避免崩溃时记录文件被截断损坏
+    std::wstring path = GetLockFilePath();
+    std::wstring tmpPath = path + L".tmp";
+    HANDLE hFile = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(hFile, content.data(), (DWORD)content.size(), &written, nullptr);
+    CloseHandle(hFile);
+    // 重命名失败时清理临时文件，避免 .tmp 残留
+    if (!MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmpPath.c_str());
+    }
+}
+
+void WinDGuard::ClearLockFile() {
+    DeleteFileW(GetLockFilePath().c_str());
+}
+
+// 恢复上一次运行遗留的窗口样式（崩溃兜底）。
+// 仅在 hwnd 仍有效且进程 ID 一致时恢复，避免句柄被复用后误改无关窗口。
+void WinDGuard::RecoverOrphanedStyles(bool removeFile) {
+    std::wstring path = GetLockFilePath();
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    std::string data;
+    char buf[2048];
+    DWORD read = 0;
+    while (ReadFile(hFile, buf, sizeof(buf), &read, nullptr) && read > 0) {
+        data.append(buf, (size_t)read);
+    }
+    CloseHandle(hFile);
+
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) eol = data.size();
+        std::string line = data.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.empty()) continue;
+
+        size_t t1 = line.find('\t');
+        if (t1 == std::string::npos) continue;
+        size_t t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) continue;
+        size_t t3 = line.find('\t', t2 + 1);
+        if (t3 == std::string::npos) continue;
+
+        DWORD pid = (DWORD)std::strtoul(line.substr(0, t1).c_str(), nullptr, 10);
+        HWND hwnd = (HWND)(uintptr_t)std::strtoull(line.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+        LONG_PTR origStyle = (LONG_PTR)std::strtoll(line.substr(t2 + 1, t3 - t2 - 1).c_str(), nullptr, 10);
+        LONG_PTR origExStyle = (LONG_PTR)std::strtoll(line.substr(t3 + 1).c_str(), nullptr, 10);
+
+        if (!hwnd || !IsWindow(hwnd)) continue;
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(hwnd, &wpid);
+        if (wpid != pid) continue;  // 句柄已被复用，跳过以免误改
+
+        // 恢复 WS_MINIMIZEBOX（仅当原本有、当前没有时）
+        LONG_PTR curStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        bool needMinimizeBox = ((origStyle & WS_MINIMIZEBOX) != 0) && ((curStyle & WS_MINIMIZEBOX) == 0);
+        if (needMinimizeBox) {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, curStyle | WS_MINIMIZEBOX);
+        }
+
+        // 恢复非置顶状态（仅当原本不置顶、当前却置顶时）
+        LONG_PTR curExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        bool needUntopmost = (!(origExStyle & WS_EX_TOPMOST)) && ((curExStyle & WS_EX_TOPMOST) != 0);
+
+        if (needUntopmost) {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        } else if (needMinimizeBox) {
+            SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+
+    // 恢复动作全部完成后再删除记录文件：若恢复到一半再次异常退出，
+    // 文件仍保留，下次启动可继续恢复剩余窗口，避免样式永久残留
+    if (removeFile) DeleteFileW(path.c_str());
 }
 
 // 一次性配置启用状态和窗口列表
@@ -162,6 +304,9 @@ void WinDGuard::ApplyLock() {
             LockWindow(hwnd, pid);
         }
     }
+
+    // 锁定结果落盘，供程序异常退出后恢复窗口样式
+    if (!m_lockedWindows.empty()) SaveLockFile();
 }
 
 // 清理：移除所有保护并禁用功能
@@ -178,23 +323,40 @@ void WinDGuard::RemoveLock() {
     for (auto& lw : m_lockedWindows) {
         if (!IsWindow(lw.hwnd)) continue;
 
-        // 仅恢复 WS_MINIMIZEBOX 位，保留窗口运行期间的其他样式变化
+        // 校验进程 ID：句柄可能已被回收复用，指向无关窗口，此时跳过以免误改
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(lw.hwnd, &wpid);
+        if (wpid != lw.processId) continue;
+
+        // 仅恢复 WS_MINIMIZEBOX 位，保留窗口运行期间的其他样式变化；
+        // 仅当样式确有变化时才写回并刷新框架，避免无谓的跨进程窗口操作
         LONG_PTR currentStyle = GetWindowLongPtrW(lw.hwnd, GWL_STYLE);
         LONG_PTR restoredStyle = (currentStyle & ~WS_MINIMIZEBOX) | (lw.originalStyle & WS_MINIMIZEBOX);
-        SetWindowLongPtrW(lw.hwnd, GWL_STYLE, restoredStyle);
+        bool styleChanged = (restoredStyle != currentStyle);
+        if (styleChanged) {
+            SetWindowLongPtrW(lw.hwnd, GWL_STYLE, restoredStyle);
+        }
 
         // 恢复置顶状态：仅当窗口原本不是 TOPMOST 时才取消置顶
         // 避免破坏用户手动设置的"始终置顶"窗口（如任务管理器）
         if (!(lw.originalExStyle & WS_EX_TOPMOST)) {
-            SetWindowPos(lw.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        } else {
-            // 原本就是 TOPMOST，只需刷新框架（最小化按钮可能已恢复）
+            LONG_PTR curExStyle = GetWindowLongPtrW(lw.hwnd, GWL_EXSTYLE);
+            if (curExStyle & WS_EX_TOPMOST) {
+                SetWindowPos(lw.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            } else if (styleChanged) {
+                SetWindowPos(lw.hwnd, nullptr, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
+        } else if (styleChanged) {
+            // 原本就是 TOPMOST，仅在样式变化时刷新框架（最小化按钮可能已恢复）
             SetWindowPos(lw.hwnd, nullptr, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
     }
     m_lockedWindows.clear();
+    // 已全部恢复原始样式，删除落盘记录
+    ClearLockFile();
 }
 
 // ============================================================
@@ -206,11 +368,13 @@ void WinDGuard::RemoveLock() {
 void WinDGuard::CheckNewWindows() {
     if (!m_enabled || m_protectedWindows.empty()) return;
 
-    // 移除已销毁的窗口记录
+    // 移除已销毁的窗口记录，并同步收敛落盘记录（否则失效条目会不断累积）
+    size_t lockedBefore = m_lockedWindows.size();
     m_lockedWindows.erase(
         std::remove_if(m_lockedWindows.begin(), m_lockedWindows.end(),
             [](const LockedWindow& lw) { return !IsWindow(lw.hwnd); }),
         m_lockedWindows.end());
+    if (m_lockedWindows.size() != lockedBefore) SaveLockFile();
 
     // 对已锁定的窗口重新应用保护（轻量操作，仅状态变化时才调用 SetWindowPos）
     for (auto& lw : m_lockedWindows) {
@@ -235,6 +399,7 @@ void WinDGuard::CheckNewWindows() {
     }
 
     ProcessUtils::PathCache cache;  // 单次枚举内复用进程路径，避免相同 pid 重复查询
+    lockedBefore = m_lockedWindows.size();
     for (HWND hwnd : allWindows) {
         if (IsWindowMatched(hwnd, cache) && lockedSet.find(hwnd) == lockedSet.end()) {
             DWORD pid = 0;
@@ -242,4 +407,7 @@ void WinDGuard::CheckNewWindows() {
             LockWindow(hwnd, pid);
         }
     }
+
+    // 新增锁定窗口时更新落盘记录，保证崩溃后能恢复这些窗口的样式
+    if (m_lockedWindows.size() != lockedBefore) SaveLockFile();
 }

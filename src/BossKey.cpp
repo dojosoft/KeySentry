@@ -14,11 +14,11 @@ BossKey::BossKey() { s_instance = this; }
 BossKey::~BossKey() {
     UninstallMouseHook();
     Unregister();
-    // 析构时恢复所有隐藏的窗口
-    if (m_active) {
-        ShowWindows();
-        m_active = false;
-    }
+    // 析构时恢复所有隐藏的窗口并取消静音（异常退出路径的兜底）；
+    // 正常退出/关机路径已由 WM_DESTROY / WM_ENDSESSION 调用 Deactivate 覆盖
+    if (m_active) Deactivate();
+    // 释放缓存的音频设备枚举器（须在 Deactivate 内的 SetMute 之后）
+    if (m_pEnumerator) { m_pEnumerator->Release(); m_pEnumerator = nullptr; }
     s_instance = nullptr;
 }
 
@@ -86,14 +86,13 @@ void BossKey::HideWindows() {
     EnumBossData data{ &m_boundWindows, &matching, &cache };
     EnumWindows(EnumBossWindowsProc, reinterpret_cast<LPARAM>(&data));
 
-    // 保存窗口信息（显示状态、进程ID、路径），用于恢复
+    // 保存窗口信息（显示状态、进程ID），用于恢复
     for (HWND hwnd : matching) {
         WINDOWPLACEMENT wp = { sizeof(wp) };
         GetWindowPlacement(hwnd, &wp);
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
-        std::wstring procPath = ProcessUtils::GetProcessPath(pid);
-        m_hiddenWindows.push_back({ hwnd, (int)wp.showCmd, pid, procPath });
+        m_hiddenWindows.push_back({ hwnd, (int)wp.showCmd, pid });
     }
 
     // 可选：隐藏当前前台窗口（排除自身进程的窗口）
@@ -112,8 +111,7 @@ void BossKey::HideWindows() {
                 if (!alreadyInList) {
                     WINDOWPLACEMENT wp = { sizeof(wp) };
                     GetWindowPlacement(fg, &wp);
-                    std::wstring procPath = ProcessUtils::GetProcessPath(fgPid);
-                    m_hiddenWindows.push_back({ fg, (int)wp.showCmd, fgPid, procPath });
+                    m_hiddenWindows.push_back({ fg, (int)wp.showCmd, fgPid });
                 }
             }
         }
@@ -130,8 +128,8 @@ void BossKey::HideWindows() {
     // 持久化被隐藏窗口的信息，用于程序异常退出后恢复
     SaveRecoverFile();
 
-    // 可选：静音系统音频
-    if (m_muteEnabled) SetMute(true);
+    // 可选：静音系统音频（仅当确有窗口被隐藏时才静音，避免无恢复契机地静音全系统）
+    if (m_muteEnabled && !m_hiddenWindows.empty()) SetMute(true);
 }
 
 // ============================================================
@@ -160,14 +158,16 @@ void BossKey::ShowWindows() {
 void BossKey::SetMute(bool mute, bool forceUnmute) {
     // COM 已在主线程 wWinMain 中初始化，无需重复初始化
 
-    IMMDeviceEnumerator* pEnumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                           __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnumerator));
-    if (FAILED(hr)) return;
+    // 复用缓存的设备枚举器：老板键可由鼠标中键/侧键频繁切换，
+    // 若每次都 CoCreateInstance 会产生大量 COM 实例创建开销
+    if (!m_pEnumerator) {
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                               __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&m_pEnumerator));
+        if (FAILED(hr)) { m_pEnumerator = nullptr; return; }
+    }
 
     IMMDevice* pDevice = nullptr;
-    hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    pEnumerator->Release();
+    HRESULT hr = m_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
     if (FAILED(hr)) return;
 
     IAudioEndpointVolume* pVolume = nullptr;
@@ -182,9 +182,11 @@ void BossKey::SetMute(bool mute, bool forceUnmute) {
         if (SUCCEEDED(pVolume->GetMute(&wasMuted)))
             m_wasMuted = wasMuted != FALSE;
         pVolume->SetMute(TRUE, nullptr);
+        m_mutedByUs = true;  // 标记由本程序发起静音，恢复时据此解除（不依赖 m_muteEnabled 当前值）
     } else {
         // 恢复：如果之前不是静音状态则取消静音，或强制取消静音
         pVolume->SetMute(forceUnmute ? FALSE : (m_wasMuted ? TRUE : FALSE), nullptr);
+        m_mutedByUs = false;
     }
 
     pVolume->Release();
@@ -208,7 +210,9 @@ void BossKey::Deactivate() {
     if (!m_active) return;
     m_active = false;
     ShowWindows();
-    if (m_muteEnabled) SetMute(false);
+    // 依据"是否由本程序静音"而非当前静音开关状态解除静音：
+    // 隐藏期间用户若关闭"隐藏时静音"，此处仍应恢复，避免系统被永久静音
+    if (m_mutedByUs) SetMute(false);
     m_lastDeactivateTick = GetTickCount64();
 }
 
@@ -279,12 +283,14 @@ void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
             }
         }
         if (alive.empty()) break;
-        // 分批等待，每批最多 MAXIMUM_WAIT_OBJECTS 个
-        DWORD waitMs = (DWORD)std::min((ULONGLONG)500, timeoutMs - (GetTickCount64() - start));
-        if (waitMs == 0) break;
+        // 分批等待，每批最多 MAXIMUM_WAIT_OBJECTS 个；
+        // 每批按剩余预算重算超时，避免多批串行等待导致总时长超出 timeoutMs
         for (size_t batchStart = 0; batchStart < alive.size(); batchStart += MAXIMUM_WAIT_OBJECTS) {
+            ULONGLONG remain = timeoutMs - (GetTickCount64() - start);
+            DWORD batchWait = (DWORD)std::min((ULONGLONG)500, remain);
+            if (batchWait == 0) break;
             size_t batchSize = std::min(alive.size() - batchStart, (size_t)MAXIMUM_WAIT_OBJECTS);
-            WaitForMultipleObjects((DWORD)batchSize, &alive[batchStart], FALSE, waitMs);
+            WaitForMultipleObjects((DWORD)batchSize, &alive[batchStart], FALSE, batchWait);
         }
     }
 
@@ -299,7 +305,9 @@ void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
     m_hiddenWindows.clear();
     if (m_active) {
         m_active = false;
-        if (m_muteEnabled) SetMute(false, true);
+        if (m_mutedByUs) SetMute(false, true);
+        // 记录停用时间，使自动隐藏冷却生效（与 Deactivate 保持一致）
+        m_lastDeactivateTick = GetTickCount64();
     }
     // 绑定进程已关闭，清除恢复文件
     ClearRecoverFile();
@@ -313,30 +321,35 @@ void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
 //   - 下次启动时 RecoverOrphanedWindows 读取并恢复
 // ============================================================
 std::wstring BossKey::GetRecoverFilePath() {
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring dir(exePath);
-    size_t pos = dir.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) dir = dir.substr(0, pos + 1);
+    // 路径在进程生命周期内固定（exe 目录与可写性不变），缓存探测结果，
+    // 避免每次创建/删除恢复文件都创建一个临时探测文件
+    static const std::wstring cachedPath = []() -> std::wstring {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring dir(exePath);
+        size_t pos = dir.find_last_of(L"\\/");
+        if (pos != std::wstring::npos) dir = dir.substr(0, pos + 1);
 
-    // 目录策略与 INI 一致：优先 exe 同目录（便携模式）；
-    // 目录只读（如 Program Files）时回退 %APPDATA%\KeySentry，
-    // 避免恢复文件写入静默失败导致崩溃后无法恢复被隐藏的窗口
-    std::wstring testPath = dir + L".~rtest.tmp";
-    HANDLE hTest = CreateFileW(testPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-    if (hTest != INVALID_HANDLE_VALUE) {
-        CloseHandle(hTest);  // 关闭即自动删除测试文件
-        return dir + L"KeySentry.recover";
-    }
+        // 目录策略与 INI 一致：优先 exe 同目录（便携模式）；
+        // 目录只读（如 Program Files）时回退 %APPDATA%\KeySentry，
+        // 避免恢复文件写入静默失败导致崩溃后无法恢复被隐藏的窗口
+        std::wstring testPath = dir + L".~rtest.tmp";
+        HANDLE hTest = CreateFileW(testPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (hTest != INVALID_HANDLE_VALUE) {
+            CloseHandle(hTest);  // 关闭即自动删除测试文件
+            return dir + L"KeySentry.recover";
+        }
 
-    wchar_t appData[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
-        std::wstring ad = std::wstring(appData) + L"\\KeySentry";
-        CreateDirectoryW(ad.c_str(), nullptr);
-        return ad + L"\\KeySentry.recover";
-    }
-    return dir + L"KeySentry.recover";  // 获取 AppData 失败时仍返回原路径
+        wchar_t appData[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
+            std::wstring ad = std::wstring(appData) + L"\\KeySentry";
+            CreateDirectoryW(ad.c_str(), nullptr);
+            return ad + L"\\KeySentry.recover";
+        }
+        return dir + L"KeySentry.recover";  // 获取 AppData 失败时仍返回原路径
+    }();
+    return cachedPath;
 }
 
 void BossKey::SaveRecoverFile() {
@@ -363,19 +376,26 @@ void BossKey::SaveRecoverFile() {
     std::string utf8((size_t)bytes, '\0');
     WideCharToMultiByte(CP_UTF8, 0, content.c_str(), -1, &utf8[0], bytes, nullptr, nullptr);
 
-    HANDLE hFile = CreateFileW(GetRecoverFilePath().c_str(), GENERIC_WRITE, 0, nullptr,
+    // 原子写入：先写临时文件再重命名替换，避免崩溃时恢复文件被截断损坏
+    std::wstring path = GetRecoverFilePath();
+    std::wstring tmpPath = path + L".tmp";
+    HANDLE hFile = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(hFile, utf8.data(), (DWORD)(bytes - 1), &written, nullptr);  // 不写结尾 NUL
     CloseHandle(hFile);
+    // 重命名失败时清理临时文件，避免 .tmp 残留
+    if (!MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmpPath.c_str());
+    }
 }
 
 void BossKey::ClearRecoverFile() {
     DeleteFileW(GetRecoverFilePath().c_str());
 }
 
-// 枚举回调上下文：按进程 ID + 标题子串查找窗口
+// 枚举回调上下文：按进程 ID + 标题精确匹配查找窗口
 struct RecoverFindCtx {
     DWORD pid;
     const std::wstring* title;
@@ -391,7 +411,8 @@ static BOOL CALLBACK RecoverFindWindowProc(HWND h, LPARAM lp) {
     if (p != ctx->pid) return TRUE;
     wchar_t t[512] = {};
     if (GetWindowTextW(h, t, 512) == 0) return TRUE;
-    if (wcsstr(t, ctx->title->c_str()) != nullptr) {
+    // 精确匹配标题（而非子串）：子串匹配可能命中标题更长的无关窗口并错误显示
+    if (wcscmp(t, ctx->title->c_str()) == 0) {
         if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOWNORMAL);
         ctx->found = true;
         return FALSE;  // 找到即停止枚举
@@ -413,14 +434,14 @@ int BossKey::RecoverOrphanedWindows() {
         utf8.append(buf, (size_t)read);
     }
     CloseHandle(hFile);
-    // 恢复文件是一次性的，无论恢复结果如何都删除
-    ClearRecoverFile();
 
-    if (utf8.empty()) return 0;
+    // 恢复文件在完成全部恢复动作后才删除：若在恢复过程中程序再次异常退出，
+    // 文件仍保留，下次启动可继续恢复，避免被隐藏的窗口永久失联
+    if (utf8.empty()) { ClearRecoverFile(); return 0; }
 
     // UTF-8 转宽字符
     int wchars = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), nullptr, 0);
-    if (wchars <= 0) return 0;
+    if (wchars <= 0) { ClearRecoverFile(); return 0; }
     std::wstring content((size_t)wchars, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), &content[0], wchars);
 
@@ -459,7 +480,7 @@ int BossKey::RecoverOrphanedWindows() {
             }
         }
 
-        // 路径 2：句柄失效（跨会话/句柄被复用），按进程 ID + 标题子串匹配
+        // 路径 2：句柄失效（跨会话/句柄被复用），按进程 ID + 标题精确匹配
         if (!done && !title.empty()) {
             RecoverFindCtx fctx{ pid, &title, false };
             EnumWindows(RecoverFindWindowProc, reinterpret_cast<LPARAM>(&fctx));
@@ -468,6 +489,9 @@ int BossKey::RecoverOrphanedWindows() {
 
         if (done) recovered++;
     }
+
+    // 恢复动作已全部完成，删除恢复文件
+    ClearRecoverFile();
     return recovered;
 }
 
@@ -499,12 +523,12 @@ void BossKey::UpdateMouseHookSettings(bool middleBtn, bool sideBtn1, bool sideBt
 LRESULT CALLBACK BossKey::MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && s_instance) {
         // 中键按下：触发老板键并吞掉事件
-        if (wParam == WM_MBUTTONDOWN && s_instance->m_middleBtnEnabled) {
+        if (wParam == WM_MBUTTONDOWN && s_instance->m_middleBtnEnabled && s_instance->m_mouseNotifyWnd) {
             PostMessageW(s_instance->m_mouseNotifyWnd, WM_BOSS_MOUSE_TOGGLE, 0, 0);
             return 1;
         }
-        // 中键释放：吞掉事件
-        if (wParam == WM_MBUTTONUP && s_instance->m_middleBtnEnabled) {
+        // 中键释放：吞掉事件（判空条件与按下分支保持一致，避免钩子已解绑时仍吞消息）
+        if (wParam == WM_MBUTTONUP && s_instance->m_middleBtnEnabled && s_instance->m_mouseNotifyWnd) {
             return 1;
         }
         // 侧键按下：检查是否为启用的侧键

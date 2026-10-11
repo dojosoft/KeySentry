@@ -1,5 +1,6 @@
 #pragma once
 #include <Windows.h>
+#include <mmdeviceapi.h>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,8 @@ private:
     bool m_primaryOnly = false;     // 是否仅在主显示器显示
     HINSTANCE m_hInst = nullptr;    // 应用实例句柄
     ULONGLONG m_lastShowTick = 0;   // 上次真正显示浮层的时刻（用于连发去抖）
+    // 缓存的音频设备枚举器：MMDeviceEnumerator 可复用，避免每次查询都 CoCreateInstance
+    IMMDeviceEnumerator* m_pEnumerator = nullptr;
 
     static const wchar_t* CLASS_NAME; // 浮层窗口类名
 

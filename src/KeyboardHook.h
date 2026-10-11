@@ -66,8 +66,13 @@ private:
     // 置顶重排与重绘，导致浮层闪烁并使任务栏/DWM 卡顿。
     bool m_lockKeyHeld[3] = { false, false, false }; // Caps/Num/Scroll 是否已按下
     ULONGLONG m_lockKeyHeldTick[3] = { 0, 0, 0 };    // 按下时刻（超时兜底，防止标志卡住）
+    // 静音键连发抑制：与锁键同理，只在首次物理按下时通知（避免连发时反复枚举音频设备）
+    bool m_muteKeyHeld = false;
+    ULONGLONG m_muteKeyHeldTick = 0;
     // 锁键虚拟码 -> 下标：CAPITAL->0, NUMLOCK->1, SCROLL->2，其他返回 -1
     static int LockKeyIndex(UINT vk);
+    // 复位所有「按键已按下」连发抑制标志（捕获模式开始、钩子卸载时调用）
+    void ResetHeldInputState();
 
     static KeyboardHook* s_instance;   // 单例指针，供静态回调使用
 };
