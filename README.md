@@ -54,18 +54,12 @@
 
 - **浏览器下载提示"可能有害/不常见"**：文件来自网络且无下载信誉，SmartScreen 会对未签名文件一律拦截
 - **首次运行出现"Windows 已保护你的电脑 / 未知发布者"**：点击「更多信息 → 仍要运行」即可
-- **解除单个文件拦截**：右键文件 → 属性 → 勾选「解除锁定」；或执行 `Unblock-File .\KeySentry.exe`
 
 **校验下载完整性（SHA-256）**：Releases 页面为每个文件附有 SHA-256 值，下载后可比对：
 
 ```powershell
 Get-FileHash .\KeySentry.exe -Algorithm SHA256
 ```
-
-若确认是安全软件误报，可向微软提交申诉（类型选 "Software developer" → 误报），有助于清除该文件的判定：
-<https://www.microsoft.com/en-us/wdsi/filesubmission>
-
-> 本项目正在接入受信任的代码签名证书（OV/EV）。完成签名后的版本将不再出现上述下载与启动提示。
 
 ## 从源码构建
 
@@ -77,21 +71,6 @@ Get-FileHash .\KeySentry.exe -Algorithm SHA256
 cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 # 产物位于 release\KeySentry.exe
-```
-
-如需对产物进行代码签名（消除下载与启动时的 SmartScreen 提示），在配置阶段传入证书即可自动签名，未传入则跳过：
-
-```powershell
-cmake -S . -B build -DKS_SIGN_PFX="D:/cert/KeySentry.pfx" -DKS_SIGN_PWD="证书密码"
-cmake --build build --config Release
-# 签名参数：SHA-256 + RFC3161 时间戳
-```
-
-发布时建议同时生成校验值并附在 Release 说明中：
-
-```powershell
-Get-FileHash .\release\KeySentry.exe, .\release\KeySentry-x64.exe -Algorithm SHA256 |
-  Format-Table Hash, Path -AutoSize
 ```
 
 ## 使用注意事项
