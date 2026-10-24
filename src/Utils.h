@@ -10,6 +10,71 @@
 #pragma comment(lib, "Psapi.lib")
 
 // ============================================================
+// 窗口工具命名空间
+// ============================================================
+namespace WindowUtils {
+    // 安全获取窗口标题
+    // 说明：GetWindowTextW 对其它进程的窗口会同步发送 WM_GETTEXT，
+    //       目标进程无响应时会阻塞调用线程。老板键运行在承载
+    //       WH_MOUSE_LL 鼠标钩子的 UI 线程上，一旦阻塞会导致全系统
+    //       鼠标输入停滞，故改用带超时的 SendMessageTimeoutW。
+    inline std::wstring GetTextSafe(HWND hwnd, UINT timeoutMs = 50) {
+        if (!IsWindow(hwnd)) return L"";
+        // 先用栈缓冲尝试；返回值达到缓冲上限说明可能被截断，再按实际长度重读一次。
+        // 固定 512 字符会让超长标题被截断，导致按标题绑定/恢复文件精确匹配失败
+        const int kInitialChars = 512;
+        wchar_t buf[kInitialChars] = {};
+        DWORD_PTR result = 0;
+        LRESULT ok = SendMessageTimeoutW(hwnd, WM_GETTEXT, (WPARAM)kInitialChars, (LPARAM)buf,
+                                         SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &result);
+        if (ok == 0) {
+            // 超时或失败：仅对同进程窗口回退到 GetWindowTextW（不会跨进程阻塞）
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == GetCurrentProcessId()) {
+                std::wstring text(kInitialChars, L'\0');
+                int len = GetWindowTextW(hwnd, &text[0], kInitialChars);
+                text.resize(len > 0 ? (size_t)len : 0);
+                return text;
+            }
+            return L"";
+        }
+
+        if ((size_t)result < (size_t)kInitialChars - 1) return buf;
+
+        // 可能被截断：查询实际长度后重读（上限 32K，防止异常窗口返回极大值）
+        DWORD_PTR len = 0;
+        if (SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, 0, 0,
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &len) != 0 &&
+            len > 0 && len + 1 <= 32768) {
+            std::wstring text((size_t)len + 1, L'\0');
+            DWORD_PTR copied = 0;
+            if (SendMessageTimeoutW(hwnd, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)&text[0],
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &copied) != 0) {
+                text.resize((size_t)copied);
+                return text;
+            }
+        }
+        return buf;
+    }
+
+    // 是否为桌面/任务栏等外壳窗口：这些窗口不允许被隐藏、关闭或修改样式，
+    // 否则会破坏桌面与任务栏的显示层级
+    inline bool IsShellWindow(HWND hwnd) {
+        wchar_t cls[128] = {};
+        if (GetClassNameW(hwnd, cls, 128) == 0) return false;
+        static const wchar_t* kShellClasses[] = {
+            L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"NotifyIconOverflowWindow",
+            L"Progman", L"WorkerW", L"TaskListOverflowWnd"
+        };
+        for (auto name : kShellClasses) {
+            if (_wcsicmp(cls, name) == 0) return true;
+        }
+        return false;
+    }
+}
+
+// ============================================================
 // 进程工具命名空间：提供进程路径和进程名查询功能
 // ============================================================
 namespace ProcessUtils {
@@ -51,6 +116,41 @@ namespace ProcessUtils {
         if (fullPath.empty()) return L"";
         size_t pos = fullPath.find_last_of(L"\\/");
         return (pos != std::wstring::npos) ? fullPath.substr(pos + 1) : fullPath;
+    }
+
+    // 获取当前进程 exe 的完整路径（动态缓冲，支持超过 MAX_PATH 的长路径）
+    inline std::wstring GetModulePath() {
+        std::wstring buf(MAX_PATH, L'\0');
+        for (int i = 0; i < 4; ++i) {
+            DWORD len = GetModuleFileNameW(nullptr, &buf[0], (DWORD)buf.size());
+            if (len == 0) return L"";
+            if (len < buf.size()) {
+                buf.resize(len);
+                return buf;
+            }
+            // 被截断：扩大缓冲后重试（旧系统不返回所需长度，只能翻倍）
+            buf.resize(buf.size() * 2);
+        }
+        return L"";
+    }
+
+    // 获取当前进程 exe 所在目录（以反斜杠结尾）
+    inline std::wstring GetModuleDir() {
+        std::wstring path = GetModulePath();
+        size_t pos = path.find_last_of(L"\\/");
+        if (pos == std::wstring::npos) return L"";
+        return path.substr(0, pos + 1);
+    }
+
+    // 获取当前用户 %APPDATA% 目录（动态缓冲，路径可超过 MAX_PATH）
+    inline std::wstring GetAppDataDir() {
+        DWORD size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+        if (size == 0) return L"";
+        std::wstring buf((size_t)size, L'\0');
+        DWORD len = GetEnvironmentVariableW(L"APPDATA", &buf[0], size);
+        if (len == 0 || len >= size) return L"";
+        buf.resize(len);
+        return buf;
     }
 
     // 进程路径信息（含可执行文件名与完整路径）

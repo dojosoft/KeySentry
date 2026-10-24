@@ -27,7 +27,8 @@ public:
     // 读取上一次运行遗留的窗口样式记录并恢复（程序异常退出时的兜底）。
     // removeFile=true 表示恢复后删除记录文件（启动路径使用）；
     // removeFile=false 用于“修复窗口堆叠”，保留记录文件以免影响运行中实例的崩溃恢复。
-    static void RecoverOrphanedStyles(bool removeFile = true);
+    // 返回实际恢复的窗口数量（仅统计键客记录过的窗口）。
+    static int RecoverOrphanedStyles(bool removeFile = true);
 
 private:
     // 被锁定保护的窗口信息
@@ -36,6 +37,9 @@ private:
         LONG_PTR originalStyle;     // 原始窗口样式（用于恢复）
         LONG_PTR originalExStyle;   // 原始扩展样式（用于恢复）
         DWORD processId;            // 进程ID
+        // 上次重建窗口框架（SWP_FRAMECHANGED）的时刻：部分程序会周期性
+        // 重建样式，每轮都重建会让标题栏反复闪烁，据此做重试退避
+        ULONGLONG lastFrameFixTick = 0;
     };
 
     // 对所有匹配窗口应用保护

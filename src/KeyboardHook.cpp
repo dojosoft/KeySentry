@@ -51,10 +51,38 @@ bool KeyboardHook::Install(HWND notifyWnd) {
 // 卸载键盘钩子
 void KeyboardHook::Uninstall() {
     if (m_hook) {
+        // 卸载前补发目标键 keyup：否则按住映射键时退出会把目标键留在按下状态
+        ReleaseRemappedKeys();
         UnhookWindowsHookEx(m_hook);
         m_hook = nullptr;
     }
     ResetHeldInputState();
+}
+
+// 为所有仍处于按下状态的重映射目标键补发 keyup，并清空记录
+void KeyboardHook::ReleaseRemappedKeys() {
+    if (m_activeRemaps.empty()) return;
+    // 多个源键可能映射到同一目标键，keyup 只需发送一次
+    std::vector<int> targets;
+    targets.reserve(m_activeRemaps.size());
+    for (const auto& remap : m_activeRemaps) {
+        if (std::find(targets.begin(), targets.end(), remap.second) == targets.end()) {
+            targets.push_back(remap.second);
+        }
+    }
+    std::vector<INPUT> inputs;
+    inputs.reserve(targets.size());
+    for (int target : targets) {
+        INPUT input = {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = (WORD)target;
+        input.ki.wScan = (WORD)MapVirtualKeyW(target, MAPVK_VK_TO_VSC);
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        if (NeedsExtendedKeyFlag(target)) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        inputs.push_back(input);
+    }
+    SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+    m_activeRemaps.clear();
 }
 
 void KeyboardHook::SetDisabledKeys(const std::vector<int>& codes) {
@@ -82,11 +110,21 @@ void KeyboardHook::SetShowMuteOverlay(bool show) {
 }
 
 void KeyboardHook::SetKeyRemapEnabled(bool enabled) {
+    // 关闭映射前先释放已注入的目标键，避免按住映射键时关闭功能造成卡键
+    if (m_keyRemapEnabled && !enabled) ReleaseRemappedKeys();
     m_keyRemapEnabled = enabled;
 }
 
 void KeyboardHook::SetKeyRemappings(const std::vector<std::pair<int, int>>& remappings) {
-    m_remappings = remappings;
+    // 映射表变更前先释放旧映射产生的按键，避免按住映射键修改配置后卡键
+    ReleaseRemappedKeys();
+    // 过滤非法键码（0/>=255 无法被 SendInput 识别）：源键被吞掉却模拟不出目标键
+    // 会让该键彻底失效，且用户没有任何提示
+    m_remappings.clear();
+    for (const auto& r : remappings) {
+        if (r.first <= 0 || r.first >= 255 || r.second <= 0 || r.second >= 255) continue;
+        m_remappings.push_back(r);
+    }
 }
 
 void KeyboardHook::SetSimulatingInput(bool sim) {
@@ -97,7 +135,11 @@ void KeyboardHook::SetCaptureMode(bool enabled) {
     m_captureMode = enabled;
     // 进入捕获模式时复位连发标志：捕获期间钩子放行所有按键（不更新标志），
     // 若不复位，退出捕获后可能沿用捕获前的旧标志而漏发一次通知
-    if (enabled) ResetHeldInputState();
+    if (enabled) {
+        ResetHeldInputState();
+        // 捕获期间不再重映射，需先释放已注入的目标键，避免目标键卡住
+        ReleaseRemappedKeys();
+    }
 }
 
 // ============================================================
@@ -132,19 +174,52 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
             if (s_instance->m_keyRemapEnabled && !(kb->flags & LLKHF_INJECTED)) {
                 for (const auto& remap : s_instance->m_remappings) {
                     if ((int)kb->vkCode == remap.first) {
-                        // 模拟目标按键
-                        INPUT input = {};
-                        input.type = INPUT_KEYBOARD;
-                        input.ki.wVk = (WORD)remap.second;
-                        input.ki.wScan = (WORD)MapVirtualKeyW(remap.second, MAPVK_VK_TO_VSC);
-                        input.ki.dwFlags = 0;
-                        if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
-                            input.ki.dwFlags = KEYEVENTF_KEYUP;
-                        if (NeedsExtendedKeyFlag(remap.second))
-                            input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-                        // 发送重映射按键（注入的，带 LLKHF_INJECTED 标志）
-                        // 上方的 LLKHF_INJECTED 检查确保不会对注入按键再次重映射
-                        SendInput(1, &input, sizeof(INPUT));
+                        bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+                        auto held = std::make_pair((int)kb->vkCode, remap.second);
+                        // 多个源键可能映射到同一目标键：仅当没有其他源键仍按住该
+                        // 目标键时才发送 keyup，否则另一个源键按住期间目标键会失效
+                        bool targetStillHeld = false;
+                        if (isUp) {
+                            for (const auto& active : s_instance->m_activeRemaps) {
+                                if (active != held && active.second == remap.second) {
+                                    targetStillHeld = true;
+                                    break;
+                                }
+                            }
+                        }
+                        bool injected = true;
+                        if (!targetStillHeld) {
+                            // 模拟目标按键
+                            INPUT input = {};
+                            input.type = INPUT_KEYBOARD;
+                            input.ki.wVk = (WORD)remap.second;
+                            input.ki.wScan = (WORD)MapVirtualKeyW(remap.second, MAPVK_VK_TO_VSC);
+                            input.ki.dwFlags = isUp ? KEYEVENTF_KEYUP : 0;
+                            if (NeedsExtendedKeyFlag(remap.second))
+                                input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+                            // 发送重映射按键（注入的，带 LLKHF_INJECTED 标志）
+                            // 上方的 LLKHF_INJECTED 检查确保不会对注入按键再次重映射
+                            // 注入可能失败（UIPI 拦截、安全桌面、输入被独占），
+                            // 失败时必须放行原键，否则该次按键会被彻底吞掉、表现为按键失灵
+                            injected = SendInput(1, &input, sizeof(INPUT)) == 1;
+                        }
+                        // 记录/清除仍按住的目标键：配置变更、关闭映射或退出时
+                        // 需据此补发 keyup，否则目标键会一直停留在按下状态
+                        auto it = std::find(s_instance->m_activeRemaps.begin(),
+                                            s_instance->m_activeRemaps.end(), held);
+                        if (isUp) {
+                            // keyup 注入失败时保留记录，之后退出程序或修改映射时
+                            // ReleaseRemappedKeys 仍能补发 keyup 解除可能的卡键
+                            if (injected && it != s_instance->m_activeRemaps.end())
+                                s_instance->m_activeRemaps.erase(it);
+                        } else if (injected && it == s_instance->m_activeRemaps.end()) {
+                            // 同一源键的连发 keydown 只记录一次
+                            s_instance->m_activeRemaps.push_back(held);
+                        }
+                        if (!injected) {
+                            // 注入失败：不吞原键，保持按键的原有行为
+                            return CallNextHookEx(s_instance->m_hook, nCode, wParam, lParam);
+                        }
                         return 1; // 吞掉原始按键
                     }
                 }

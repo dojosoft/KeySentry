@@ -35,9 +35,8 @@ bool BoundWindowInfo::Matches(HWND hwnd, bool requireVisible) const {
 
     // Window 模式：标题子串匹配
     if (!title.empty()) {
-        wchar_t hwndTitle[512] = {};
-        GetWindowTextW(hwnd, hwndTitle, 512);
-        if (wcslen(hwndTitle) > 0 && wcsstr(hwndTitle, title.c_str()) != nullptr) {
+        std::wstring hwndTitle = WindowUtils::GetTextSafe(hwnd);
+        if (!hwndTitle.empty() && hwndTitle.find(title) != std::wstring::npos) {
             return true;
         }
     }
@@ -63,18 +62,19 @@ bool BoundWindowInfo::Matches(HWND hwnd, ProcessUtils::PathCache& cache, bool re
 // ============================================================
 
 // 将逗号分隔的整数字符串解析为整数向量
+// 要求整段完整解析：std::stoi 会接受 "12abc" 这类前缀匹配（pos=2 仍算成功），
+// 那样手改 INI 写入的错误值会被静默当作合法值，这里一律丢弃
 static std::vector<int> ParseCSVInts(const std::wstring& csv) {
     std::vector<int> result;
     std::wstringstream ss(csv);
     std::wstring token;
     while (std::getline(ss, token, L',')) {
-        if (!token.empty()) {
-            try {
-                size_t pos = 0;
-                int val = std::stoi(token, &pos);
-                if (pos > 0) result.push_back(val);
-            } catch (...) {}
-        }
+        if (token.empty()) continue;
+        try {
+            size_t pos = 0;
+            int val = std::stoi(token, &pos);
+            if (pos == token.size()) result.push_back(val);
+        } catch (...) {}
     }
     return result;
 }
@@ -159,7 +159,12 @@ void AppConfig::Load(const std::wstring& iniPath) {
     disableNumLock = GetPrivateProfileIntW(L"Keys", L"DisableNumLock", 0, iniPath.c_str()) != 0;
     forceInsertMode = GetPrivateProfileIntW(L"Keys", L"ForceInsertMode", 0, iniPath.c_str()) != 0;
     auto keysStr = IniUtils::Read(iniPath, L"Keys", L"DisabledKeyCodes");
-    disabledKeyCodes = ParseCSVInts(keysStr);
+    disabledKeyCodes.clear();  // 重复载入时避免沿用上一次的禁用项
+    for (int vk : ParseCSVInts(keysStr)) {
+        // 与重映射/自定义热键保持一致的合法性过滤：非法键码永不匹配真实按键，
+        // 留在列表里只会显示成 "0x0" 这类无意义条目
+        if (ConfigUtils::IsValidVK(vk)) disabledKeyCodes.push_back(vk);
+    }
 
     // --- 按键重映射 ---
     keyRemapEnabled = GetPrivateProfileIntW(L"KeyRemap", L"Enabled", 0, iniPath.c_str()) != 0;
@@ -168,6 +173,8 @@ void AppConfig::Load(const std::wstring& iniPath) {
     // 重映射以成对形式存储：{源键, 目标键}
     keyRemappings.clear();   // 重复载入时避免沿用上一次的映射项
     for (size_t i = 0; i + 1 < remapInts.size(); i += 2) {
+        // 丢弃非法键码：保留会让源键被吞掉却模拟不出目标键，等于该键彻底失效
+        if (!ConfigUtils::IsValidVK(remapInts[i]) || !ConfigUtils::IsValidVK(remapInts[i + 1])) continue;
         keyRemappings.push_back({remapInts[i], remapInts[i + 1]});
     }
 
@@ -181,7 +188,10 @@ void AppConfig::Load(const std::wstring& iniPath) {
             if (p.empty()) continue;
             CustomHotkey hk = CustomHotkey::Deserialize(p);
             // 丢弃手改 INI 产生的非法条目：无修饰键或无主键时注册会全局劫持普通按键
-            if (hk.mod == 0 || hk.vk == 0) continue;
+            hk.mod = ConfigUtils::SanitizeMods((int)hk.mod);
+            if (hk.mod == 0 || !ConfigUtils::IsValidVK((int)hk.vk)) continue;
+            // 模拟按键模式下目标键非法时动作必然失败，同样丢弃
+            if (hk.simulateKey && !ConfigUtils::IsValidVK((int)hk.targetVK)) continue;
             // 丢弃重复组合（mod+vk 相同只保留第一条），避免注册失败连环弹窗
             bool duplicated = false;
             for (const auto& existing : customHotkeys) {
@@ -196,10 +206,17 @@ void AppConfig::Load(const std::wstring& iniPath) {
 
     // --- 老板键设置 ---
     bossKeyEnabled = GetPrivateProfileIntW(L"BossKey", L"Enabled", 0, iniPath.c_str()) != 0;
-    bossKeyMod = (UINT)GetPrivateProfileIntW(L"BossKey", L"Modifiers", MOD_WIN, iniPath.c_str());
-    bossKeyVK = (UINT)GetPrivateProfileIntW(L"BossKey", L"VKCode", 0xC0, iniPath.c_str());
-    bossKeyCloseMod = (UINT)GetPrivateProfileIntW(L"BossKey", L"CloseModifiers", MOD_WIN, iniPath.c_str());
-    bossKeyCloseVK = (UINT)GetPrivateProfileIntW(L"BossKey", L"CloseVKCode", VK_ESCAPE, iniPath.c_str());
+    // 手改 INI 的非法修饰键/虚拟键码会让 RegisterHotKey 永远失败，载入时统一收敛
+    bossKeyMod = ConfigUtils::SanitizeMods(GetPrivateProfileIntW(L"BossKey", L"Modifiers", MOD_WIN, iniPath.c_str()));
+    {
+        int vkVal = GetPrivateProfileIntW(L"BossKey", L"VKCode", 0xC0, iniPath.c_str());
+        bossKeyVK = ConfigUtils::IsValidVK(vkVal) ? (UINT)vkVal : 0xC0;
+    }
+    bossKeyCloseMod = ConfigUtils::SanitizeMods(GetPrivateProfileIntW(L"BossKey", L"CloseModifiers", MOD_WIN, iniPath.c_str()));
+    {
+        int vkVal = GetPrivateProfileIntW(L"BossKey", L"CloseVKCode", VK_ESCAPE, iniPath.c_str());
+        bossKeyCloseVK = ConfigUtils::IsValidVK(vkVal) ? (UINT)vkVal : (UINT)VK_ESCAPE;
+    }
     bossKeyMute = GetPrivateProfileIntW(L"BossKey", L"Mute", 0, iniPath.c_str()) != 0;
     auto bossWinsStr = IniUtils::Read(iniPath, L"BossKey", L"Windows");
     {
@@ -276,74 +293,84 @@ void AppConfig::Load(const std::wstring& iniPath) {
 // ============================================================
 // AppConfig::Save - 保存所有配置项到 INI 文件
 // ============================================================
-void AppConfig::Save(const std::wstring& iniPath) const {
-    IniUtils::Write(iniPath, L"General", L"ConfigVersion", std::to_wstring(CONFIG_VERSION));
-    IniUtils::Write(iniPath, L"General", L"AutoStart", IniUtils::BoolToStr(autoStart));
-    IniUtils::Write(iniPath, L"General", L"ShowOverlay", IniUtils::BoolToStr(showLockKeyOverlay));
-    IniUtils::Write(iniPath, L"General", L"ShowMuteOverlay", IniUtils::BoolToStr(showMuteOverlay));
-    IniUtils::Write(iniPath, L"General", L"OverlayPrimaryOnly", IniUtils::BoolToStr(overlayPrimaryOnly));
-    IniUtils::Write(iniPath, L"General", L"ForceNumLockOn", IniUtils::BoolToStr(forceNumLockOn));
-    IniUtils::Write(iniPath, L"General", L"DisableStartupNotification", IniUtils::BoolToStr(disableStartupNotification));
-    IniUtils::Write(iniPath, L"General", L"ExplorerHideHidden", std::to_wstring(explorerHideHidden));
-    IniUtils::Write(iniPath, L"General", L"ExplorerHideExt", std::to_wstring(explorerHideExt));
-    IniUtils::Write(iniPath, L"General", L"ExplorerHideOS", std::to_wstring(explorerHideOS));
-    IniUtils::Write(iniPath, L"General", L"TabState", std::to_wstring(tabState));
+bool AppConfig::Save(const std::wstring& iniPath) const {
+    // 原子写入：先写临时文件再替换目标文件，避免写盘途中崩溃/断电留下截断的配置。
+    // 以全新的临时文件为写入对象，也自然丢弃旧版本遗留的废弃字段
+    std::wstring tmpPath = iniPath + L".tmp";
+    DeleteFileW(tmpPath.c_str());
+    IniUtils::Write(tmpPath, L"General", L"ConfigVersion", std::to_wstring(CONFIG_VERSION));
+    IniUtils::Write(tmpPath, L"General", L"AutoStart", IniUtils::BoolToStr(autoStart));
+    IniUtils::Write(tmpPath, L"General", L"ShowOverlay", IniUtils::BoolToStr(showLockKeyOverlay));
+    IniUtils::Write(tmpPath, L"General", L"ShowMuteOverlay", IniUtils::BoolToStr(showMuteOverlay));
+    IniUtils::Write(tmpPath, L"General", L"OverlayPrimaryOnly", IniUtils::BoolToStr(overlayPrimaryOnly));
+    IniUtils::Write(tmpPath, L"General", L"ForceNumLockOn", IniUtils::BoolToStr(forceNumLockOn));
+    IniUtils::Write(tmpPath, L"General", L"DisableStartupNotification", IniUtils::BoolToStr(disableStartupNotification));
+    IniUtils::Write(tmpPath, L"General", L"ExplorerHideHidden", std::to_wstring(explorerHideHidden));
+    IniUtils::Write(tmpPath, L"General", L"ExplorerHideExt", std::to_wstring(explorerHideExt));
+    IniUtils::Write(tmpPath, L"General", L"ExplorerHideOS", std::to_wstring(explorerHideOS));
+    IniUtils::Write(tmpPath, L"General", L"TabState", std::to_wstring(tabState));
 
-    IniUtils::Write(iniPath, L"Keys", L"DisableSpecifiedKeysEnabled", IniUtils::BoolToStr(disableSpecifiedKeysEnabled));
-    IniUtils::Write(iniPath, L"Keys", L"DisableNumLock", IniUtils::BoolToStr(disableNumLock));
-    IniUtils::Write(iniPath, L"Keys", L"ForceInsertMode", IniUtils::BoolToStr(forceInsertMode));
-    IniUtils::Write(iniPath, L"Keys", L"DisabledKeyCodes", IntsToCSV(disabledKeyCodes));
+    IniUtils::Write(tmpPath, L"Keys", L"DisableSpecifiedKeysEnabled", IniUtils::BoolToStr(disableSpecifiedKeysEnabled));
+    IniUtils::Write(tmpPath, L"Keys", L"DisableNumLock", IniUtils::BoolToStr(disableNumLock));
+    IniUtils::Write(tmpPath, L"Keys", L"ForceInsertMode", IniUtils::BoolToStr(forceInsertMode));
+    IniUtils::Write(tmpPath, L"Keys", L"DisabledKeyCodes", IntsToCSV(disabledKeyCodes));
 
     // 按键重映射：将成对映射展平为逗号分隔的整数序列
-    IniUtils::Write(iniPath, L"KeyRemap", L"Enabled", IniUtils::BoolToStr(keyRemapEnabled));
+    IniUtils::Write(tmpPath, L"KeyRemap", L"Enabled", IniUtils::BoolToStr(keyRemapEnabled));
     std::vector<int> remapFlat;
     for (auto& p : keyRemappings) { remapFlat.push_back(p.first); remapFlat.push_back(p.second); }
-    IniUtils::Write(iniPath, L"KeyRemap", L"Mappings", IntsToCSV(remapFlat));
+    IniUtils::Write(tmpPath, L"KeyRemap", L"Mappings", IntsToCSV(remapFlat));
 
     // 自定义热键：始终按当前序列化规范整体重写，
     // 旧版本遗留的废弃字段（sound/opacity/autoStart）在此被丢弃
-    IniUtils::Write(iniPath, L"CustomHotkeys", L"Enabled", IniUtils::BoolToStr(customHotkeysEnabled));
+    IniUtils::Write(tmpPath, L"CustomHotkeys", L"Enabled", IniUtils::BoolToStr(customHotkeysEnabled));
     {
         std::vector<std::wstring> serialized;
         for (const auto& hk : customHotkeys) serialized.push_back(hk.Serialize());
-        IniUtils::Write(iniPath, L"CustomHotkeys", L"Entries", EntryListToString(serialized));
+        IniUtils::Write(tmpPath, L"CustomHotkeys", L"Entries", EntryListToString(serialized));
     }
 
     // 老板键设置
-    IniUtils::Write(iniPath, L"BossKey", L"Enabled", IniUtils::BoolToStr(bossKeyEnabled));
-    IniUtils::Write(iniPath, L"BossKey", L"Modifiers", std::to_wstring(bossKeyMod));
-    IniUtils::Write(iniPath, L"BossKey", L"VKCode", std::to_wstring(bossKeyVK));
-    IniUtils::Write(iniPath, L"BossKey", L"CloseModifiers", std::to_wstring(bossKeyCloseMod));
-    IniUtils::Write(iniPath, L"BossKey", L"CloseVKCode", std::to_wstring(bossKeyCloseVK));
-    IniUtils::Write(iniPath, L"BossKey", L"Mute", IniUtils::BoolToStr(bossKeyMute));
+    IniUtils::Write(tmpPath, L"BossKey", L"Enabled", IniUtils::BoolToStr(bossKeyEnabled));
+    IniUtils::Write(tmpPath, L"BossKey", L"Modifiers", std::to_wstring(bossKeyMod));
+    IniUtils::Write(tmpPath, L"BossKey", L"VKCode", std::to_wstring(bossKeyVK));
+    IniUtils::Write(tmpPath, L"BossKey", L"CloseModifiers", std::to_wstring(bossKeyCloseMod));
+    IniUtils::Write(tmpPath, L"BossKey", L"CloseVKCode", std::to_wstring(bossKeyCloseVK));
+    IniUtils::Write(tmpPath, L"BossKey", L"Mute", IniUtils::BoolToStr(bossKeyMute));
     {
         std::vector<std::wstring> serialized;
         for (const auto& w : bossKeyWindows) serialized.push_back(w.Serialize());
-        IniUtils::Write(iniPath, L"BossKey", L"Windows", EntryListToString(serialized));
+        IniUtils::Write(tmpPath, L"BossKey", L"Windows", EntryListToString(serialized));
     }
-    IniUtils::Write(iniPath, L"BossKey", L"HideCurrent", IniUtils::BoolToStr(bossKeyHideCurrent));
-    IniUtils::Write(iniPath, L"BossKey", L"SendPause", IniUtils::BoolToStr(bossKeySendPause));
-    IniUtils::Write(iniPath, L"BossKey", L"MiddleButton", IniUtils::BoolToStr(bossKeyMiddleButton));
-    IniUtils::Write(iniPath, L"BossKey", L"SideButton1", IniUtils::BoolToStr(bossKeySideButton1));
-    IniUtils::Write(iniPath, L"BossKey", L"SideButton2", IniUtils::BoolToStr(bossKeySideButton2));
-    IniUtils::Write(iniPath, L"BossKey", L"CornerTL", IniUtils::BoolToStr(bossKeyCornerTL));
-    IniUtils::Write(iniPath, L"BossKey", L"CornerTR", IniUtils::BoolToStr(bossKeyCornerTR));
-    IniUtils::Write(iniPath, L"BossKey", L"CornerBL", IniUtils::BoolToStr(bossKeyCornerBL));
-    IniUtils::Write(iniPath, L"BossKey", L"CornerBR", IniUtils::BoolToStr(bossKeyCornerBR));
-    IniUtils::Write(iniPath, L"BossKey", L"AutoHide", IniUtils::BoolToStr(bossKeyAutoHide));
-    IniUtils::Write(iniPath, L"BossKey", L"AutoHideTime", std::to_wstring(bossKeyAutoHideTime));
-    IniUtils::Write(iniPath, L"BossKey", L"CloseOnExit", IniUtils::BoolToStr(bossKeyCloseOnExit));
+    IniUtils::Write(tmpPath, L"BossKey", L"HideCurrent", IniUtils::BoolToStr(bossKeyHideCurrent));
+    IniUtils::Write(tmpPath, L"BossKey", L"SendPause", IniUtils::BoolToStr(bossKeySendPause));
+    IniUtils::Write(tmpPath, L"BossKey", L"MiddleButton", IniUtils::BoolToStr(bossKeyMiddleButton));
+    IniUtils::Write(tmpPath, L"BossKey", L"SideButton1", IniUtils::BoolToStr(bossKeySideButton1));
+    IniUtils::Write(tmpPath, L"BossKey", L"SideButton2", IniUtils::BoolToStr(bossKeySideButton2));
+    IniUtils::Write(tmpPath, L"BossKey", L"CornerTL", IniUtils::BoolToStr(bossKeyCornerTL));
+    IniUtils::Write(tmpPath, L"BossKey", L"CornerTR", IniUtils::BoolToStr(bossKeyCornerTR));
+    IniUtils::Write(tmpPath, L"BossKey", L"CornerBL", IniUtils::BoolToStr(bossKeyCornerBL));
+    IniUtils::Write(tmpPath, L"BossKey", L"CornerBR", IniUtils::BoolToStr(bossKeyCornerBR));
+    IniUtils::Write(tmpPath, L"BossKey", L"AutoHide", IniUtils::BoolToStr(bossKeyAutoHide));
+    IniUtils::Write(tmpPath, L"BossKey", L"AutoHideTime", std::to_wstring(bossKeyAutoHideTime));
+    IniUtils::Write(tmpPath, L"BossKey", L"CloseOnExit", IniUtils::BoolToStr(bossKeyCloseOnExit));
 
     // WinDGuard 设置
-    IniUtils::Write(iniPath, L"WinDGuard", L"Enabled", IniUtils::BoolToStr(winDGuardEnabled));
+    IniUtils::Write(tmpPath, L"WinDGuard", L"Enabled", IniUtils::BoolToStr(winDGuardEnabled));
     {
         std::vector<std::wstring> serialized;
         for (const auto& w : winDGuardWindows) serialized.push_back(w.Serialize());
-        IniUtils::Write(iniPath, L"WinDGuard", L"Windows", EntryListToString(serialized));
+        IniUtils::Write(tmpPath, L"WinDGuard", L"Windows", EntryListToString(serialized));
     }
 
-    // 刷新 INI 文件缓存，确保写入磁盘
-    WritePrivateProfileStringW(nullptr, nullptr, nullptr, iniPath.c_str());
+    // 刷新临时文件的 INI 缓存到磁盘后再原子替换目标文件；
+    // 替换失败时清理临时文件，避免 .tmp 残留
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, tmpPath.c_str());
+    if (!MoveFileExW(tmpPath.c_str(), iniPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmpPath.c_str());
+        return false;  // 目录只读/磁盘满/权限不足：由调用方提示，避免"已应用"却未落盘
+    }
+    return true;
 }
 
 // ============================================================

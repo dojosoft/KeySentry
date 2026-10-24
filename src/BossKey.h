@@ -6,6 +6,7 @@
 
 // 前向声明：仅在成员中作指针使用，避免头文件引入 COM 头
 struct IMMDeviceEnumerator;
+struct IAudioEndpointVolume;
 
 // ============================================================
 // BossKey: 老板键管理器
@@ -55,6 +56,11 @@ public:
     int RecoverOrphanedWindows();
     // 将当前被隐藏窗口的信息持久化到恢复文件（关机前调用）
     void SaveRecoverFile();
+    // 延迟确认"异步隐藏是否最终生效"（由调用方的定时器驱动）：
+    // 生效则重新进入激活态，保证老板键仍能恢复这些窗口；否则清理残留记录
+    void VerifyPendingHide();
+    // 释放缓存的音频 COM 接口：正常退出时须在 CoUninitialize 之前调用
+    void ReleaseAudio();
 
     // 安装鼠标低级钩子（用于中键/侧键触发）
     bool InstallMouseHook(HWND notifyWnd);
@@ -82,6 +88,7 @@ private:
     void ClearRecoverFile();
 
     bool m_active = false;          // 当前是否处于激活（隐藏）状态
+    bool m_pendingVerify = false;   // 是否等待"异步隐藏延迟确认"（见 VerifyPendingHide）
     HWND m_hwnd = nullptr;          // 热键所属窗口句柄
     int m_hotkeyId = 0;             // 热键ID
     UINT m_modifiers = 0;           // 热键修饰键
@@ -100,6 +107,9 @@ private:
     std::vector<HiddenWindow> m_hiddenWindows; // 被隐藏的窗口列表
     std::vector<BoundWindowInfo> m_boundWindows; // 绑定的窗口匹配规则
     bool m_wasMuted = false;        // 隐藏前系统是否已静音
+    // m_wasMuted 是否有效：GetMute 失败时不能用陈旧值恢复，否则会把
+    // 用户本来的静音状态改错（恢复成上一轮的记录）
+    bool m_wasMutedValid = false;
     bool m_mutedByUs = false;       // 本次静音是否由本程序发起（据此决定恢复时是否解除静音）
     ULONGLONG m_lastDeactivateTick = 0; // 上次停用的时间戳
 
@@ -111,5 +121,9 @@ private:
     // 缓存的音频设备枚举器：老板键可被鼠标中键/侧键频繁切换，
     // 复用实例避免每次隐藏/恢复都 CoCreateInstance
     IMMDeviceEnumerator* m_pEnumerator = nullptr;
+    // 缓存的音量接口：按默认输出设备 ID 复用，设备变化时重建
+    IAudioEndpointVolume* m_pVolume = nullptr;
+    std::wstring m_volumeDeviceId;  // m_pVolume 对应的默认输出设备 ID
+    std::wstring m_mutedDeviceId;   // 本程序静音时所作用的设备 ID
     static BossKey* s_instance;     // 单例指针，供静态回调使用
 };
