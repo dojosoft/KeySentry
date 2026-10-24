@@ -61,6 +61,13 @@ private:
     bool m_simulatingInput = false;    // 正在模拟输入（用于防止递归拦截）
     bool m_captureMode = false;        // 热键捕获模式（不拦截任何按键）
 
+    // 已注入且仍处于按下状态的重映射目标键（源键 vk -> 目标键 vk）。
+    // 若用户在按住源键期间修改/关闭映射或退出程序，源键的 keyup 会按新配置
+    // 直接放行而不再注入目标键 keyup，导致目标键在系统中一直处于按下状态（卡键）
+    std::vector<std::pair<int, int>> m_activeRemaps;
+    // 为所有仍处于按下状态的重映射目标键补发 keyup，并清空记录
+    void ReleaseRemappedKeys();
+
     // 锁键连发抑制：只在物理按下的第一次 keydown 通知，keyup 时清除标志。
     // 锁键被按住时系统会持续产生 keydown 连发消息，若不抑制会高频触发浮层
     // 置顶重排与重绘，导致浮层闪烁并使任务栏/DWM 卡顿。

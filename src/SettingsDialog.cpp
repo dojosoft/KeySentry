@@ -15,6 +15,17 @@
 extern void ShowAboutDialog(HWND parent);   // 显示关于对话框
 extern void SetSettingsWnd(HWND wnd);       // 设置设置窗口句柄到全局，供主窗口消息处理使用
 
+// 读取控件文本到 std::wstring：不使用固定长度缓冲，避免长路径/长命令行被截断
+static std::wstring ReadWindowText(HWND hwnd) {
+    if (!hwnd) return L"";
+    int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) return L"";
+    std::wstring text((size_t)len + 1, L'\0');
+    GetWindowTextW(hwnd, &text[0], len + 1);
+    text.resize(wcslen(text.c_str()));
+    return text;
+}
+
 // ===== 静态回调指针初始化 =====
 void (*SettingsDialog::s_applyCallback)() = nullptr;
 void (*SettingsDialog::s_captureModeCallback)(bool) = nullptr;
@@ -94,8 +105,8 @@ static LRESULT CALLBACK InlineCaptureHookProc(int nCode, WPARAM wParam, LPARAM l
 }
 
 // 开始内联捕获：安装吞键钩子并通知全局键盘钩子放行（幂等，可在两项捕获间切换）
-static void BeginInlineCapture(HWND hwnd) {
-    s_inlineCapWnd = hwnd;
+// 返回 false 表示钩子安装失败，调用方不得进入捕获态
+static bool BeginInlineCapture(HWND hwnd) {
     if (!s_inlineCapHook) {
         // 全新开始捕获：以物理键状态初始化修饰键，避免用户在点击"捕获"前就已按住的
         // 修饰键丢失（其 keydown 未被钩子吞掉，不会进入 s_inlineCapMods）。
@@ -103,24 +114,45 @@ static void BeginInlineCapture(HWND hwnd) {
         s_inlineCapMods = InlineCapQueryMods();
         s_inlineCapHook = SetWindowsHookExW(WH_KEYBOARD_LL, InlineCaptureHookProc,
                                             GetModuleHandleW(nullptr), 0);
+        if (!s_inlineCapHook) {
+            // 安装失败：不进入捕获态，否则界面提示"请按下快捷键"但永远收不到按键
+            s_inlineCapMods = 0;
+            MessageBoxW(hwnd, L"无法安装键盘钩子，热键捕获已取消。\n请检查是否有安全软件拦截。",
+                        L"提示", MB_OK | MB_ICONWARNING);
+            return false;
+        }
     }
+    s_inlineCapWnd = hwnd;
     g_suppressHotkeys = true;  // 捕获期间抑制热键转发，避免捕获操作触发已注册热键
     if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(true);
+    return true;
 }
+
+// 前置声明：是否存在"只持有 s_captureKeyHook"的独立捕获对话框（定义见文件后部）
+// EndInlineCapture 需要据此判断抑制标志是否由自己负责复位
+static bool IsCaptureKeyDialogActive();
 
 // 结束内联捕获：仅当钩子归属于 owner 时才卸载
 // （捕获过程中若其他对话框接管了钩子，此处不得误拆，否则该对话框的捕获会失效）
 static void EndInlineCapture(HWND owner) {
     // 钩子已归属其他捕获窗口：交由该窗口收尾
     if (s_inlineCapWnd && s_inlineCapWnd != owner) return;
+    // 走到这里 s_inlineCapWnd 只可能是 owner 或 nullptr；
+    // 前者说明本次调用确实释放了自己持有的内联捕获
+    const bool ownedInline = (s_inlineCapWnd != nullptr);
     if (s_inlineCapHook) {
         UnhookWindowsHookEx(s_inlineCapHook);
         s_inlineCapHook = nullptr;
     }
     s_inlineCapWnd = nullptr;
     s_inlineCapMods = 0;
-    g_suppressHotkeys = false;
-    if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(false);
+    // 抑制标志与钩子捕获模式必须归还给当前真正的持有者：
+    // ShowCaptureKeyDialogEx 只持有 s_captureKeyHook（不持有 s_inlineCapWnd），
+    // 若无条件复位会把它的按键捕获与抑制状态一并破坏
+    if (ownedInline || !IsCaptureKeyDialogActive()) {
+        g_suppressHotkeys = false;
+        if (SettingsDialog::s_captureModeCallback) SettingsDialog::s_captureModeCallback(false);
+    }
 }
 
 // ===== 对话框布局常量 =====
@@ -374,7 +406,9 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
         wc.lpszClassName = KB_PICKER_CLASS;
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
+        // 注册失败时不得标记成功：否则窗口类始终未注册，
+        // CreateWindowExW 会持续返回空且不再重试（ERROR_CLASS_ALREADY_EXISTS 视为成功）
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
         registered = true;
     }
 
@@ -388,20 +422,25 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
 
     KbPickerData pd = { 0, false };
 
-    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, KB_PICKER_CLASS,
+    // WS_EX_CONTROLPARENT：非对话框窗口承载控件时，IsDialogMessage 需要它
+    // 才能在子控件之间正确进行 Tab 导航
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, KB_PICKER_CLASS,
                                  L"选择映射按键",
                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                  (screenW - winW) / 2, (screenH - winH) / 2,
                                  winW, winH,
                                  parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) return 0;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&pd));
 
     GdiObjectGuard keyFont(CreateUiFont(12, FW_NORMAL));
 
     // 为每个键盘按键创建按钮控件
+    // 必须带 WS_TABSTOP：本对话框正是为"鼠标不便"的场景准备的，
+    // 缺少它会导致 Tab 无法在按键间移动焦点，只能用鼠标点选
     for (int i = 0; i < KB_KEY_COUNT; i++) {
         CreateWindowExW(0, L"BUTTON", KB_KEYS[i].label,
-                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                          KB_KEYS[i].x + 8, KB_KEYS[i].y + 8, KB_KEYS[i].w, KB_KEYS[i].h,
                          hwnd, (HMENU)(LONG_PTR)(10000 + i), GetModuleHandleW(nullptr), nullptr);
         HWND btn = GetDlgItem(hwnd, 10000 + i);
@@ -409,8 +448,9 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
     }
 
     // 底部"取消"按钮，提供明确的取消路径（点击后走 WM_COMMAND IDCANCEL）
+    // 按 Tab 顺序排在所有按键之后，便于键盘操作
     HWND btnCancel = CreateWindowExW(0, L"BUTTON", L"取消",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                      310, 240, 90, 26,
                                      hwnd, (HMENU)(LONG_PTR)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(btnCancel, WM_SETFONT, (WPARAM)keyFont.get(), TRUE);
@@ -433,6 +473,9 @@ int SettingsDialog::ShowKeyboardPicker(HWND parent) {
                     SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
                 continue;
             }
+            // 交给对话框管理器：Tab 切换焦点、方向键移动、Esc 自动转成 IDCANCEL，
+            // 这样焦点在按钮上时 Esc 也能取消
+            if (IsDialogMessageW(hwnd, &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -468,7 +511,9 @@ INT_PTR SettingsDialog::Show(HWND parent, AppConfig& config) {
         wc.lpszClassName = SETTINGS_CLASS;
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
+        // 注册失败时不得标记成功：否则窗口类始终未注册，
+        // CreateWindowExW 会持续返回空且不再重试（ERROR_CLASS_ALREADY_EXISTS 视为成功）
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
 
         registered = true;
     }
@@ -488,6 +533,8 @@ INT_PTR SettingsDialog::Show(HWND parent, AppConfig& config) {
                                  (screenW - winW) / 2, (screenH - winH) / 2,
                                  winW, winH,
                                  parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // 窗口创建失败（极端资源耗尽）：直接返回，避免以空句柄创建子控件产生孤儿窗口
+    if (!hwnd) return 0;
 
     // 将对话框数据存储到窗口的 USERDATA 中
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&data));
@@ -656,7 +703,7 @@ void SettingsDialog::SaveCurrentTabState(HWND hwnd, AppConfig& config) {
     };
 
     switch (config.tabState) {
-    case 0: // 常规页面
+    case 0: { // 常规页面
         config.autoStart = chk(IDC_CHK_AUTOSTART);
         config.forceNumLockOn = chk(IDC_CHK_FORCENUMLOCK);
         config.disableStartupNotification = chk(IDC_CHK_DISABLE_STARTUP_NOTIFY);
@@ -664,10 +711,18 @@ void SettingsDialog::SaveCurrentTabState(HWND hwnd, AppConfig& config) {
         config.showMuteOverlay = chk(IDC_CHK_MUTE_OVERLAY);
         config.overlayPrimaryOnly = chk(IDC_CHK_PRIMARY_ONLY);
         // 保存资源管理器文件夹选项下拉框（0=不改变, 1=开启, 2=关闭）
-        config.explorerHideHidden = (int)SendMessageW(GetDlgItem(hwnd, IDC_CBO_EXPLORER_HIDDEN), CB_GETCURSEL, 0, 0);
-        config.explorerHideExt = (int)SendMessageW(GetDlgItem(hwnd, IDC_CBO_EXPLORER_EXT), CB_GETCURSEL, 0, 0);
-        config.explorerHideOS = (int)SendMessageW(GetDlgItem(hwnd, IDC_CBO_EXPLORER_OS), CB_GETCURSEL, 0, 0);
+        // CB_GETCURSEL 失败返回 CB_ERR(-1)，必须收敛到 0~2，避免把非法值写入配置
+        auto combo = [&](int id) -> int {
+            int sel = (int)SendMessageW(GetDlgItem(hwnd, id), CB_GETCURSEL, 0, 0);
+            if (sel < 0) sel = 0;
+            if (sel > 2) sel = 2;
+            return sel;
+        };
+        config.explorerHideHidden = combo(IDC_CBO_EXPLORER_HIDDEN);
+        config.explorerHideExt = combo(IDC_CBO_EXPLORER_EXT);
+        config.explorerHideOS = combo(IDC_CBO_EXPLORER_OS);
         break;
+    }
     case 1: // 按键禁用页面
         config.disableSpecifiedKeysEnabled = chk(IDC_CHK_DISABLEKEYS);
         config.disableNumLock = chk(IDC_CHK_DISABLENUM);
@@ -1325,6 +1380,7 @@ bool SettingsDialog::ApplySettings(HWND hwnd, AppConfig& config) {
     // 将工作副本写入实际配置
     *data->config = data->workingCopy;
     data->originalConfig = data->workingCopy; // 更新原始配置快照
+    data->applied = true;                     // 标记本次会话已应用过设置
     if (s_applyCallback) s_applyCallback();   // 通知外部模块重新加载配置
     return true;
 }
@@ -1368,39 +1424,6 @@ void SettingsDialog::RefreshBossWindowList(HWND hwnd, AppConfig& config) {
         }
         ListView_SetItemText(lv, (int)i, 1, const_cast<LPWSTR>(display.c_str()));
     }
-}
-
-// 枚举回调上下文：异常置顶窗口收集
-struct TopmostEnumData {
-    std::vector<HWND>* windows;
-};
-
-// 枚举回调：收集异常置顶窗口（排除系统窗口），见 IDC_BTN_FIX_ZORDER
-static BOOL CALLBACK CollectTopmostWindowsProc(HWND hwnd, LPARAM lParam) {
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD) return TRUE;
-    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (!(exStyle & WS_EX_TOPMOST)) return TRUE;
-    if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) {
-        if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_POPUP) return TRUE;
-    }
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == 0) return TRUE;
-    wchar_t className[256] = {};
-    GetClassNameW(hwnd, className, 256);
-    // 排除系统窗口类（任务栏、桌面等）
-    static const wchar_t* sysClasses[] = {
-        L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
-        L"NotifyIconOverflowWindow", L"TaskListOverlayWnd",
-        L"Windows.UI.Core.CoreWindow", L"ApplicationFrameWindow",
-        L"Progman", L"WorkerW",
-    };
-    for (auto sc : sysClasses) {
-        if (_wcsicmp(className, sc) == 0) return TRUE;
-    }
-    reinterpret_cast<TopmostEnumData*>(lParam)->windows->push_back(hwnd);
-    return TRUE;
 }
 
 // ===== 刷新窗口置顶绑定列表视图 =====
@@ -1460,6 +1483,11 @@ struct CaptureKeyData {
 
 static HHOOK s_captureKeyHook = nullptr; // 全局键盘钩子句柄
 static HWND s_captureKeyDlg = nullptr;   // 捕获对话框窗口句柄
+
+// 是否存在"只持有 s_captureKeyHook"的独立捕获对话框（禁用键/按键映射的取值对话框）
+static bool IsCaptureKeyDialogActive() {
+    return s_captureKeyHook != nullptr || s_captureKeyDlg != nullptr;
+}
 
 // ===== 按键捕获低级键盘钩子过程 =====
 // 拦截键盘输入，将非注入的按键事件转发给捕获对话框
@@ -1540,7 +1568,9 @@ static int ShowCaptureKeyDialogEx(HWND parent, const wchar_t* title, const wchar
         wc.lpszClassName = CAPTURE_KEY_CLASS;
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
+        // 注册失败时不得标记成功：否则窗口类始终未注册，
+        // CreateWindowExW 会持续返回空且不再重试（ERROR_CLASS_ALREADY_EXISTS 视为成功）
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
         registered = true;
     }
 
@@ -1864,7 +1894,9 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
         wc.lpszClassName = className;
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
+        // 注册失败时不得标记成功：否则窗口类始终未注册，
+        // CreateWindowExW 会持续返回空且不再重试（ERROR_CLASS_ALREADY_EXISTS 视为成功）
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
         *pRegistered = true;
     }
 
@@ -1881,12 +1913,14 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, className,
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, className,
                                 L"添加绑定",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                 (screenW - winW) / 2, (screenH - winH) / 2,
                                 winW, winH,
                                 hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // 窗口创建失败时直接返回，避免以空句柄创建子控件产生孤儿窗口
+    if (!dlg) return;
     SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&abd));
 
     HFONT font = GetDlgFont();
@@ -1900,14 +1934,14 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
     SetControlFont(lblAll, font);
 
     HWND btnRefresh = CreateWindowExW(0, L"BUTTON", L"刷新",
-                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                        cx + cw - 70, y - 2, 70, 26,
                                        dlg, (HMENU)IDC_BTN_REFRESH_WINS, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(btnRefresh, font);
     y += 28;
 
     HWND lstAll = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
                                    cx, y, cw, 220,
                                    dlg, (HMENU)IDC_LST_ALL_WINDOWS, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(lstAll, font);
@@ -1920,13 +1954,13 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
     y += 28;
 
     HWND btnProc = CreateWindowExW(0, L"BUTTON", L"按进程名绑定",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                     cx, y, 160, 30,
                                     dlg, (HMENU)IDC_BTN_ADD_PROC_BINDING, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(btnProc, font);
 
     HWND btnWin = CreateWindowExW(0, L"BUTTON", L"按窗口名绑定",
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                    cx + 168, y, 160, 30,
                                    dlg, (HMENU)IDC_BTN_ADD_WIN_BINDING, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(btnWin, font);
@@ -1944,27 +1978,27 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
     SetControlFont(lblHint2, font);
     y += 30;
 
-    HWND lblManual = CreateWindowExW(0, L"STATIC", L"手动添加窗口标题 (支持部分匹配):",
+    HWND lblManual = CreateWindowExW(0, L"STATIC", L"手动添加窗口标题 (标题包含该文字的所有窗口都会匹配):",
                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
                                       cx, y, cw, 24, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(lblManual, font);
     y += 28;
 
     HWND edtManual = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                      WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
                                       cx, y, cw - 90, 28,
                                       dlg, (HMENU)IDC_EDT_BOSSWIN, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(edtManual, font);
 
     HWND btnAddManual = CreateWindowExW(0, L"BUTTON", L"添加",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                          cx + cw - 80, y, 80, 28,
                                          dlg, (HMENU)IDC_BTN_ADDBOSS, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(btnAddManual, font);
     y += 38;
 
     HWND btnCancel = CreateWindowExW(0, L"BUTTON", L"关闭",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                       cx + cw - 80, y, 80, 30,
                                       dlg, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
     SetControlFont(btnCancel, font);
@@ -1987,6 +2021,8 @@ void SettingsDialog::ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector
                     SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
                 continue;
             }
+            // 交给对话框管理器：Tab 切换焦点、Esc 自动转成 IDCANCEL，便于纯键盘操作
+            if (IsDialogMessageW(dlg, &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -2077,6 +2113,17 @@ static void UpdateAddHotkeyMode(HWND hwnd, bool simMode) {
     }
 }
 
+// ===== 结束自定义热键对话框的捕获态 =====
+// 捕获期间打开"浏览程序/浏览目录/选择按键"等模态界面时必须先调用：
+// 吞键钩子会吞掉全部物理按键，这些模态窗口将完全无法接收键盘输入，
+// 且其模态循环不会处理 WM_INLINE_CAPTURE_KEY，捕获也无法自行结束
+static void StopAddHotkeyCapture(HWND hwnd, AddHotkeyData* ahd) {
+    if (!ahd->capturing) return;
+    ahd->capturing = false;
+    EndInlineCapture(hwnd);
+    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HK_CAPTURE), L"捕获快捷键");
+}
+
 // ===== 自定义热键对话框窗口过程 =====
 static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* ahd = reinterpret_cast<AddHotkeyData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -2086,6 +2133,8 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDOK: {
+            // 捕获态下确定：先卸载吞键钩子，避免后续提示框无法用键盘关闭
+            StopAddHotkeyCapture(hwnd, ahd);
             // 确定按钮：验证输入并保存自定义热键
             HWND edtKey = GetDlgItem(hwnd, IDC_EDT_HK_KEY);
             wchar_t keyText[64] = {};
@@ -2095,13 +2144,17 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 return 0;
             }
 
-            // 主键取值：优先采用文本框当前内容（支持手动修改），
-            // 无法解析时回退到捕获值；两者均无效则拒绝保存，防止 vk=0 的无效热键
+            // 主键取值：优先采用文本框当前内容（支持手动修改）。
+            // 仅当文本框内容与"捕获到的键名"完全一致时，才允许回退到捕获值——
+            // VKToName 借助 GetKeyNameTextW 能产出 "Numpad 0"、"Divide" 这类
+            // NameToVK 无法反解的本地化名称，若此时静默回退，会注册出与界面显示不符的键。
+            // 因此解析失败且文本框已被改动时直接拒绝，而不是猜一个值
             UINT parsedVK = (UINT)AppConfig::NameToVK(keyText);
             if (parsedVK != 0) {
                 ahd->captureVK = parsedVK;
-            } else if (ahd->captureVK == 0) {
-                MessageBoxW(hwnd, L"主键无效，请点击\"捕获快捷键\"按钮设置主键",
+            } else if (ahd->captureVK == 0 ||
+                       keyText != AppConfig::VKToName((int)ahd->captureVK)) {
+                MessageBoxW(hwnd, L"无法识别该按键名称。\n请点击\"捕获快捷键\"或\"选择按键\"按钮重新设置主键。",
                              L"提示", MB_OK | MB_ICONWARNING);
                 return 0;
             }
@@ -2120,9 +2173,8 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             }
 
             HWND edtCmd = GetDlgItem(hwnd, IDC_EDT_HK_CMD);
-            wchar_t cmdText[MAX_PATH] = {};
-            GetWindowTextW(edtCmd, cmdText, MAX_PATH);
-            if (!ahd->simMode && wcslen(cmdText) == 0) {
+            std::wstring cmdText = ReadWindowText(edtCmd);
+            if (!ahd->simMode && cmdText.empty()) {
                 MessageBoxW(hwnd, L"请输入命令或程序路径", L"提示", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
@@ -2149,8 +2201,7 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             GetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_PARAMS), paramsText, 512);
             hk.parameters = ahd->simMode ? L"" : paramsText;
 
-            wchar_t workDirText[MAX_PATH] = {};
-            GetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_WORKDIR), workDirText, MAX_PATH);
+            std::wstring workDirText = ReadWindowText(GetDlgItem(hwnd, IDC_EDT_HK_WORKDIR));
             hk.workDir = ahd->simMode ? L"" : workDirText;
 
             wchar_t descText[256] = {};
@@ -2195,9 +2246,11 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             return 0;
         case IDC_BTN_HK_CAPTURE:
             // 开始捕获热键：安装吞键钩子，避免按键被全局钩子吞掉或触发系统快捷键
-            ahd->capturing = true;
-            BeginInlineCapture(hwnd);
-            SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HK_CAPTURE), L"请按下快捷键...");
+            // 钩子安装失败时不进入捕获态，否则界面提示"请按下快捷键"但永远收不到按键
+            if (BeginInlineCapture(hwnd)) {
+                ahd->capturing = true;
+                SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HK_CAPTURE), L"请按下快捷键...");
+            }
             SetFocus(hwnd);
             return 0;
         case IDC_RADIO_HK_CMD:
@@ -2207,6 +2260,8 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             UpdateAddHotkeyMode(hwnd, true);
             // 首次切入模拟模式且尚未选键时，直接弹出键盘选择界面
             if (ahd->simVK == 0) {
+                // 键盘选择界面需要接收键盘输入，先退出捕获态
+                StopAddHotkeyCapture(hwnd, ahd);
                 int picked = SettingsDialog::ShowKeyboardPicker(hwnd);
                 if (picked > 0) {
                     ahd->simVK = (UINT)picked;
@@ -2216,6 +2271,7 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             return 0;
         case IDC_BTN_HK_PICKKEY: {
             // 重新选择被模拟的按键（与按键映射一致的虚拟键盘界面）
+            StopAddHotkeyCapture(hwnd, ahd);
             int picked = SettingsDialog::ShowKeyboardPicker(hwnd);
             if (picked > 0) {
                 ahd->simVK = (UINT)picked;
@@ -2224,32 +2280,39 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             return 0;
         }
         case IDC_BTN_HK_BROWSE: {
-            // 浏览选择可执行文件
+            // 浏览选择可执行文件：文件对话框需要键盘输入，先退出捕获态
+            StopAddHotkeyCapture(hwnd, ahd);
             OPENFILENAMEW ofn = {};
-            wchar_t szFile[MAX_PATH] = {};
+            // 使用长路径上限缓冲（32768），避免路径超过 MAX_PATH 时被截断
+            std::wstring szFile(32768, L'\0');
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner = hwnd;
-            ofn.lpstrFile = szFile;
-            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrFile = &szFile[0];
+            ofn.nMaxFile = (DWORD)szFile.size();
             ofn.lpstrFilter = L"可执行文件\0*.exe;*.bat;*.cmd;*.ps1\0所有文件\0*.*\0";
             ofn.nFilterIndex = 1;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
             if (GetOpenFileNameW(&ofn)) {
-                SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_CMD), szFile);
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_CMD), szFile.c_str());
             }
             return 0;
         }
         case IDC_BTN_HK_WORKDIR_BROWSE: {
-            // 浏览选择工作目录
-            wchar_t dir[MAX_PATH] = {};
+            // 浏览选择工作目录：目录选择框需要键盘输入，先退出捕获态
+            StopAddHotkeyCapture(hwnd, ahd);
+            // 与上面的文件浏览一致使用长路径缓冲：MAX_PATH 下超过 260 字符的
+            // 目录会让 SHGetPathFromIDListW 失败，工作目录被静默丢弃
+            std::vector<wchar_t> dir(32768, L'\0');
             BROWSEINFOW bi = {};
             bi.hwndOwner = hwnd;
             bi.lpszTitle = L"选择工作目录";
             bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
             LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
             if (pidl) {
-                SHGetPathFromIDListW(pidl, dir);
-                SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_WORKDIR), dir);
+                // 转换失败时不能清空已有工作目录，仅在成功取得路径时写回
+                if (SHGetPathFromIDListW(pidl, dir.data())) {
+                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_WORKDIR), dir.data());
+                }
                 CoTaskMemFree(pidl);
             }
             return 0;
@@ -2287,7 +2350,9 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         wc.lpszClassName = ADD_HOTKEY_CLASS;
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
+        // 注册失败时不得标记成功：否则窗口类始终未注册，
+        // CreateWindowExW 会持续返回空且不再重试（ERROR_CLASS_ALREADY_EXISTS 视为成功）
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
         registered = true;
     }
 
@@ -2316,12 +2381,14 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, ADD_HOTKEY_CLASS,
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, ADD_HOTKEY_CLASS,
                                 isEdit ? L"编辑自定义热键" : L"新增自定义热键",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                 (screenW - winW) / 2, (screenH - winH) / 2,
                                 winW, winH,
                                 hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // 窗口创建失败时直接返回，避免以空句柄创建子控件产生孤儿窗口
+    if (!dlg) return;
     SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&ahd));
 
     HFONT font = GetDlgFont();
@@ -2342,7 +2409,7 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
 
     auto dlgEdit = [&](int id, int px, int py, int w) {
         HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                   WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
                                    px, py, w, lineH,
                                    dlg, (HMENU)(LONG_PTR)id, GetModuleHandleW(nullptr), nullptr);
         SetControlFont(h, font);
@@ -2350,7 +2417,7 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
 
     auto dlgChk = [&](int id, const wchar_t* text, int px, int py, int w) {
         HWND h = CreateWindowExW(0, L"BUTTON", text,
-                                   WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                    px, py, w, lineH,
                                    dlg, (HMENU)(LONG_PTR)id, GetModuleHandleW(nullptr), nullptr);
         SetControlFont(h, font);
@@ -2358,7 +2425,7 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
 
     auto dlgButton = [&](int id, const wchar_t* text, int px, int py, int w, int h2) {
         HWND h = CreateWindowExW(0, L"BUTTON", text,
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                    px, py, w, h2,
                                    dlg, (HMENU)(LONG_PTR)id, GetModuleHandleW(nullptr), nullptr);
         SetControlFont(h, font);
@@ -2556,6 +2623,8 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
                     SendMessageW(g_mainWnd, msg.message, msg.wParam, msg.lParam);
                 continue;
             }
+            // 交给对话框管理器：Tab 切换焦点、Esc 自动转成 IDCANCEL，便于纯键盘操作
+            if (IsDialogMessageW(dlg, &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -2631,7 +2700,10 @@ void SettingsDialog::RefreshCustomHotkeyList(HWND hwnd, AppConfig& config) {
     for (size_t i = 0; i < config.customHotkeys.size(); i++) {
         const auto& hk = config.customHotkeys[i];
         if (hk.mod == 0 && hk.vk == 0) continue;
-        std::wstring keyName = FormatHotKey(hk.mod, hk.vk);
+        // mod/vk 任一为 0 的条目不会被注册（ApplyConfig 按 || 跳过），
+        // 明确标注为无效，避免列表看起来正常却始终不生效；仍保留行以便选中删除
+        std::wstring keyName = (hk.mod == 0 || hk.vk == 0)
+            ? L"（无效）" : FormatHotKey(hk.mod, hk.vk);
         // 模拟按键模式显示被模拟的按键，命令模式显示命令路径
         std::wstring cmd = hk.simulateKey
             ? (L"模拟按键: " + AppConfig::VKToName(hk.targetVK))
@@ -2662,6 +2734,8 @@ void SettingsDialog::RefreshCustomHotkeyList(HWND hwnd, AppConfig& config) {
 // ===== 开始捕获窗口隐藏热键 =====
 void SettingsDialog::StartHotKeyCapture(HWND hwnd) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // 先安装吞键钩子：失败时不进入捕获态（失败提示已在内部弹出）
+    if (!BeginInlineCapture(hwnd)) return;
     // 两项内联捕获互斥：开始本项前先取消另一项，
     // 避免两个标志同时为真时退出其一就错误地提前结束捕获模式
     if (data->capturingCloseHotKey) {
@@ -2670,8 +2744,6 @@ void SettingsDialog::StartHotKeyCapture(HWND hwnd) {
                        FormatHotKey(data->workingCopy.bossKeyCloseMod, data->workingCopy.bossKeyCloseVK).c_str());
     }
     data->capturingHotKey = true;
-    // 安装吞键钩子：待捕获按键不会被全局钩子吞掉，也不会触发系统快捷键
-    BeginInlineCapture(hwnd);
     SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETHOTKEY), L"请按下快捷键...");
     SetFocus(hwnd);
 }
@@ -2679,6 +2751,8 @@ void SettingsDialog::StartHotKeyCapture(HWND hwnd) {
 // ===== 开始捕获一键关闭程序热键 =====
 void SettingsDialog::StartCloseHotKeyCapture(HWND hwnd) {
     auto* data = reinterpret_cast<DialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // 先安装吞键钩子：失败时不进入捕获态（失败提示已在内部弹出）
+    if (!BeginInlineCapture(hwnd)) return;
     // 两项内联捕获互斥：开始本项前先取消另一项（对称处理，见 StartHotKeyCapture）
     if (data->capturingHotKey) {
         data->capturingHotKey = false;
@@ -2686,8 +2760,6 @@ void SettingsDialog::StartCloseHotKeyCapture(HWND hwnd) {
                        FormatHotKey(data->workingCopy.bossKeyMod, data->workingCopy.bossKeyVK).c_str());
     }
     data->capturingCloseHotKey = true;
-    // 安装吞键钩子（对称处理，见 StartHotKeyCapture）
-    BeginInlineCapture(hwnd);
     SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_SETCLOSEHOTKEY), L"请按下快捷键...");
     SetFocus(hwnd);
 }
@@ -2726,6 +2798,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         switch (LOWORD(wp)) {
         case IDOK:
             // 确定：应用设置并关闭对话框（冲突被拒绝时不关闭，允许用户修改）
+            // 应用过程可能弹出热键冲突询问框，必须先取消内联捕获，否则提示框键盘失灵
+            CancelInlineCapture(data, hwnd);
             if (SettingsDialog::ApplySettings(hwnd, data->workingCopy))
                 DestroyWindow(hwnd);
             return 0;
@@ -2735,7 +2809,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             DestroyWindow(hwnd);
             return 0;
         case IDAPPLY:
-            // 应用：仅应用设置，不关闭对话框
+            // 应用：仅应用设置，不关闭对话框（同样可能弹出冲突提示框）
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::ApplySettings(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_ABOUT:
@@ -2868,37 +2943,35 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         }
 
         case IDC_BTN_FIX_ZORDER: {
-            // 修复窗口堆叠：取消所有异常置顶的窗口
+            // 修复窗口堆叠：只恢复键客自己记录过的窗口
+            // 确认框/结果框需要键盘操作，先取消内联捕获避免吞键钩子让弹窗键盘失灵
+            CancelInlineCapture(data, hwnd);
             int confirm = MessageBoxW(hwnd,
                 L"此功能用于修复 Win+D 桌面保护引发的窗口 Z 轴错乱及异常置顶问题。\n请确认是否运行修复？",
                 L"修复窗口堆叠",
                 MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
             if (confirm != IDYES) return 0;
 
-            // 枚举所有置顶窗口，排除系统窗口后取消其置顶状态
-            std::vector<HWND> topmostWindows;
-            TopmostEnumData ed{ &topmostWindows };
-            EnumWindows(CollectTopmostWindowsProc, reinterpret_cast<LPARAM>(&ed));
-
-            // 将所有异常置顶窗口设置为非置顶
-            for (HWND w : topmostWindows) {
-                SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
-
-            // 同时恢复上次异常退出残留的窗口样式（WS_MINIMIZEBOX）。
-            // 仅在窗口置顶守护当前未启用时才执行：启用状态下记录文件属于正在运行的
+            // 仅依据键客的窗口样式记录（KeySentry.wguard）恢复窗口，不再枚举
+            // 全系统置顶窗口统一取消置顶：否则会误伤其他程序主动置顶的窗口
+            //（如播放器小窗、聊天工具置顶），那些置顶并非键客造成
+            // 仅在窗口置顶守护当前未启用时执行：启用状态下记录文件属于正在运行的
             // 本实例，恢复会临时撤销正在生效的保护（置顶 / 禁止最小化）。
             // removeFile=false：保留记录文件，不影响运行中实例的崩溃恢复
             // 判断依据必须是"当前已生效的配置"（data->config）而非未保存的 workingCopy：
             // 若用户勾选了正在编辑但尚未应用的 winDGuardEnabled，此时守护尚未运行，
             // 却会因 workingCopy 为 true 而跳过恢复，导致残留样式无法修复
+            int repaired = 0;
             if (!data->config->winDGuardEnabled) {
-                WinDGuard::RecoverOrphanedStyles(false);
+                repaired = WinDGuard::RecoverOrphanedStyles(false);
             }
 
-            wchar_t buf[128] = {};
-            swprintf_s(buf, L"已修复 %zu 个异常置顶窗口", topmostWindows.size());
+            wchar_t buf[160] = {};
+            if (repaired > 0) {
+                swprintf_s(buf, L"已修复 %d 个窗口的置顶/最小化按钮状态", repaired);
+            } else {
+                swprintf_s(buf, L"未发现由键客造成异常的窗口");
+            }
             MessageBoxW(hwnd, buf, L"修复完成", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
@@ -3000,15 +3073,21 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         }
 
         case IDC_BTN_ADDKEY:
+            // 打开按键捕获框（自带吞键钩子 + 后续提示框）前先退出内联捕获
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::AddDisabledKey(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_DELKEY:
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::RemoveDisabledKey(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_ADDREMAP:
+            // 映射项对话框内含按键捕获与模态提示框，必须先取消内联捕获
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::AddRemapEntry(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_DELREMAP:
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::RemoveRemapEntry(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_DELBOSS:
@@ -3020,6 +3099,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             SettingsDialog::ShowBindingDialog(hwnd, data->workingCopy, data->workingCopy.bossKeyWindows, ADD_BINDING_CLASS);
             return 0;
         case IDC_BTN_ADD_WIND_BINDING:
+            // 与"添加绑定"保持一致：打开模态子对话框前取消内联捕获
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::AddWindWindow(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_DELWIND:
@@ -3051,12 +3132,16 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         }
 
         case IDC_BTN_ADD_CUSTOMHK:
+            // 子对话框自带捕获钩子：不先取消会让主窗口捕获标志与钩子归属不一致而卡死
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::AddCustomHotkey(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_EDIT_CUSTOMHK:
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::EditCustomHotkey(hwnd, data->workingCopy);
             return 0;
         case IDC_BTN_DEL_CUSTOMHK:
+            CancelInlineCapture(data, hwnd);
             SettingsDialog::DeleteCustomHotkey(hwnd, data->workingCopy);
             return 0;
         }
@@ -3082,9 +3167,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     }
 
     case WM_CLOSE:
-        // 关闭窗口时恢复原始配置
-        *data->config = data->originalConfig;
-        if (SettingsDialog::s_applyCallback) SettingsDialog::s_applyCallback();
+        // 关闭窗口时恢复原始配置；仅在本次确实应用过设置时才回滚并通知外部，
+        // 避免用户什么都没改也重写 INI 并重新广播资源管理器设置
+        if (data->applied) {
+            *data->config = data->originalConfig;
+            if (SettingsDialog::s_applyCallback) SettingsDialog::s_applyCallback();
+        }
         DestroyWindow(hwnd);
         return 0;
     }

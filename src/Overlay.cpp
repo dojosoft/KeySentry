@@ -3,6 +3,7 @@
 #include "Utils.h"
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+#include <algorithm>
 
 const wchar_t* OverlayWindow::CLASS_NAME = L"KeySentryOverlayWnd";
 
@@ -62,7 +63,9 @@ std::vector<HMONITOR> OverlayWindow::GetTargetMonitors() {
         POINT pt = { 0, 0 };
         HMONITOR hPrimary = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi = { sizeof(mi) };
-        GetMonitorInfoW(hPrimary, &mi);
+        // 取不到显示器信息时不返回该显示器：调用方会用 rcWork 计算浮层位置，
+        // 失败时 rcWork 全为 0，会把浮层画到 (0,0) 附近
+        if (!GetMonitorInfoW(hPrimary, &mi)) return monitors;
         if (mi.dwFlags & MONITORINFOF_PRIMARY) {
             monitors.push_back(hPrimary);
         } else {
@@ -77,6 +80,14 @@ std::vector<HMONITOR> OverlayWindow::GetTargetMonitors() {
         // 枚举所有显示器
         EnumDisplayMonitors(nullptr, nullptr, CollectAllMonitorsProc,
                             reinterpret_cast<LPARAM>(&monitors));
+        // 剔除信息不可用的显示器，避免浮层定位到 (0,0)
+        monitors.erase(
+            std::remove_if(monitors.begin(), monitors.end(), [](HMONITOR hMon) {
+                MONITORINFO mi = { sizeof(mi) };
+                return !GetMonitorInfoW(hMon, &mi) || mi.rcWork.right <= mi.rcWork.left ||
+                       mi.rcWork.bottom <= mi.rcWork.top;
+            }),
+            monitors.end());
     }
 
     return monitors;
@@ -139,6 +150,8 @@ void OverlayWindow::Destroy() {
         if (hwnd) DestroyWindow(hwnd);
     }
     m_hwnds.clear();
+    if (m_pVolume) { m_pVolume->Release(); m_pVolume = nullptr; }
+    m_volumeDeviceId.clear();
     if (m_pEnumerator) { m_pEnumerator->Release(); m_pEnumerator = nullptr; }
     if (m_fontLarge) { DeleteObject(m_fontLarge); m_fontLarge = nullptr; }
     if (m_fontMedium) { DeleteObject(m_fontMedium); m_fontMedium = nullptr; }
@@ -153,7 +166,7 @@ void OverlayWindow::Destroy() {
 // OverlayWindow::GetAudioState - 获取当前系统音频状态
 // 通过 Windows Core Audio API 查询默认音频输出设备
 // ============================================================
-void OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
+bool OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
     isMuted = false;
     volumeLevel = 0;
 
@@ -166,29 +179,57 @@ void OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
                                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&m_pEnumerator));
         if (FAILED(hr)) {
             m_pEnumerator = nullptr;
-            return;
+            return false;
         }
     }
 
     IMMDevice* pDevice = nullptr;
     HRESULT hr = m_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) return false;
 
-    IAudioEndpointVolume* pVolume = nullptr;
-    hr = pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-                            nullptr, reinterpret_cast<void**>(&pVolume));
+    // 读取默认设备 ID：设备切换（插拔耳机、切换输出）时需重建音量接口，
+    // 否则会一直查询旧设备的静音/音量状态
+    LPWSTR devId = nullptr;
+    std::wstring deviceId;
+    if (SUCCEEDED(pDevice->GetId(&devId)) && devId) {
+        deviceId = devId;
+        CoTaskMemFree(devId);
+    }
+    if (!m_pVolume || deviceId != m_volumeDeviceId) {
+        if (m_pVolume) { m_pVolume->Release(); m_pVolume = nullptr; }
+        if (SUCCEEDED(pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+                                        nullptr, reinterpret_cast<void**>(&m_pVolume)))) {
+            m_volumeDeviceId = deviceId;
+        } else {
+            m_pVolume = nullptr;
+            m_volumeDeviceId.clear();
+        }
+    }
     pDevice->Release();
-    if (FAILED(hr)) return;
+    if (!m_pVolume) return false;
 
     BOOL muted = FALSE;
-    float vol = 0.0f;
-    if (SUCCEEDED(pVolume->GetMute(&muted)))
-        isMuted = muted != FALSE;
-    if (SUCCEEDED(pVolume->GetMasterVolumeLevelScalar(&vol)))
-        volumeLevel = (int)(vol * 100.0f + 0.5f);
-    pVolume->Release();
+    if (FAILED(m_pVolume->GetMute(&muted))) {
+        // 端点已失效（设备被移除/切换等）：释放缓存，下次查询时重新创建
+        m_pVolume->Release();
+        m_pVolume = nullptr;
+        m_volumeDeviceId.clear();
+        return false;
+    }
+    isMuted = muted != FALSE;
 
-    if (volumeLevel > 100) volumeLevel = 100;
+    float vol = 0.0f;
+    if (SUCCEEDED(m_pVolume->GetMasterVolumeLevelScalar(&vol))) {
+        volumeLevel = (int)(vol * 100.0f + 0.5f);
+        if (volumeLevel > 100) volumeLevel = 100;
+    } else {
+        // 音量读取失败不算整体失败：部分虚拟声卡/独占模式不报告主音量，
+        // 若据此判定失败会让静音浮层在这类设备上完全不显示（muted 状态仍有效）。
+        // 但必须输出 -1 表示"音量未知"，否则绘制层会把调用方传入的 0 当成真实音量
+        // 显示成 "0%"，与实际不符
+        volumeLevel = -1;
+    }
+    return true;
 }
 
 // ============================================================
@@ -259,7 +300,8 @@ void OverlayWindow::ShowMute() {
     // 先查询当前音频状态，用于判断浮层内容是否真的变化
     bool isMuted = false;
     int volume = 0;
-    GetAudioState(isMuted, volume);
+    // 端点不可用时不显示浮层：否则会把默认值（未静音/0%）当作真实状态展示
+    if (!GetAudioState(isMuted, volume)) return;
 
     // 连发去抖：静音键被按住时系统会持续产生 keydown，仅在"内容一致且过密"时丢弃；
     // 静音状态确实切换时即使间隔很近也照常显示，避免真实状态变化被误丢
@@ -413,8 +455,8 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             DrawTextW(hdc, muteLabel, -1, &labelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(hdc, oldFontM);
 
-            // 非静音时显示音量百分比
-            if (!self->m_audioMuted) {
+            // 非静音时显示音量百分比（音量未知时 m_audioVolume 为 -1，跳过）
+            if (!self->m_audioMuted && self->m_audioVolume >= 0) {
                 wchar_t volText[16] = {};
                 swprintf_s(volText, L"%d%%", self->m_audioVolume);
                 RECT volRect = { 0, OVERLAY_VOL_LABEL_TOP, W, OVERLAY_VOL_LABEL_BOTTOM };

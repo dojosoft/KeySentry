@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 
+// 前向声明：仅作指针成员使用，避免头文件引入 endpointvolume.h
+struct IAudioEndpointVolume;
+
 // ============================================================
 // OverlayWindow: 锁键/静音状态浮层提示窗口
 // 在屏幕底部居中显示一个半透明浮层，提示当前锁键或静音状态
@@ -23,7 +26,9 @@ public:
     // 显示静音状态浮层（内部自行查询当前静音状态与音量）
     void ShowMute();
     // 获取当前系统音频状态（是否静音、音量百分比）
-    void GetAudioState(bool& isMuted, int& volumeLevel);
+    // 返回 false 表示音频端点不可用（此时输出参数无意义，调用方应跳过提示）
+    // volumeLevel 为 -1 表示音量读取失败（设备不报告主音量），调用方应隐藏百分比
+    bool GetAudioState(bool& isMuted, int& volumeLevel);
     // 设置是否仅在主显示器显示浮层
     void SetPrimaryOnly(bool primaryOnly);
 
@@ -58,6 +63,10 @@ private:
     ULONGLONG m_lastShowTick = 0;   // 上次真正显示浮层的时刻（用于连发去抖）
     // 缓存的音频设备枚举器：MMDeviceEnumerator 可复用，避免每次查询都 CoCreateInstance
     IMMDeviceEnumerator* m_pEnumerator = nullptr;
+    // 缓存的默认输出设备音量接口：静音键会触发最多 10 次轮询查询，
+    // 复用该接口可避免每次都 Activate 一次 COM 对象
+    IAudioEndpointVolume* m_pVolume = nullptr;
+    std::wstring m_volumeDeviceId;    // m_pVolume 对应的设备 ID，默认设备切换后据此重建
 
     static const wchar_t* CLASS_NAME; // 浮层窗口类名
 

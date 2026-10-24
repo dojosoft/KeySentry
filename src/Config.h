@@ -80,6 +80,16 @@ namespace ConfigUtils {
         return (MatchMode)v;
     }
 
+    // 只保留合法的热键修饰键位：手改 INI 写入非法位会让 RegisterHotKey 永远失败
+    static inline UINT SanitizeMods(int v) {
+        return (UINT)(v & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN));
+    }
+
+    // 虚拟键码合法范围：1~254（0 与更大的值无法被 RegisterHotKey/SendInput 识别）
+    static inline bool IsValidVK(int vk) {
+        return vk > 0 && vk < 255;
+    }
+
     // 安全地将宽字符串解析为整数，解析失败返回默认值
     static inline int SafeParseInt(const std::wstring& s, int defVal = 0) {
         if (s.empty()) return defVal;
@@ -251,30 +261,37 @@ namespace WindowEnum {
         std::vector<BoundWindowInfo>* cache;    // 缓存未绑定窗口信息
         const std::vector<BoundWindowInfo>* bound; // 已绑定窗口列表
         HWND lstAll;                            // 列表框控件句柄
+        // 单次枚举内复用进程路径，避免同一进程的多个窗口重复 OpenProcess
+        ProcessUtils::PathCache pathCache;
     };
 
     // 枚举回调：32 位下 GCC 的 lambda 无法隐式转换为 stdcall 的 WNDENUMPROC，
     // 故用显式 CALLBACK 约定的命名函数
     inline BOOL CALLBACK EnumUnboundProc(HWND hwnd, LPARAM lParam) {
             if (!IsWindowVisible(hwnd)) return TRUE;
-            wchar_t title[512] = {};
-            GetWindowTextW(hwnd, title, 512);
-            if (wcslen(title) == 0) return TRUE;
+            // 跳过桌面/任务栏等外壳窗口：这些窗口不允许被隐藏，绑定后也不会生效
+            if (WindowUtils::IsShellWindow(hwnd)) return TRUE;
+            // 安全读取标题：此枚举在设置窗口的 UI 线程上执行，
+            // 不能因某个无响应窗口的 WM_GETTEXT 把设置界面卡死
+            std::wstring title = WindowUtils::GetTextSafe(hwnd);
+            if (title.empty()) return TRUE;
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
             if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
 
-            // 一次 OpenProcess 取回完整路径，再从路径截取进程名，避免重复打开进程
-            std::wstring processPath = ProcessUtils::GetProcessPath(pid);
-            std::wstring processName = processPath;
-            size_t slash = processName.find_last_of(L"\\/");
-            if (slash != std::wstring::npos) processName = processName.substr(slash + 1);
-
             auto* ctx = reinterpret_cast<EnumWindowCtx*>(lParam);
-            // 跳过已绑定的窗口
+            // 复用缓存查询进程路径：同一进程的多个窗口只打开一次进程
+            const ProcessUtils::ProcPathInfo& proc = ctx->pathCache.Get(pid);
+            const std::wstring& processPath = proc.path;
+            const std::wstring& processName = proc.name;
+
+            // 跳过已绑定的窗口。
+            // 不能用 b.pid 判断：pid 是绑定当时的快照（已持久化），重启后会被系统复用，
+            // 会把无关进程的窗口误判为已绑定而从列表中消失
             bool alreadyBound = false;
             for (const auto& b : *ctx->bound) {
-                if (b.pid == pid || (!b.processName.empty() && _wcsicmp(b.processName.c_str(), processName.c_str()) == 0)) {
+                if ((!b.processName.empty() && _wcsicmp(b.processName.c_str(), processName.c_str()) == 0) ||
+                    (!b.title.empty() && b.title == title)) {
                     alreadyBound = true;
                     break;
                 }
@@ -362,8 +379,8 @@ struct AppConfig {
 
     // 从 INI 文件加载配置
     void Load(const std::wstring& iniPath);
-    // 保存配置到 INI 文件
-    void Save(const std::wstring& iniPath) const;
+    // 保存配置到 INI（原子写入）；返回 false 表示落盘失败（目录只读/磁盘满/权限不足）
+    bool Save(const std::wstring& iniPath) const;
 
     // 虚拟键码转可读名称
     static std::wstring VKToName(int vk);

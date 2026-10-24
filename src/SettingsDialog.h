@@ -103,6 +103,7 @@ public:
         bool capturingCloseHotKey;  // 是否正在捕获一键关闭程序热键
         UINT captureCloseMod;       // 捕获到的一键关闭热键修饰键
         UINT captureCloseVK;        // 捕获到的一键关闭热键虚拟键码
+        bool applied = false;       // 本次会话是否应用过设置（关闭时决定是否需要回滚）
         std::vector<BoundWindowInfo> allWindowsCache; // 所有可选窗口的缓存
     };
 };
