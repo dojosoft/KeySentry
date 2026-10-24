@@ -18,6 +18,10 @@ namespace WindowUtils {
     //       目标进程无响应时会阻塞调用线程。老板键运行在承载
     //       WH_MOUSE_LL 鼠标钩子的 UI 线程上，一旦阻塞会导致全系统
     //       鼠标输入停滞，故改用带超时的 SendMessageTimeoutW。
+    //   注意：这里不能加 SMTO_BLOCK —— 该标志要求"等待期间不处理任何其它
+    //       消息"，而低级鼠标钩子正是靠给本线程投递消息来派发的，加了它
+    //       反而会让鼠标在整个等待期间完全无响应。只用 SMTO_ABORTIFHUNG，
+    //       等待期间线程仍可继续派发钩子回调。
     inline std::wstring GetTextSafe(HWND hwnd, UINT timeoutMs = 50) {
         if (!IsWindow(hwnd)) return L"";
         // 先用栈缓冲尝试；返回值达到缓冲上限说明可能被截断，再按实际长度重读一次。
@@ -26,7 +30,7 @@ namespace WindowUtils {
         wchar_t buf[kInitialChars] = {};
         DWORD_PTR result = 0;
         LRESULT ok = SendMessageTimeoutW(hwnd, WM_GETTEXT, (WPARAM)kInitialChars, (LPARAM)buf,
-                                         SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &result);
+                                         SMTO_ABORTIFHUNG, timeoutMs, &result);
         if (ok == 0) {
             // 超时或失败：仅对同进程窗口回退到 GetWindowTextW（不会跨进程阻塞）
             DWORD pid = 0;
@@ -45,12 +49,12 @@ namespace WindowUtils {
         // 可能被截断：查询实际长度后重读（上限 32K，防止异常窗口返回极大值）
         DWORD_PTR len = 0;
         if (SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, 0, 0,
-                                SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &len) != 0 &&
+                                SMTO_ABORTIFHUNG, timeoutMs, &len) != 0 &&
             len > 0 && len + 1 <= 32768) {
             std::wstring text((size_t)len + 1, L'\0');
             DWORD_PTR copied = 0;
             if (SendMessageTimeoutW(hwnd, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)&text[0],
-                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &copied) != 0) {
+                                    SMTO_ABORTIFHUNG, timeoutMs, &copied) != 0) {
                 text.resize((size_t)copied);
                 return text;
             }

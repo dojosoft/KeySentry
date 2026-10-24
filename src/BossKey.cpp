@@ -23,12 +23,22 @@ static const UINT BOSSKEY_VERIFY_DELAY_MS = 800;
 // ============================================================
 namespace {
     // 通知窗口取消内部模式（鼠标捕获、菜单/拖拽循环等），
-    // 避免隐藏一个仍持有鼠标捕获的窗口后，鼠标输入被该窗口独占
-    void CancelWindowModes(HWND hwnd, UINT timeoutMs = 50) {
+    // 避免隐藏一个仍持有鼠标捕获的窗口后，鼠标输入被该窗口独占。
+    // 用 PostMessage 而不是 SendMessageTimeout：本函数运行在承载 WH_MOUSE_LL 的
+    // UI 线程上，任何同步等待（尤其是 SMTO_BLOCK）都会让该线程无法派发鼠标钩子，
+    // 表现为"全系统鼠标点击无响应、键盘正常"，而这里并不需要知道目标是否处理了消息
+    void CancelWindowModes(HWND hwnd) {
         if (!IsWindow(hwnd)) return;
+        PostMessageW(hwnd, WM_CANCELMODE, 0, 0);
+    }
+
+    // 有界探测窗口是否可响应：用于"抢焦点"这类会同步等待目标线程的操作之前，
+    // 目标繁忙时宁可跳过，也不要让承载鼠标钩子的 UI 线程一起被挂住
+    bool WindowResponds(HWND hwnd, UINT timeoutMs = 120) {
+        if (!IsWindow(hwnd) || IsHungAppWindow(hwnd)) return false;
         DWORD_PTR result = 0;
-        SendMessageTimeoutW(hwnd, WM_CANCELMODE, 0, 0,
-                            SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &result);
+        return SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
+                                   SMTO_ABORTIFHUNG, timeoutMs, &result) != 0;
     }
 
     // 安全地显示/隐藏窗口，返回 true 表示走了异步投递。
@@ -44,6 +54,17 @@ namespace {
         }
         ShowWindow(hwnd, showCmd);
         return false;
+    }
+
+    // 安全获取"恢复时要用哪个显示状态"：不调用 GetWindowPlacement，
+    // 它是跨进程查询、目标繁忙时会阻塞承载鼠标钩子的 UI 线程；
+    // IsIconic/IsZoomed 由内核按窗口样式位直接回答，不跨线程、不会阻塞。
+    // 附带好处：窗口自身处于隐藏状态时 WINDOWPLACEMENT.showCmd 可能返回 SW_HIDE，
+    // 一旦按它恢复就会"越恢复越隐藏"，改用样式位可避免这种记录
+    int GetShowCmdSafe(HWND hwnd) {
+        if (IsIconic(hwnd)) return SW_SHOWMINIMIZED;
+        if (IsZoomed(hwnd)) return SW_SHOWMAXIMIZED;
+        return SW_SHOWNORMAL;
     }
 
     // 有界等待异步窗口操作生效：最多 100ms 且与窗口数量无关，
@@ -175,11 +196,9 @@ void BossKey::HideWindows() {
 
     // 保存窗口信息（显示状态、进程ID），用于恢复
     for (HWND hwnd : matching) {
-        WINDOWPLACEMENT wp = { sizeof(wp) };
-        GetWindowPlacement(hwnd, &wp);
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
-        m_hiddenWindows.push_back({ hwnd, (int)wp.showCmd, pid });
+        m_hiddenWindows.push_back({ hwnd, GetShowCmdSafe(hwnd), pid });
     }
 
     // 可选：隐藏当前前台窗口（排除自身进程与桌面/任务栏等外壳窗口）
@@ -199,9 +218,7 @@ void BossKey::HideWindows() {
                     if (hw.hwnd == fg) { alreadyInList = true; break; }
                 }
                 if (!alreadyInList) {
-                    WINDOWPLACEMENT wp = { sizeof(wp) };
-                    GetWindowPlacement(fg, &wp);
-                    m_hiddenWindows.push_back({ fg, (int)wp.showCmd, fgPid });
+                    m_hiddenWindows.push_back({ fg, GetShowCmdSafe(fg), fgPid });
                 }
             }
         }
@@ -307,8 +324,11 @@ void BossKey::ShowWindows() {
     }
     // 异步恢复时先有界等待窗口显现，否则 SetForegroundWindow 对隐藏窗口无效
     if (anyAsync) WaitForVisibility(targets, true);
-    if (lastForeground && !IsHungAppWindow(lastForeground) &&
-        IsWindowVisible(lastForeground)) {
+    // 抢焦点前先做有界探测：SetForegroundWindow 会同步等待目标线程处理激活消息，
+    // 目标正忙（如浏览器加载页面）时会连带阻塞承载鼠标钩子的 UI 线程。
+    // 窗口此时已经恢复，抢焦点只是附属效果，目标忙时跳过比卡住系统输入更划算
+    if (lastForeground && IsWindowVisible(lastForeground) &&
+        WindowResponds(lastForeground)) {
         SetForegroundWindow(lastForeground);
     }
 
