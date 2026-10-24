@@ -336,13 +336,15 @@ void WinDGuard::ReLockWindow(LockedWindow& lw) {
     bool minimizeBoxRestored = (currentStyle & WS_MINIMIZEBOX) != 0;
 
     if (minimizeBoxRestored) {
-        // 同一窗口在该间隔内只重建一次框架：浏览器导航、Electron/游戏窗口会
-        // 周期性重建窗口样式，每 3 秒 SWP_FRAMECHANGED 会把标题栏闪一下
+        // 重新移除最小化按钮：SetWindowLongPtrW 不发送窗口消息、不会引起闪烁，
+        // 必须每次都执行；否则退避期间保护会失效，最小化按钮重新出现
+        SetWindowLongPtrW(lw.hwnd, GWL_STYLE, currentStyle & ~WS_MINIMIZEBOX);
+
+        // 只有重绘框架（SWP_FRAMECHANGED）才会让标题栏闪烁，因此仅对它做退避：
+        // 浏览器导航、Electron/游戏窗口会周期性重建样式，每 3 秒刷一次会持续闪烁
         ULONGLONG now = GetTickCount64();
         if (now - lw.lastFrameFixTick >= STYLE_FIX_INTERVAL_MS) {
             lw.lastFrameFixTick = now;
-            // 需要重新移除最小化按钮并刷新框架
-            SetWindowLongPtrW(lw.hwnd, GWL_STYLE, currentStyle & ~WS_MINIMIZEBOX);
             SetWindowPosSafe(lw.hwnd, HWND_TOPMOST,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         } else if (lostTopmost || wasMinimized) {

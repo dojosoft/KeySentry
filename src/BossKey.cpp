@@ -350,6 +350,9 @@ void BossKey::ShowWindows() {
 void BossKey::VerifyPendingHide() {
     if (!m_pendingVerify) return;
     m_pendingVerify = false;
+    // 延迟确认可能来自两条路径：异步隐藏迟到生效，或恢复未能立即完成。
+    // 前者 m_active 已为 false，后者仍为 true —— 收尾时据此决定是否补做解除静音
+    const bool wasActive = m_active;
 
     // 保留仍然隐藏的窗口记录：它们既可能来自"迟到的隐藏已生效"，
     // 也可能来自上一轮恢复失败。失效句柄与已恢复的窗口一并剔除
@@ -369,14 +372,27 @@ void BossKey::VerifyPendingHide() {
         // 保证这些窗口仍能用老板键恢复
         m_hiddenWindows.swap(remaining);
         m_active = true;
+        // 迟到生效的隐藏：HideWindows 当时因"尚未确认隐藏成功"跳过了静音与媒体暂停，
+        // 此刻窗口确认已不可见，必须补齐，否则该路径下"隐藏时静音/暂停媒体"会静默失效。
+        // wasActive 为 true 表示本次是"恢复未完成"，静音早已生效，不能重复执行
+        if (!wasActive) {
+            if (m_sendPauseBeforeHide) SendMediaPause();
+            if (m_muteEnabled) SetMute(true);
+        }
         SaveRecoverFile();
         return;
     }
 
     // 没有任何窗口处于隐藏状态：清理残留记录与恢复文件，并退出激活态
     m_hiddenWindows.clear();
-    m_active = false;
     ClearRecoverFile();
+    m_active = false;
+    // 恢复路径的收尾：Deactivate 当时因"仍有窗口未恢复"跳过了取消静音与冷却记录，
+    // 此刻窗口已全部回来，必须补做，否则系统会一直停留在静音状态
+    if (wasActive) {
+        if (m_mutedByUs) SetMute(false);
+        m_lastDeactivateTick = GetTickCount64();
+    }
 }
 
 // ============================================================
