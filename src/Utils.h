@@ -216,9 +216,21 @@ public:
 // ============================================================
 class ModalGuard {
     HWND m_parent;
+    bool m_wasEnabled;   // 进入前的启用状态，析构时按原样还原
 public:
-    explicit ModalGuard(HWND parent) : m_parent(parent) { if (IsWindow(parent)) EnableWindow(parent, FALSE); }
-    ~ModalGuard() { if (IsWindow(m_parent)) { EnableWindow(m_parent, TRUE); SetForegroundWindow(m_parent); } }
+    explicit ModalGuard(HWND parent)
+        : m_parent(parent),
+          m_wasEnabled(IsWindow(parent) != FALSE && IsWindowEnabled(parent) != FALSE) {
+        if (IsWindow(m_parent)) EnableWindow(m_parent, FALSE);
+    }
+    ~ModalGuard() {
+        // 只还原"进入前本就处于启用状态"的窗口：若父窗口事先已被禁用（嵌套模态），
+        // 无条件 EnableWindow 会误启用外层正需要保持禁用的窗口
+        if (IsWindow(m_parent) && m_wasEnabled) {
+            EnableWindow(m_parent, TRUE);
+            SetForegroundWindow(m_parent);
+        }
+    }
     ModalGuard(const ModalGuard&) = delete;
     ModalGuard& operator=(const ModalGuard&) = delete;
 };

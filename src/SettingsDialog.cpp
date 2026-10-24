@@ -2144,13 +2144,17 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 return 0;
             }
 
-            // 主键取值：优先采用文本框当前内容（支持手动修改），
-            // 无法解析时回退到捕获值；两者均无效则拒绝保存，防止 vk=0 的无效热键
+            // 主键取值：优先采用文本框当前内容（支持手动修改）。
+            // 仅当文本框内容与"捕获到的键名"完全一致时，才允许回退到捕获值——
+            // VKToName 借助 GetKeyNameTextW 能产出 "Numpad 0"、"Divide" 这类
+            // NameToVK 无法反解的本地化名称，若此时静默回退，会注册出与界面显示不符的键。
+            // 因此解析失败且文本框已被改动时直接拒绝，而不是猜一个值
             UINT parsedVK = (UINT)AppConfig::NameToVK(keyText);
             if (parsedVK != 0) {
                 ahd->captureVK = parsedVK;
-            } else if (ahd->captureVK == 0) {
-                MessageBoxW(hwnd, L"主键无效，请点击\"捕获快捷键\"按钮设置主键",
+            } else if (ahd->captureVK == 0 ||
+                       keyText != AppConfig::VKToName((int)ahd->captureVK)) {
+                MessageBoxW(hwnd, L"无法识别该按键名称。\n请点击\"捕获快捷键\"或\"选择按键\"按钮重新设置主键。",
                              L"提示", MB_OK | MB_ICONWARNING);
                 return 0;
             }
