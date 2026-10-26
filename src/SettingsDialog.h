@@ -75,7 +75,8 @@ public:
     static void UpdateRemapState(HWND hwnd, bool enabled);
 
     // 显示虚拟键盘选择器对话框，返回选中的虚拟键码，0 表示取消
-    static int ShowKeyboardPicker(HWND parent);
+    // outMods/allowMods：allowMods=true 时显示修饰键勾选，outMods 返回勾选的修饰键组合
+    static int ShowKeyboardPicker(HWND parent, UINT* outMods = nullptr, bool allowMods = false);
 
     // 显示添加绑定的模态对话框，支持按进程名/窗口名/手动输入三种方式
     static void ShowBindingDialog(HWND hwnd, AppConfig& config, std::vector<BoundWindowInfo>& boundWindows, const wchar_t* className);

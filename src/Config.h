@@ -90,6 +90,15 @@ namespace ConfigUtils {
         return vk > 0 && vk < 255;
     }
 
+    // 是否为修饰键（Shift/Ctrl/Alt/Win 及其左右版本）。
+    // 修饰键不能作为按键映射的源键：拦截后会导致整个修饰键失效。
+    static inline bool IsModifierKey(int vk) {
+        return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+               vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+               vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+               vk == VK_LWIN || vk == VK_RWIN;
+    }
+
     // 安全地将宽字符串解析为整数，解析失败返回默认值
     static inline int SafeParseInt(const std::wstring& s, int defVal = 0) {
         if (s.empty()) return defVal;
@@ -119,11 +128,14 @@ struct CustomHotkey {
     bool runAsAdmin = false;             // 是否以管理员权限运行
     bool simulateKey = false;            // 触发动作类型：true=模拟按键（targetVK 为被模拟键），false=运行命令
     UINT targetVK = 0;                   // 模拟按键模式下被模拟的按键虚拟键码
+    UINT targetMod = 0;                  // 模拟按键模式下目标组合的修饰键（0 表示单键）
 
     // 将自定义热键序列化为管道分隔的字符串（当前规范共 11 个字段）
     // 说明：早期版本中的 sound/opacity/autoStart 字段已废弃，不再写入
+    // 模拟组合键（targetMod 非 0）时追加第 12 个字段，保持旧配置格式不变
     std::wstring Serialize() const {
-        return std::to_wstring(mod) + L"|" + std::to_wstring(vk) + L"|" +
+        std::wstring result =
+               std::to_wstring(mod) + L"|" + std::to_wstring(vk) + L"|" +
                ConfigUtils::EscapeField(command) + L"|" + ConfigUtils::EscapeField(parameters) + L"|" +
                ConfigUtils::EscapeField(workDir) + L"|" +
                ConfigUtils::EscapeField(description) + L"|" +
@@ -132,11 +144,14 @@ struct CustomHotkey {
                IniUtils::BoolToStr(runAsAdmin) + L"|" +
                IniUtils::BoolToStr(simulateKey) + L"|" +
                std::to_wstring(targetVK);
+        if (targetMod != 0) result += L"|" + std::to_wstring(targetMod);
+        return result;
     }
 
     // 从管道分隔的字符串反序列化自定义热键
     // 兼容三种历史格式（按管道 | 的数量区分）：
     //   新格式  11 字段(10 个 |)：已移除废弃字段 sound/opacity/autoStart
+    //   新格式  12 字段(11 个 |)：在第 11 字段后追加模拟组合键修饰键 targetMod
     //   旧格式  12/13 字段(11/12 个 |)：含 sound/opacity/autoStart
     //   更旧    14 字段(13 个 |)：额外含 simulateKey/targetVK
     static CustomHotkey Deserialize(const std::wstring& str) {
@@ -144,6 +159,29 @@ struct CustomHotkey {
         std::vector<size_t> pipes;
         for (size_t i = 0; i < str.size(); i++) {
             if (str[i] == L'|') pipes.push_back(i);
+        }
+
+        // --- 新格式：12 字段，末尾追加了 targetMod ---
+        // 与旧 12 字段格式区分：新格式第 11 字段为目标键码（>=2），
+        // 第 12 字段为修饰键位（1..15）；旧格式这两个位置是布尔值 confirm/runAsAdmin
+        if (pipes.size() == 11) {
+            int vkVal = ConfigUtils::SafeParseInt(str.substr(pipes[9] + 1, pipes[10] - pipes[9] - 1));
+            int modVal = ConfigUtils::SafeParseInt(str.substr(pipes[10] + 1));
+            if (vkVal >= 2 && modVal >= 1 && modVal <= 15) {
+                hk.mod = (UINT)ConfigUtils::SafeParseInt(str.substr(0, pipes[0]));
+                hk.vk = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[0] + 1, pipes[1] - pipes[0] - 1));
+                hk.command = ConfigUtils::UnescapeField(str.substr(pipes[1] + 1, pipes[2] - pipes[1] - 1));
+                hk.parameters = ConfigUtils::UnescapeField(str.substr(pipes[2] + 1, pipes[3] - pipes[2] - 1));
+                hk.workDir = ConfigUtils::UnescapeField(str.substr(pipes[3] + 1, pipes[4] - pipes[3] - 1));
+                hk.description = ConfigUtils::UnescapeField(str.substr(pipes[4] + 1, pipes[5] - pipes[4] - 1));
+                hk.windowState = ConfigUtils::ClampWindowState(ConfigUtils::SafeParseInt(str.substr(pipes[5] + 1, pipes[6] - pipes[5] - 1)));
+                hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[6] + 1, pipes[7] - pipes[6] - 1)) != 0;
+                hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[7] + 1, pipes[8] - pipes[7] - 1)) != 0;
+                hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1)) != 0;
+                hk.targetVK = (UINT)vkVal;
+                hk.targetMod = (UINT)modVal;
+                return hk;
+            }
         }
 
         // --- 旧格式：含已废弃的 sound / opacity / autoStart 字段 ---
@@ -320,6 +358,16 @@ namespace WindowEnum {
 }
 
 // ============================================================
+// KeyRemapEntry: 按键映射项
+// 源键 -> 目标单键或组合键；mods 为 0 表示映射为单键。
+// ============================================================
+struct KeyRemapEntry {
+    int sourceVK = 0;   // 源键虚拟键码
+    UINT mods = 0;      // 目标组合修饰键（MOD_CONTROL/MOD_SHIFT/MOD_ALT/MOD_WIN）
+    int targetVK = 0;   // 目标主键虚拟键码
+};
+
+// ============================================================
 // AppConfig: 应用全局配置
 // 包含所有功能模块的配置项，支持 INI 文件读写
 // ============================================================
@@ -342,7 +390,7 @@ struct AppConfig {
 
     // --- 按键重映射 ---
     bool keyRemapEnabled = false;         // 启用按键重映射
-    std::vector<std::pair<int, int>> keyRemappings; // 重映射对：{源键, 目标键}
+    std::vector<KeyRemapEntry> keyRemappings; // 重映射项：源键 -> 单键或组合键
 
     // --- 自定义热键 ---
     bool customHotkeysEnabled = false;    // 启用自定义热键

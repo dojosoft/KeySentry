@@ -74,6 +74,10 @@ private:
     void HideWindows();
     // 恢复所有隐藏窗口
     void ShowWindows();
+    // 修复隐藏/恢复后残留的输入模式（鼠标捕获/菜单/移动缩放循环）：
+    // 已隐藏的窗口若仍独占鼠标捕获，会让全系统鼠标点击都送给它，
+    // 表现为目标窗口按钮与任务栏点击无响应（键盘不受影响）
+    void HealStuckInputMode();
     // 设置系统静音/取消静音（通过 Windows Core Audio API）
     void SetMute(bool mute, bool forceUnmute = false);
     // 发送媒体暂停/播放按键

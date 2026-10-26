@@ -22,14 +22,81 @@ static const UINT BOSSKEY_VERIFY_DELAY_MS = 800;
 //       鼠标钩子无法派发，表现为"全系统鼠标点击无响应、键盘正常"。
 // ============================================================
 namespace {
-    // 通知窗口取消内部模式（鼠标捕获、菜单/拖拽循环等），
-    // 避免隐藏一个仍持有鼠标捕获的窗口后，鼠标输入被该窗口独占。
-    // 用 PostMessage 而不是 SendMessageTimeout：本函数运行在承载 WH_MOUSE_LL 的
-    // UI 线程上，任何同步等待（尤其是 SMTO_BLOCK）都会让该线程无法派发鼠标钩子，
-    // 表现为"全系统鼠标点击无响应、键盘正常"，而这里并不需要知道目标是否处理了消息
-    void CancelWindowModes(HWND hwnd) {
-        if (!IsWindow(hwnd)) return;
-        PostMessageW(hwnd, WM_CANCELMODE, 0, 0);
+    // 系统当前的输入模式：鼠标捕获窗口、菜单循环宿主、移动/缩放循环宿主。
+    // 这三者任意一个残留在"已隐藏的窗口"上，都会让全系统鼠标点击只送给
+    // 该窗口：目标窗口的最小化/最大化/关闭按钮、任务栏点击全部无响应，
+    // 而键盘输入正常；只有切到 Ctrl+Alt+Del 安全桌面再返回才会被动解除
+    struct InputModeState {
+        HWND capture = nullptr;
+        HWND menuOwner = nullptr;
+        HWND moveSize = nullptr;
+    };
+
+    // 查询某个输入队列上的残留输入模式；threadId 为 0 表示前台输入队列。
+    // 鼠标捕获只在按键按下期间对后台线程生效，隐藏后前台往往已切到别的
+    // 线程，因此只查前台队列会漏掉仍滞留在原线程上的捕获
+    InputModeState QueryInputModeState(DWORD threadId = 0) {
+        InputModeState st;
+        GUITHREADINFO gti = { sizeof(gti) };
+        if (GetGUIThreadInfo(threadId, &gti)) {
+            st.capture = gti.hwndCapture;
+            st.menuOwner = gti.hwndMenuOwner;
+            st.moveSize = gti.hwndMoveSize;
+        }
+        return st;
+    }
+
+    // 两个窗口是否属于同一棵窗口树（同一顶层窗口）
+    bool IsSameWindowTree(HWND a, HWND b) {
+        if (!a || !b) return false;
+        HWND ra = GetAncestor(a, GA_ROOT);
+        HWND rb = GetAncestor(b, GA_ROOT);
+        return ra != nullptr && ra == rb;
+    }
+
+    // 有界同步发送 WM_CANCELMODE：不使用 SMTO_BLOCK（它要求等待期间不处理
+    // 任何其它消息，会让承载鼠标钩子的线程停止派发），目标无响应时 50ms 放弃
+    void SendCancelModeBounded(HWND hwnd) {
+        if (!hwnd || !IsWindow(hwnd)) return;
+        DWORD_PTR result = 0;
+        SendMessageTimeoutW(hwnd, WM_CANCELMODE, 0, 0, SMTO_ABORTIFHUNG, 50, &result);
+    }
+
+    // 强制解除系统鼠标捕获：捕获是系统级独占，本线程临时抢占再释放，
+    // 原持有窗口会收到 WM_CAPTURECHANGED 并失去捕获（跨进程同样有效）。
+    // 仅在目标不处理 WM_CANCELMODE 时使用（Chromium 等自绘窗口常见）
+    void ForceReleaseMouseCapture(HWND hostWnd) {
+        if (!hostWnd || !IsWindow(hostWnd)) return;
+        SetCapture(hostWnd);
+        ReleaseCapture();
+    }
+
+    // 取消目标窗口的内部模式（鼠标捕获/菜单/移动缩放循环）。
+    // 必须针对"真正持有捕获的那个窗口"发送：Chromium 等程序捕获的是子窗口，
+    // 只给顶层窗口发 WM_CANCELMODE 解除不了，隐藏后该窗口仍独占鼠标输入
+    void CancelWindowModes(HWND target, HWND captureHost) {
+        if (!IsWindow(target)) return;
+
+        // 目标线程与前台线程可能不同：两个队列上的残留模式都要处理
+        DWORD tid = GetWindowThreadProcessId(target, nullptr);
+        InputModeState states[2] = {
+            QueryInputModeState(0),
+            (tid && tid != GetCurrentThreadId()) ? QueryInputModeState(tid) : InputModeState()
+        };
+        for (const InputModeState& st : states) {
+            if (st.capture && IsSameWindowTree(st.capture, target)) {
+                SendCancelModeBounded(st.capture);
+                // 自定义 WndProc 可能不把 WM_CANCELMODE 交给 DefWindowProc，
+                // 此时只能由本线程强行夺取捕获再释放（重复夺取无害）
+                ForceReleaseMouseCapture(captureHost);
+            }
+            if (st.moveSize && IsSameWindowTree(st.moveSize, target)) {
+                SendCancelModeBounded(st.moveSize);
+            }
+            if (st.menuOwner && IsSameWindowTree(st.menuOwner, target)) {
+                SendCancelModeBounded(st.menuOwner);
+            }
+        }
     }
 
     // 有界探测窗口是否可响应：用于"抢焦点"这类会同步等待目标线程的操作之前，
@@ -227,12 +294,15 @@ void BossKey::HideWindows() {
     // 隐藏所有窗口；跨进程窗口改用异步投递，避免目标短暂繁忙时拖住钩子线程
     std::vector<HWND> targets;
     targets.reserve(m_hiddenWindows.size());
+    // 强制解除捕获需要一个属于本线程的窗口：优先用鼠标钩子的通知窗口，
+    // 未安装鼠标钩子（仅用键盘热键触发）时退回主窗口
+    HWND captureHost = m_mouseNotifyWnd ? m_mouseNotifyWnd : m_hwnd;
     bool anyAsync = false;
     for (auto& hw : m_hiddenWindows) {
         if (!IsWindow(hw.hwnd)) continue;
         // 先释放目标窗口可能持有的鼠标捕获，避免隐藏后鼠标输入仍被
         // 无响应窗口独占
-        CancelWindowModes(hw.hwnd);
+        CancelWindowModes(hw.hwnd, captureHost);
         if (SetWindowShowState(hw.hwnd, SW_HIDE)) anyAsync = true;
         targets.push_back(hw.hwnd);
     }
@@ -254,6 +324,7 @@ void BossKey::HideWindows() {
 
     // 没有任何窗口可隐藏（如绑定程序未运行）：退出激活状态
     if (m_hiddenWindows.empty()) {
+        HealStuckInputMode();
         m_active = false;
         ClearRecoverFile();
         return;
@@ -277,6 +348,7 @@ void BossKey::HideWindows() {
             m_hiddenWindows.clear();
             ClearRecoverFile();
         }
+        HealStuckInputMode();
         return;
     }
 
@@ -288,6 +360,9 @@ void BossKey::HideWindows() {
 
     // 可选：静音系统音频（仅当确有窗口被隐藏时才静音，避免无恢复契机地静音全系统）
     if (m_muteEnabled) SetMute(true);
+
+    // 收尾自愈：异步隐藏生效后，被隐藏的窗口可能仍独占鼠标捕获
+    HealStuckInputMode();
 }
 
 // ============================================================
@@ -304,6 +379,9 @@ void BossKey::ShowWindows() {
     bool anyAsync = false;
     std::vector<HWND> targets;
     targets.reserve(m_hiddenWindows.size());
+    // 恢复前先自愈：上次隐藏时若把鼠标捕获留在了被隐藏的窗口上，
+    // 直接恢复会让这个仍独占输入的窗口重新可见，点击依旧全部送给它
+    HealStuckInputMode();
     for (auto& hw : m_hiddenWindows) {
         if (!IsWindow(hw.hwnd)) continue;
         // 校验进程 ID：句柄可能已被回收复用，避免恢复无关窗口
@@ -348,6 +426,7 @@ void BossKey::ShowWindows() {
 
     if (m_hiddenWindows.empty()) {
         // 全部恢复成功（或窗口已销毁）：退出激活状态并清除恢复文件
+        HealStuckInputMode();
         m_active = false;
         ClearRecoverFile();
         return;
@@ -359,6 +438,7 @@ void BossKey::ShowWindows() {
     SaveRecoverFile();
     m_pendingVerify = true;
     if (m_hwnd) SetTimer(m_hwnd, TIMER_BOSSKEY_VERIFY, BOSSKEY_VERIFY_DELAY_MS, nullptr);
+    HealStuckInputMode();
 }
 
 // ============================================================
@@ -400,6 +480,7 @@ void BossKey::VerifyPendingHide() {
             if (m_muteEnabled) SetMute(true);
         }
         SaveRecoverFile();
+        HealStuckInputMode();
         return;
     }
 
@@ -412,6 +493,59 @@ void BossKey::VerifyPendingHide() {
     if (wasActive) {
         if (m_mutedByUs) SetMute(false);
         m_lastDeactivateTick = GetTickCount64();
+    }
+    HealStuckInputMode();
+}
+
+// ============================================================
+// BossKey::HealStuckInputMode - 修复隐藏/恢复后残留的输入模式
+// 症状：目标窗口的最小化/最大化/关闭按钮与任务栏点击全部无响应，键盘正常，
+//       只有切到 Ctrl+Alt+Del 安全桌面再返回才恢复。
+// 原因：某个已不可见的窗口仍独占鼠标捕获（用鼠标侧键/中键触发时，按下
+//       那一刻的捕获会留在被隐藏的窗口上），捕获是全局独占的，所有点击
+//       都被送给这个看不见的窗口；菜单循环、移动/缩放循环残留同理。
+// 只在窗口"已不可见"或"属于本次隐藏清单"时处理：可见窗口持有捕获
+// 可能是用户正在拖拽/框选，不能打断。
+// ============================================================
+void BossKey::HealStuckInputMode() {
+    HWND captureHost = m_mouseNotifyWnd ? m_mouseNotifyWnd : m_hwnd;
+    if (!captureHost || !IsWindow(captureHost)) return;
+
+    auto isStuck = [this](HWND h) {
+        if (!h || !IsWindow(h)) return false;
+        if (!IsWindowVisible(h)) return true;
+        for (const auto& hw : m_hiddenWindows) {
+            if (hw.hwnd == h || IsSameWindowTree(hw.hwnd, h)) return true;
+        }
+        return false;
+    };
+
+    // 检查前台队列 + 每个隐藏窗口所属线程的队列（去重）：隐藏后前台常常
+    // 已切换到别的线程，只查前台队列会漏掉滞留在原线程上的残留捕获
+    std::vector<DWORD> queues;
+    queues.push_back(0);
+    for (const auto& hw : m_hiddenWindows) {
+        if (!hw.hwnd || !IsWindow(hw.hwnd)) continue;
+        DWORD tid = GetWindowThreadProcessId(hw.hwnd, nullptr);
+        if (tid && tid != GetCurrentThreadId() &&
+            std::find(queues.begin(), queues.end(), tid) == queues.end()) {
+            queues.push_back(tid);
+        }
+    }
+
+    for (DWORD tid : queues) {
+        InputModeState st = QueryInputModeState(tid);
+        if (st.capture && isStuck(st.capture)) {
+            SendCancelModeBounded(st.capture);
+            // 目标忽略 WM_CANCELMODE 时由本线程强行夺走捕获再释放
+            ForceReleaseMouseCapture(captureHost);
+        }
+        if (st.moveSize && isStuck(st.moveSize)) {
+            SendCancelModeBounded(st.moveSize);
+        }
+        if (st.menuOwner && isStuck(st.menuOwner)) {
+            SendCancelModeBounded(st.menuOwner);
+        }
     }
 }
 

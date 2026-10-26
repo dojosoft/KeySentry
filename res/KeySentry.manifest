@@ -14,10 +14,10 @@
   </trustInfo>
   <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
     <asmv3:windowsSettings>
-      <!-- 撤销 DPI 感知：本程序所有布局均为固定像素，感知模式下高 DPI 屏幕上界面/浮层偏小。
-           设为不感知后由系统整体位图缩放，尺寸恢复正确（非整数缩放时画面略柔和）。
-           注意：不要再添加 dpiAwareness(PerMonitorV2)，它会在 Win10 1607+ 上覆盖此项并重新开启感知。 -->
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">false</dpiAware>
+      <!-- 高 DPI 适配：声明系统级 DPI 感知，配合 Utils.h 中的 UI 缩放，
+           使字体与控件随系统 DPI 同比放大，避免高分辨率下界面偏小。
+           不使用 dpiAwareness(PerMonitorV2)，以保持 Win7 SP1 兼容。 -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
     </asmv3:windowsSettings>
   </asmv3:application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

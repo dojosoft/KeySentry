@@ -2,6 +2,7 @@
 #include <Windows.h>
 #include <vector>
 #include <utility>
+#include "Config.h"
 
 // ============================================================
 // KeyboardHook: 低级键盘钩子管理器
@@ -37,8 +38,8 @@ public:
     void SetShowMuteOverlay(bool show);
     // 启用/禁用按键重映射
     void SetKeyRemapEnabled(bool enabled);
-    // 设置按键重映射表：{源键虚拟码, 目标键虚拟码}
-    void SetKeyRemappings(const std::vector<std::pair<int, int>>& remappings);
+    // 设置按键重映射表：源键 -> 单键或组合键（mods 为 0 表示单键）
+    void SetKeyRemappings(const std::vector<KeyRemapEntry>& remappings);
     // 标记当前正在模拟输入（避免钩子递归拦截自己发送的按键）
     void SetSimulatingInput(bool sim);
     // 启用/禁用热键捕获模式（捕获模式下不拦截任何按键）
@@ -57,14 +58,19 @@ private:
     bool m_showOverlay = true;         // 是否显示锁键状态浮层
     bool m_showMuteOverlay = false;    // 是否显示静音状态浮层
     bool m_keyRemapEnabled = false;    // 是否启用按键重映射
-    std::vector<std::pair<int, int>> m_remappings; // 按键重映射表
+    std::vector<KeyRemapEntry> m_remappings; // 按键重映射表
     bool m_simulatingInput = false;    // 正在模拟输入（用于防止递归拦截）
     bool m_captureMode = false;        // 热键捕获模式（不拦截任何按键）
 
-    // 已注入且仍处于按下状态的重映射目标键（源键 vk -> 目标键 vk）。
-    // 若用户在按住源键期间修改/关闭映射或退出程序，源键的 keyup 会按新配置
-    // 直接放行而不再注入目标键 keyup，导致目标键在系统中一直处于按下状态（卡键）
-    std::vector<std::pair<int, int>> m_activeRemaps;
+    // 已注入且仍处于按下状态的重映射记录。
+    // injectedMods 记录为凑出目标组合而注入的修饰键，抬起时需精确释放，
+    // 避免用户按住源键期间修改/关闭映射或退出程序后修饰键卡住。
+    struct ActiveRemap {
+        int sourceVK = 0;
+        int targetVK = 0;
+        UINT injectedMods = 0;
+    };
+    std::vector<ActiveRemap> m_activeRemaps;
     // 为所有仍处于按下状态的重映射目标键补发 keyup，并清空记录
     void ReleaseRemappedKeys();
 

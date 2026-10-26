@@ -84,16 +84,25 @@ void SetHookSimulating(bool sim) {
 }
 
 // ===== SimulateTargetKeyPress =====
-// 功能：模拟单次按键（自定义热键的"模拟按键"模式）
+// 功能：模拟单次按键或组合键（自定义热键的"模拟按键"模式）
 // 流程：
 //   1. 释放当前物理按住的修饰键——热键触发瞬间用户通常还按着 Ctrl/Alt 等，
-//      不释放会导致目标程序收到"修饰键+目标键"的组合而非纯净单键
-//   2. 发送目标键 down+up（扩展键自动附加 KEYEVENTF_EXTENDEDKEY）
+//      不释放会导致目标程序收到"修饰键+目标键"的组合而非纯净输入
+//   2. 按下目标组合的修饰键与主键，短暂停留后抬起
 //   3. 恢复 Ctrl/Shift——用户仍物理按住时保持修饰键有效
 //      注意：Alt 不恢复（单独恢复会激活程序菜单栏），
 //            Win 不恢复（恢复后用户物理释放会误开开始菜单）
-static void SimulateTargetKeyPress(UINT vk) {
+static void SimulateTargetKeyPress(UINT vk, UINT mods) {
     if (vk == 0) return;
+
+    // 构造一个键盘输入事件（扩展键自动附加 KEYEVENTF_EXTENDEDKEY）
+    auto fillKey = [](INPUT& in, UINT keyVk, bool keyUp) {
+        in.type = INPUT_KEYBOARD;
+        in.ki.wVk = (WORD)keyVk;
+        in.ki.wScan = (WORD)MapVirtualKeyW(keyVk, MAPVK_VK_TO_VSC);
+        in.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
+        if (NeedsExtendedKeyFlag(keyVk)) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    };
 
     // 记录热键触发瞬间的物理修饰键状态（注入按键前检查才准确）
     const UINT aggMods[3] = { VK_CONTROL, VK_SHIFT, VK_MENU }; // 聚合修饰键（不区分左右）
@@ -124,15 +133,28 @@ static void SimulateTargetKeyPress(UINT vk) {
         Sleep(30);
     }
 
-    // 第二步：发送目标键 down+up
-    INPUT key[2] = {};
-    key[0].type = INPUT_KEYBOARD;
-    key[0].ki.wVk = (WORD)vk;
-    key[0].ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-    if (NeedsExtendedKeyFlag(vk)) key[0].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-    key[1] = key[0];
-    key[1].ki.dwFlags |= KEYEVENTF_KEYUP;
-    SendInput(2, key, sizeof(INPUT));
+    // 第二步：按下目标组合所需修饰键与主键
+    // 修饰键顺序固定为 Ctrl/Shift/Alt/Win，与常见组合键习惯一致
+    INPUT down[5] = {};
+    UINT dn = 0;
+    if (mods & MOD_CONTROL) fillKey(down[dn++], VK_CONTROL, false);
+    if (mods & MOD_SHIFT)   fillKey(down[dn++], VK_SHIFT, false);
+    if (mods & MOD_ALT)     fillKey(down[dn++], VK_MENU, false);
+    if (mods & MOD_WIN)     fillKey(down[dn++], VK_LWIN, false);
+    fillKey(down[dn++], vk, false);
+    SendInput(dn, down, sizeof(INPUT));
+
+    // 抬起：主键先抬，修饰键按注入逆序抬起，避免组合状态错乱
+    INPUT up[5] = {};
+    UINT un = 0;
+    fillKey(up[un++], vk, true);
+    if (mods & MOD_WIN)     fillKey(up[un++], VK_LWIN, true);
+    if (mods & MOD_ALT)     fillKey(up[un++], VK_MENU, true);
+    if (mods & MOD_SHIFT)   fillKey(up[un++], VK_SHIFT, true);
+    if (mods & MOD_CONTROL) fillKey(up[un++], VK_CONTROL, true);
+    // 组合键留出少量间隔，确保目标程序先处理修饰键按下再收到主键
+    if (mods != 0) Sleep(20);
+    SendInput(un, up, sizeof(INPUT));
 
     // 第三步：恢复 Ctrl/Shift（仅限仍需保持的聚合修饰键，Alt/Win 见函数头注释）
     INPUT re[2] = {};
@@ -1126,8 +1148,8 @@ void ShowAboutDialog(HWND parent) {
         registered = true;
     }
 
-    // 计算窗口大小和居中位置
-    RECT rc = { 0, 0, 360, 240 };
+    // 计算窗口大小和居中位置（按系统 DPI 放大）
+    RECT rc = { 0, 0, ScaleUi(360), ScaleUi(240) };
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
@@ -1152,35 +1174,35 @@ void ShowAboutDialog(HWND parent) {
     HICON hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
     HWND iconCtrl = CreateWindowExW(0, L"STATIC", L"",
                                       WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
-                                      20, 20, 48, 48,
+                                      ScaleUi(20), ScaleUi(20), ScaleUi(48), ScaleUi(48),
                                       hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(iconCtrl, STM_SETICON, (WPARAM)hIcon, 0);
 
     // 标题文字
     HWND titleCtrl = CreateWindowExW(0, L"STATIC", L"键客 KeySentry",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       80, 20, 260, 32,
+                                       ScaleUi(80), ScaleUi(20), ScaleUi(260), ScaleUi(32),
                                        hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.31.0.1024",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.40.0.1027",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     80, 55, 260, 24,
+                                     ScaleUi(80), ScaleUi(55), ScaleUi(260), ScaleUi(24),
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(verCtrl, WM_SETFONT, (WPARAM)fontNormal.get(), TRUE);
 
     // 分隔线
     CreateWindowExW(0, L"STATIC", L"",
                     WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                    20, 88, 320, 2,
+                    ScaleUi(20), ScaleUi(88), ScaleUi(320), ScaleUi(2),
                     hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     // 应用描述（横向居中）
     HWND descCtrl = CreateWindowExW(0, L"STATIC",
                                       L"一款掌控你的键盘和窗口的轻量工具。",
                                       WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                      20, 100, 320, 24,
+                                      ScaleUi(20), ScaleUi(100), ScaleUi(320), ScaleUi(24),
                                       hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(descCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
 
@@ -1196,34 +1218,34 @@ void ShowAboutDialog(HWND parent) {
     GetTextExtentPoint32W(hdcMeasure, gitText, (int)wcslen(gitText), &szGit);
     SelectObject(hdcMeasure, oldFont);
     ReleaseDC(hwnd, hdcMeasure);
-    const int gap = 6;  // 元素间距
-    int rowY = 128;
+    const int gap = ScaleUi(6);  // 元素间距
+    int rowY = ScaleUi(128);
     int totalW = szCopy.cx + gap + szSep.cx + gap + szGit.cx;
-    int startX = (360 - totalW) / 2;
+    int startX = (ScaleUi(360) - totalW) / 2;
 
     HWND copyCtrl = CreateWindowExW(0, L"STATIC", copyText,
                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                      startX, rowY, szCopy.cx + 4, 24,
+                                      startX, rowY, szCopy.cx + 4, ScaleUi(24),
                                       hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(copyCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
 
     HWND sepCtrl = CreateWindowExW(0, L"STATIC", sepText,
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     startX + szCopy.cx + gap, rowY, szSep.cx + 4, 24,
+                                     startX + szCopy.cx + gap, rowY, szSep.cx + 4, ScaleUi(24),
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(sepCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
 
     // GitHub链接
     HWND githubCtrl = CreateWindowExW(0, L"STATIC", gitText,
                                         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
-                                        startX + szCopy.cx + gap + szSep.cx + gap, rowY, szGit.cx + 4, 24,
+                                        startX + szCopy.cx + gap + szSep.cx + gap, rowY, szGit.cx + 4, ScaleUi(24),
                                         hwnd, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(githubCtrl, WM_SETFONT, (WPARAM)fontSmall.get(), TRUE);
 
     // 确定按钮
     HWND okBtn = CreateWindowExW(0, L"BUTTON", L"确定",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-                                   140, 165, 80, 32,
+                                   ScaleUi(140), ScaleUi(165), ScaleUi(80), ScaleUi(32),
                                    hwnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(okBtn, WM_SETFONT, (WPARAM)fontNormal.get(), TRUE);
 
@@ -1365,9 +1387,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int idx = (int)wp - CUSTOM_HOTKEY_ID_START;
             if (idx >= 0 && idx < (int)g_config.customHotkeys.size()) {
                 const auto& hk = g_config.customHotkeys[idx];
-                // 模拟按键模式：释放修饰键后发送被模拟的按键
+                // 模拟按键模式：释放修饰键后发送被模拟的按键或组合键
                 if (hk.simulateKey && hk.targetVK != 0) {
-                    SimulateTargetKeyPress(hk.targetVK);
+                    SimulateTargetKeyPress(hk.targetVK, hk.targetMod);
                     return 0;
                 }
                 if (!hk.command.empty()) {
@@ -1577,6 +1599,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 //  10. 进入消息循环
 //  11. 退出时保存配置、释放互斥体
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // 先初始化 UI 缩放系数（基于系统 DPI），保证后续字体与窗口尺寸一致
+    InitUiScale();
+
     // 注册 TaskbarCreated 消息，用于 explorer 重启后恢复托盘图标
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 

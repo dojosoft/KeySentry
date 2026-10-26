@@ -4,6 +4,7 @@
 #include <memory>
 #include <unordered_map>
 #include <Windows.h>
+#include <CommCtrl.h>
 #include <objbase.h>
 #include <Psapi.h>
 
@@ -312,12 +313,103 @@ inline bool NeedsExtendedKeyFlag(UINT vk) {
     return false;
 }
 
+// ============================================================
+// 高 DPI 适配：进程声明为系统 DPI 感知后，固定像素布局在高 DPI 屏幕上会偏小。
+// 统一用该缩放系数换算字号与控件坐标，保证 100%/125%/150%/200% 下观感一致。
+// ============================================================
+inline float& UiScaleStorage() {
+    static float scale = 0.0f;
+    return scale;
+}
+
+// 计算界面缩放系数：以系统 DPI 为基准，并限制在可用工作区内
+// （以最大的设置窗口 800x680 为基准，避免缩放后窗口超出屏幕）。
+inline void InitUiScale() {
+    HDC hdc = GetDC(nullptr);
+    int dpi = hdc ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+    if (hdc) ReleaseDC(nullptr, hdc);
+    if (dpi <= 0) dpi = 96;
+
+    float scale = (float)dpi / 96.0f;
+
+    RECT work = { 0, 0, 0, 0 };
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+        float fitW = (float)(work.right - work.left - 40) / 800.0f;
+        float fitH = (float)(work.bottom - work.top - 60) / 680.0f;
+        float fit = (fitW < fitH) ? fitW : fitH;
+        if (scale > fit) scale = fit;
+    }
+
+    // 低 DPI 下不缩小；极端缩放设置上限，防止布局溢出
+    if (scale < 1.0f) scale = 1.0f;
+    if (scale > 3.0f) scale = 3.0f;
+    UiScaleStorage() = scale;
+}
+
+inline float GetUiScale() {
+    float s = UiScaleStorage();
+    return s > 0.0f ? s : 1.0f;
+}
+
+// 将逻辑像素换算为当前 DPI 下的物理像素（四舍五入）
+inline int ScaleUi(int v) {
+    return (int)(v * GetUiScale() + (v >= 0 ? 0.5f : -0.5f));
+}
+
+// 按缩放系数重设子控件矩形；ListView 同步缩放列宽。
+// 仅用于布局完成后一次性缩放，运行期反复调用会重复放大。
+// skipIds 中的控件（已按物理坐标创建）会被跳过，典型用于选项卡与底部按钮。
+inline void ScaleChildWindows(HWND parent, float scale,
+                              const LONG_PTR* skipIds = nullptr, int skipCount = 0) {
+    if (!parent || scale <= 0.0f || scale == 1.0f) return;
+
+    HWND child = GetWindow(parent, GW_CHILD);
+    while (child) {
+        HWND next = GetWindow(child, GW_HWNDNEXT);
+
+        bool skip = false;
+        if (skipIds) {
+            LONG_PTR id = GetWindowLongPtrW(child, GWLP_ID);
+            for (int i = 0; i < skipCount; i++) {
+                if (id == skipIds[i]) { skip = true; break; }
+            }
+        }
+
+        if (!skip) {
+            RECT rc = { 0, 0, 0, 0 };
+            if (GetWindowRect(child, &rc)) {
+                MapWindowPoints(HWND_DESKTOP, parent, reinterpret_cast<POINT*>(&rc), 2);
+                int x = (int)(rc.left * scale + (rc.left >= 0 ? 0.5f : -0.5f));
+                int y = (int)(rc.top * scale + (rc.top >= 0 ? 0.5f : -0.5f));
+                int w = (int)((rc.right - rc.left) * scale + 0.5f);
+                int h = (int)((rc.bottom - rc.top) * scale + 0.5f);
+                SetWindowPos(child, nullptr, x, y, w, h,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+
+            wchar_t cls[64] = {};
+            if (GetClassNameW(child, cls, 64) && wcscmp(cls, WC_LISTVIEWW) == 0) {
+                int cols = (int)Header_GetItemCount((HWND)SendMessageW(child, LVM_GETHEADER, 0, 0));
+                for (int i = 0; i < cols; i++) {
+                    int cw = (int)SendMessageW(child, LVM_GETCOLUMNWIDTH, i, 0);
+                    if (cw > 0) {
+                        SendMessageW(child, LVM_SETCOLUMNWIDTH, i,
+                                     (LPARAM)((int)(cw * scale + 0.5f)));
+                    }
+                }
+            }
+        }
+
+        child = next;
+    }
+}
+
 // 创建 UI 字体，基于系统默认字体调整高度和粗细
 inline HFONT CreateUiFont(int height, int weight = FW_NORMAL) {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     LOGFONTW lf = ncm.lfMessageFont;
-    lf.lfHeight = -height;
+    lf.lfHeight = -ScaleUi(height);
     lf.lfWeight = weight;
     return CreateFontIndirectW(&lf);
 }

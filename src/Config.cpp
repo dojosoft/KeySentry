@@ -168,14 +168,44 @@ void AppConfig::Load(const std::wstring& iniPath) {
 
     // --- 按键重映射 ---
     keyRemapEnabled = GetPrivateProfileIntW(L"KeyRemap", L"Enabled", 0, iniPath.c_str()) != 0;
-    auto remapStr = IniUtils::Read(iniPath, L"KeyRemap", L"Mappings");
-    auto remapInts = ParseCSVInts(remapStr);
-    // 重映射以成对形式存储：{源键, 目标键}
     keyRemappings.clear();   // 重复载入时避免沿用上一次的映射项
-    for (size_t i = 0; i + 1 < remapInts.size(); i += 2) {
-        // 丢弃非法键码：保留会让源键被吞掉却模拟不出目标键，等于该键彻底失效
-        if (!ConfigUtils::IsValidVK(remapInts[i]) || !ConfigUtils::IsValidVK(remapInts[i + 1])) continue;
-        keyRemappings.push_back({remapInts[i], remapInts[i + 1]});
+
+    // 新格式 MappingsV2：三元组 {源键, 修饰键, 目标键}；旧格式 Mappings 仍按成对读取
+    auto remapV2Str = IniUtils::Read(iniPath, L"KeyRemap", L"MappingsV2");
+    auto remapV2Ints = ParseCSVInts(remapV2Str);
+    if (!remapV2Ints.empty()) {
+        for (size_t i = 0; i + 2 < remapV2Ints.size(); i += 3) {
+            int src = remapV2Ints[i];
+            UINT mods = ConfigUtils::SanitizeMods(remapV2Ints[i + 1]);
+            int tgt = remapV2Ints[i + 2];
+            // 丢弃非法键码：保留会让源键被吞掉却模拟不出目标键，等于该键彻底失效
+            if (!ConfigUtils::IsValidVK(src) || !ConfigUtils::IsValidVK(tgt)) continue;
+            // 修饰键作源键会让整个 Ctrl/Shift/Alt/Win 失效，直接丢弃
+            if (ConfigUtils::IsModifierKey(src)) continue;
+            if (mods == 0 && src == tgt) continue;
+            // 同一源键只保留第一条，避免重复映射造成行为不确定
+            bool exists = false;
+            for (const auto& r : keyRemappings) {
+                if (r.sourceVK == src) { exists = true; break; }
+            }
+            if (!exists) keyRemappings.push_back({ src, mods, tgt });
+        }
+    } else {
+        auto remapStr = IniUtils::Read(iniPath, L"KeyRemap", L"Mappings");
+        auto remapInts = ParseCSVInts(remapStr);
+        // 旧格式以成对形式存储：{源键, 目标键}，等价于 mods = 0
+        for (size_t i = 0; i + 1 < remapInts.size(); i += 2) {
+            int src = remapInts[i];
+            int tgt = remapInts[i + 1];
+            if (!ConfigUtils::IsValidVK(src) || !ConfigUtils::IsValidVK(tgt)) continue;
+            if (ConfigUtils::IsModifierKey(src)) continue;
+            if (src == tgt) continue;
+            bool exists = false;
+            for (const auto& r : keyRemappings) {
+                if (r.sourceVK == src) { exists = true; break; }
+            }
+            if (!exists) keyRemappings.push_back({ src, 0, tgt });
+        }
     }
 
     // --- 自定义热键 ---
@@ -192,6 +222,9 @@ void AppConfig::Load(const std::wstring& iniPath) {
             if (hk.mod == 0 || !ConfigUtils::IsValidVK((int)hk.vk)) continue;
             // 模拟按键模式下目标键非法时动作必然失败，同样丢弃
             if (hk.simulateKey && !ConfigUtils::IsValidVK((int)hk.targetVK)) continue;
+            // 模拟组合键的修饰键位收敛；修饰键不能作为组合的主键
+            hk.targetMod = ConfigUtils::SanitizeMods((int)hk.targetMod);
+            if (hk.targetMod != 0 && ConfigUtils::IsModifierKey((int)hk.targetVK)) hk.targetMod = 0;
             // 丢弃重复组合（mod+vk 相同只保留第一条），避免注册失败连环弹窗
             bool duplicated = false;
             for (const auto& existing : customHotkeys) {
@@ -315,11 +348,21 @@ bool AppConfig::Save(const std::wstring& iniPath) const {
     IniUtils::Write(tmpPath, L"Keys", L"ForceInsertMode", IniUtils::BoolToStr(forceInsertMode));
     IniUtils::Write(tmpPath, L"Keys", L"DisabledKeyCodes", IntsToCSV(disabledKeyCodes));
 
-    // 按键重映射：将成对映射展平为逗号分隔的整数序列
+    // 按键重映射：写入新格式三元组；同时为旧版本保留单键映射的成对格式
     IniUtils::Write(tmpPath, L"KeyRemap", L"Enabled", IniUtils::BoolToStr(keyRemapEnabled));
-    std::vector<int> remapFlat;
-    for (auto& p : keyRemappings) { remapFlat.push_back(p.first); remapFlat.push_back(p.second); }
-    IniUtils::Write(tmpPath, L"KeyRemap", L"Mappings", IntsToCSV(remapFlat));
+    std::vector<int> remapV2Flat;
+    std::vector<int> remapLegacyFlat;
+    for (const auto& r : keyRemappings) {
+        remapV2Flat.push_back(r.sourceVK);
+        remapV2Flat.push_back((int)r.mods);
+        remapV2Flat.push_back(r.targetVK);
+        if (r.mods == 0) {
+            remapLegacyFlat.push_back(r.sourceVK);
+            remapLegacyFlat.push_back(r.targetVK);
+        }
+    }
+    IniUtils::Write(tmpPath, L"KeyRemap", L"MappingsV2", IntsToCSV(remapV2Flat));
+    IniUtils::Write(tmpPath, L"KeyRemap", L"Mappings", IntsToCSV(remapLegacyFlat));
 
     // 自定义热键：始终按当前序列化规范整体重写，
     // 旧版本遗留的废弃字段（sound/opacity/autoStart）在此被丢弃

@@ -9,6 +9,28 @@ KeyboardHook* KeyboardHook::s_instance = nullptr;
 // 视为标志失效并允许重新通知，避免按一次之后再也收不到浮层。
 static const ULONGLONG LOCK_KEY_HOLD_TIMEOUT_MS = 3000;
 
+// 修饰键位（MOD_*） -> 实际虚拟键码
+static UINT ModifierVKForFlag(UINT mod) {
+    switch (mod) {
+    case MOD_CONTROL: return VK_CONTROL;
+    case MOD_SHIFT:   return VK_SHIFT;
+    case MOD_ALT:     return VK_MENU;
+    case MOD_WIN:     return VK_LWIN;
+    default:          return 0;
+    }
+}
+
+// 构造一个键盘输入事件
+static INPUT MakeKeyInput(int vk, bool keyUp) {
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = (WORD)vk;
+    input.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    input.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
+    if (NeedsExtendedKeyFlag(vk)) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    return input;
+}
+
 KeyboardHook::KeyboardHook() {
     s_instance = this;
 }
@@ -59,29 +81,35 @@ void KeyboardHook::Uninstall() {
     ResetHeldInputState();
 }
 
-// 为所有仍处于按下状态的重映射目标键补发 keyup，并清空记录
+// 为所有仍处于按下状态的重映射目标键与注入的修饰键补发 keyup，并清空记录
 void KeyboardHook::ReleaseRemappedKeys() {
     if (m_activeRemaps.empty()) return;
+
     // 多个源键可能映射到同一目标键，keyup 只需发送一次
     std::vector<int> targets;
+    UINT injectedMods = 0;
     targets.reserve(m_activeRemaps.size());
     for (const auto& remap : m_activeRemaps) {
-        if (std::find(targets.begin(), targets.end(), remap.second) == targets.end()) {
-            targets.push_back(remap.second);
+        if (std::find(targets.begin(), targets.end(), remap.targetVK) == targets.end()) {
+            targets.push_back(remap.targetVK);
         }
+        injectedMods |= remap.injectedMods;
     }
+
     std::vector<INPUT> inputs;
-    inputs.reserve(targets.size());
+    inputs.reserve(targets.size() + 4);
     for (int target : targets) {
-        INPUT input = {};
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = (WORD)target;
-        input.ki.wScan = (WORD)MapVirtualKeyW(target, MAPVK_VK_TO_VSC);
-        input.ki.dwFlags = KEYEVENTF_KEYUP;
-        if (NeedsExtendedKeyFlag(target)) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-        inputs.push_back(input);
+        inputs.push_back(MakeKeyInput(target, true));
     }
-    SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+    // 修饰键按注入的逆序释放，避免顺序错乱影响组合状态
+    static const UINT releaseOrder[] = { MOD_WIN, MOD_ALT, MOD_SHIFT, MOD_CONTROL };
+    for (UINT mod : releaseOrder) {
+        if (injectedMods & mod) inputs.push_back(MakeKeyInput((int)ModifierVKForFlag(mod), true));
+    }
+
+    if (!inputs.empty()) {
+        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+    }
     m_activeRemaps.clear();
 }
 
@@ -115,15 +143,25 @@ void KeyboardHook::SetKeyRemapEnabled(bool enabled) {
     m_keyRemapEnabled = enabled;
 }
 
-void KeyboardHook::SetKeyRemappings(const std::vector<std::pair<int, int>>& remappings) {
+void KeyboardHook::SetKeyRemappings(const std::vector<KeyRemapEntry>& remappings) {
     // 映射表变更前先释放旧映射产生的按键，避免按住映射键修改配置后卡键
     ReleaseRemappedKeys();
     // 过滤非法键码（0/>=255 无法被 SendInput 识别）：源键被吞掉却模拟不出目标键
     // 会让该键彻底失效，且用户没有任何提示
     m_remappings.clear();
     for (const auto& r : remappings) {
-        if (r.first <= 0 || r.first >= 255 || r.second <= 0 || r.second >= 255) continue;
-        m_remappings.push_back(r);
+        if (!ConfigUtils::IsValidVK(r.sourceVK) || !ConfigUtils::IsValidVK(r.targetVK)) continue;
+        // 修饰键作源键会导致整个 Ctrl/Shift/Alt/Win 被拦截，直接丢弃
+        if (ConfigUtils::IsModifierKey(r.sourceVK)) continue;
+        UINT mods = ConfigUtils::SanitizeMods((int)r.mods);
+        if (mods == 0 && r.sourceVK == r.targetVK) continue;  // 无意义的自映射
+        // 同一源键只保留第一条，避免行为不确定
+        bool exists = false;
+        for (const auto& existing : m_remappings) {
+            if (existing.sourceVK == r.sourceVK) { exists = true; break; }
+        }
+        if (exists) continue;
+        m_remappings.push_back({ r.sourceVK, mods, r.targetVK });
     }
 }
 
@@ -173,55 +211,95 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
             // 跳过注入按键，防止重映射的注入按键触发二次重映射（无限递归）
             if (s_instance->m_keyRemapEnabled && !(kb->flags & LLKHF_INJECTED)) {
                 for (const auto& remap : s_instance->m_remappings) {
-                    if ((int)kb->vkCode == remap.first) {
-                        bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
-                        auto held = std::make_pair((int)kb->vkCode, remap.second);
-                        // 多个源键可能映射到同一目标键：仅当没有其他源键仍按住该
-                        // 目标键时才发送 keyup，否则另一个源键按住期间目标键会失效
-                        bool targetStillHeld = false;
-                        if (isUp) {
-                            for (const auto& active : s_instance->m_activeRemaps) {
-                                if (active != held && active.second == remap.second) {
-                                    targetStillHeld = true;
-                                    break;
-                                }
+                    if ((int)kb->vkCode != remap.sourceVK) continue;
+
+                    bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+                    auto it = std::find_if(s_instance->m_activeRemaps.begin(),
+                                           s_instance->m_activeRemaps.end(),
+                                           [&](const ActiveRemap& a) {
+                                               return a.sourceVK == remap.sourceVK;
+                                           });
+
+                    if (!isUp) {
+                        // 首次按下：补齐目标组合所需且当前未被物理按下的修饰键；
+                        // 连发 keydown：修饰键只注入一次，仅重发目标键
+                        bool firstPress = (it == s_instance->m_activeRemaps.end());
+                        UINT injectedMods = firstPress ? 0 : it->injectedMods;
+                        INPUT inputs[5] = {};
+                        UINT n = 0;
+
+                        if (firstPress) {
+                            static const UINT modOrder[] = { MOD_CONTROL, MOD_SHIFT, MOD_ALT, MOD_WIN };
+                            for (UINT mod : modOrder) {
+                                if (!(remap.mods & mod)) continue;
+                                int mvk = (int)ModifierVKForFlag(mod);
+                                if (mvk == 0) continue;
+                                if (GetAsyncKeyState(mvk) & 0x8000) continue; // 已被物理按下
+                                inputs[n++] = MakeKeyInput(mvk, false);
+                                injectedMods |= mod;
                             }
                         }
-                        bool injected = true;
-                        if (!targetStillHeld) {
-                            // 模拟目标按键
-                            INPUT input = {};
-                            input.type = INPUT_KEYBOARD;
-                            input.ki.wVk = (WORD)remap.second;
-                            input.ki.wScan = (WORD)MapVirtualKeyW(remap.second, MAPVK_VK_TO_VSC);
-                            input.ki.dwFlags = isUp ? KEYEVENTF_KEYUP : 0;
-                            if (NeedsExtendedKeyFlag(remap.second))
-                                input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-                            // 发送重映射按键（注入的，带 LLKHF_INJECTED 标志）
-                            // 上方的 LLKHF_INJECTED 检查确保不会对注入按键再次重映射
-                            // 注入可能失败（UIPI 拦截、安全桌面、输入被独占），
-                            // 失败时必须放行原键，否则该次按键会被彻底吞掉、表现为按键失灵
-                            injected = SendInput(1, &input, sizeof(INPUT)) == 1;
-                        }
-                        // 记录/清除仍按住的目标键：配置变更、关闭映射或退出时
-                        // 需据此补发 keyup，否则目标键会一直停留在按下状态
-                        auto it = std::find(s_instance->m_activeRemaps.begin(),
-                                            s_instance->m_activeRemaps.end(), held);
-                        if (isUp) {
-                            // keyup 注入失败时保留记录，之后退出程序或修改映射时
-                            // ReleaseRemappedKeys 仍能补发 keyup 解除可能的卡键
-                            if (injected && it != s_instance->m_activeRemaps.end())
-                                s_instance->m_activeRemaps.erase(it);
-                        } else if (injected && it == s_instance->m_activeRemaps.end()) {
-                            // 同一源键的连发 keydown 只记录一次
-                            s_instance->m_activeRemaps.push_back(held);
-                        }
+                        inputs[n++] = MakeKeyInput(remap.targetVK, false);
+
+                        // 注入可能失败（UIPI 拦截、安全桌面、输入被独占）：
+                        // 失败时必须放行原键，否则该次按键会被彻底吞掉、表现为按键失灵
+                        bool injected = SendInput(n, inputs, sizeof(INPUT)) == n;
                         if (!injected) {
-                            // 注入失败：不吞原键，保持按键的原有行为
+                            // 部分失败时修饰键可能已按下，逐一释放避免卡键
+                            std::vector<INPUT> releases;
+                            static const UINT releaseOrder[] = { MOD_WIN, MOD_ALT, MOD_SHIFT, MOD_CONTROL };
+                            for (UINT mod : releaseOrder) {
+                                if (injectedMods & mod) {
+                                    releases.push_back(MakeKeyInput((int)ModifierVKForFlag(mod), true));
+                                }
+                            }
+                            if (!releases.empty()) {
+                                SendInput((UINT)releases.size(), releases.data(), sizeof(INPUT));
+                            }
                             return CallNextHookEx(s_instance->m_hook, nCode, wParam, lParam);
+                        }
+                        if (firstPress) {
+                            // 记录注入的修饰键：抬起、改配置、关闭功能或退出时据此释放
+                            s_instance->m_activeRemaps.push_back(
+                                { remap.sourceVK, remap.targetVK, injectedMods });
                         }
                         return 1; // 吞掉原始按键
                     }
+
+                    // keyup：若首次 keydown 未能注入（无记录），放行原键，
+                    // 避免原键 keydown 已放行而 keyup 被吞导致按键卡住
+                    if (it == s_instance->m_activeRemaps.end()) {
+                        return CallNextHookEx(s_instance->m_hook, nCode, wParam, lParam);
+                    }
+
+                    // 多个源键可能映射到同一目标键：仅当没有其他源键仍按住该
+                    // 目标键时才发送 keyup，否则另一个源键按住期间目标键会失效
+                    bool targetStillHeld = false;
+                    UINT otherMods = 0;
+                    for (const auto& active : s_instance->m_activeRemaps) {
+                        if (active.sourceVK == remap.sourceVK) continue;
+                        if (active.targetVK == remap.targetVK) targetStillHeld = true;
+                        otherMods |= active.injectedMods;
+                    }
+
+                    INPUT inputs[5] = {};
+                    UINT n = 0;
+                    if (!targetStillHeld) inputs[n++] = MakeKeyInput(remap.targetVK, true);
+                    // 只释放本条目注入、且其他仍按住的条目不需要的修饰键
+                    UINT releaseMods = it->injectedMods & ~otherMods;
+                    static const UINT releaseOrder[] = { MOD_WIN, MOD_ALT, MOD_SHIFT, MOD_CONTROL };
+                    for (UINT mod : releaseOrder) {
+                        if (releaseMods & mod) {
+                            inputs[n++] = MakeKeyInput((int)ModifierVKForFlag(mod), true);
+                        }
+                    }
+                    bool injected = (n == 0) || (SendInput(n, inputs, sizeof(INPUT)) == n);
+                    if (injected) {
+                        s_instance->m_activeRemaps.erase(it);
+                    }
+                    // keyup 注入失败时保留记录，之后退出程序或修改映射时
+                    // ReleaseRemappedKeys 仍能补发 keyup 解除可能的卡键
+                    return 1;
                 }
             }
 

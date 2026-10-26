@@ -23,7 +23,7 @@ HWND OverlayWindow::CreateOverlayWnd() {
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
         CLASS_NAME, L"",
         WS_POPUP,
-        0, 0, OVERLAY_SIZE, OVERLAY_SIZE,
+        0, 0, ScaleUi(OVERLAY_SIZE), ScaleUi(OVERLAY_SIZE),
         nullptr, nullptr, m_hInst, this
     );
     if (hwnd) {
@@ -264,17 +264,20 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfoW(monitors[i], &mi);
         int screenW = mi.rcWork.right - mi.rcWork.left;
-        int x = (screenW - OVERLAY_SIZE) / 2 + mi.rcWork.left;
-        int y = mi.rcWork.bottom - OVERLAY_KEY_HEIGHT - OVERLAY_BOTTOM_MARGIN;
+        int ovW = ScaleUi(OVERLAY_SIZE);
+        int ovH = ScaleUi(OVERLAY_KEY_HEIGHT);
+        int margin = ScaleUi(OVERLAY_BOTTOM_MARGIN);
+        int x = (screenW - ovW) / 2 + mi.rcWork.left;
+        int y = mi.rcWork.bottom - ovH - margin;
 
         // 仅在窗口原本隐藏时才重新置顶显示，避免可见状态下的重复 SetWindowPos
         if (!IsWindowVisible(m_hwnds[i])) {
-            SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_KEY_HEIGHT,
+            SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, ovW, ovH,
                          SWP_SHOWWINDOW | SWP_NOACTIVATE);
         } else {
             // 已可见时仍校正位置/尺寸（锁键与静音浮层高度不同、显示器布局可能变化），
             // 但不改变 Z-order，避免重复置顶重排
-            SetWindowPos(m_hwnds[i], nullptr, x, y, OVERLAY_SIZE, OVERLAY_KEY_HEIGHT,
+            SetWindowPos(m_hwnds[i], nullptr, x, y, ovW, ovH,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
         // bErase=FALSE：WM_PAINT 已整窗填充背景，且 WM_ERASEBKGND 已返回 1
@@ -323,16 +326,18 @@ void OverlayWindow::ShowMute() {
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfoW(monitors[i], &mi);
         int screenW = mi.rcWork.right - mi.rcWork.left;
-        int x = (screenW - OVERLAY_SIZE) / 2 + mi.rcWork.left;
-        int y = mi.rcWork.bottom - OVERLAY_SIZE - OVERLAY_BOTTOM_MARGIN;
+        int ovSize = ScaleUi(OVERLAY_SIZE);
+        int margin = ScaleUi(OVERLAY_BOTTOM_MARGIN);
+        int x = (screenW - ovSize) / 2 + mi.rcWork.left;
+        int y = mi.rcWork.bottom - ovSize - margin;
 
         // 仅在窗口原本隐藏时才重新置顶显示
         if (!IsWindowVisible(m_hwnds[i])) {
-            SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_SIZE,
+            SetWindowPos(m_hwnds[i], HWND_TOPMOST, x, y, ovSize, ovSize,
                          SWP_SHOWWINDOW | SWP_NOACTIVATE);
         } else {
             // 已可见时仍校正位置/尺寸（从锁键浮层切换过来时高度不同），不改变 Z-order
-            SetWindowPos(m_hwnds[i], nullptr, x, y, OVERLAY_SIZE, OVERLAY_SIZE,
+            SetWindowPos(m_hwnds[i], nullptr, x, y, ovSize, ovSize,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
         InvalidateRect(m_hwnds[i], nullptr, FALSE);
@@ -444,12 +449,12 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 
         if (self->m_showMuteOverlay) {
             // --- 静音浮层绘制 ---
-            DrawSpeakerIcon(hdc, W / 2, OVERLAY_ICON_Y, OVERLAY_ICON_SIZE, self->m_audioMuted);
+            DrawSpeakerIcon(hdc, W / 2, ScaleUi(OVERLAY_ICON_Y), ScaleUi(OVERLAY_ICON_SIZE), self->m_audioMuted);
 
             // 静音/取消静音标签
             const wchar_t* muteLabel = self->m_audioMuted ? L"静音" : L"取消静音";
             COLORREF muteColor = self->m_audioMuted ? RGB(200, 80, 80) : RGB(100, 200, 130);
-            RECT labelRect = { 0, OVERLAY_MUTE_LABEL_TOP, W, OVERLAY_MUTE_LABEL_BOTTOM };
+            RECT labelRect = { 0, ScaleUi(OVERLAY_MUTE_LABEL_TOP), W, ScaleUi(OVERLAY_MUTE_LABEL_BOTTOM) };
             SetTextColor(hdc, muteColor);
             HFONT oldFontM = (HFONT)SelectObject(hdc, self->m_fontMedium);
             DrawTextW(hdc, muteLabel, -1, &labelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -459,7 +464,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (!self->m_audioMuted && self->m_audioVolume >= 0) {
                 wchar_t volText[16] = {};
                 swprintf_s(volText, L"%d%%", self->m_audioVolume);
-                RECT volRect = { 0, OVERLAY_VOL_LABEL_TOP, W, OVERLAY_VOL_LABEL_BOTTOM };
+                RECT volRect = { 0, ScaleUi(OVERLAY_VOL_LABEL_TOP), W, ScaleUi(OVERLAY_VOL_LABEL_BOTTOM) };
                 SetTextColor(hdc, RGB(180, 220, 200));
                 HFONT oldFontS = (HFONT)SelectObject(hdc, self->m_fontSmall);
                 DrawTextW(hdc, volText, -1, &volRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -467,10 +472,11 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
 
             // 绘制音量条
-            int barLeft = OVERLAY_BAR_MARGIN;
-            int barRight = W - OVERLAY_BAR_MARGIN;
-            int barTop = self->m_audioMuted ? OVERLAY_MUTE_LABEL_BOTTOM + 4 : OVERLAY_VOL_LABEL_BOTTOM + 6;
-            int barBottom = barTop + OVERLAY_BAR_HEIGHT;
+            int barLeft = ScaleUi(OVERLAY_BAR_MARGIN);
+            int barRight = W - ScaleUi(OVERLAY_BAR_MARGIN);
+            int barTop = self->m_audioMuted ? ScaleUi(OVERLAY_MUTE_LABEL_BOTTOM) + ScaleUi(4)
+                                            : ScaleUi(OVERLAY_VOL_LABEL_BOTTOM) + ScaleUi(6);
+            int barBottom = barTop + ScaleUi(OVERLAY_BAR_HEIGHT);
             int barW = barRight - barLeft;
 
             // 音量条背景
@@ -515,7 +521,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
 
             // 绘制锁键图标
-            RECT iconRect = { 0, OVERLAY_KEY_ICON_TOP, W, OVERLAY_KEY_ICON_BOTTOM };
+            RECT iconRect = { 0, ScaleUi(OVERLAY_KEY_ICON_TOP), W, ScaleUi(OVERLAY_KEY_ICON_BOTTOM) };
             SetTextColor(hdc, iconColor);
             HFONT oldFontL = (HFONT)SelectObject(hdc, self->m_fontLarge);
             DrawTextW(hdc, iconText, -1, &iconRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -534,7 +540,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 swprintf_s(label, L"%s: %s", keyName, self->m_state ? L"开" : L"关");
             }
 
-            RECT labelRect = { 0, OVERLAY_KEY_LABEL_TOP, W, OVERLAY_KEY_LABEL_BOTTOM };
+            RECT labelRect = { 0, ScaleUi(OVERLAY_KEY_LABEL_TOP), W, ScaleUi(OVERLAY_KEY_LABEL_BOTTOM) };
             SetTextColor(hdc, RGB(200, 200, 220));
             HFONT oldFontM = (HFONT)SelectObject(hdc, self->m_fontMedium);
             DrawTextW(hdc, label, -1, &labelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
