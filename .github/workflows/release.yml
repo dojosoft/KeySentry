@@ -51,12 +51,12 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v5
 
-      - name: 构建 x86（Win32，主产物 KeySentry.exe）
+      - name: 构建 x86（Win32，产物 KeySentry-x86.exe）
         run: |
           cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32 -T v143
           cmake --build build-x86 --config Release
           New-Item -ItemType Directory -Force unsigned | Out-Null
-          Copy-Item release\KeySentry.exe unsigned\KeySentry.exe
+          Copy-Item release\KeySentry-x86.exe unsigned\KeySentry-x86.exe
 
       - name: 构建 x64（产物 KeySentry-x64.exe）
         run: |
@@ -70,7 +70,7 @@ jobs:
         with:
           name: unsigned-binaries
           path: |
-            unsigned/KeySentry.exe
+            unsigned/KeySentry-x86.exe
             unsigned/KeySentry-x64.exe
           if-no-files-found: error
 
@@ -90,7 +90,7 @@ jobs:
 
       - name: 校验签名（必须 Valid 且主体为 SignPath Foundation）
         run: |
-          $targets = @('signed\KeySentry.exe', 'signed\KeySentry-x64.exe')
+          $targets = @('signed\KeySentry-x86.exe', 'signed\KeySentry-x64.exe')
           foreach ($f in $targets) {
             if (-not (Test-Path $f)) { throw "缺少已签名文件: $f" }
             $sig = Get-AuthenticodeSignature $f
@@ -101,7 +101,7 @@ jobs:
 
       - name: 生成 SHA-256 校验文件
         run: |
-          Get-FileHash signed\KeySentry.exe, signed\KeySentry-x64.exe -Algorithm SHA256 |
+          Get-FileHash signed\KeySentry-x86.exe, signed\KeySentry-x64.exe -Algorithm SHA256 |
             ForEach-Object { "{0}  {1}" -f $_.Hash, (Split-Path $_.Path -Leaf) } |
             Set-Content -Path signed\SHA256SUMS.txt -Encoding ascii
           Get-Content signed\SHA256SUMS.txt
@@ -111,7 +111,7 @@ jobs:
         with:
           name: signed-binaries
           path: |
-            signed/KeySentry.exe
+            signed/KeySentry-x86.exe
             signed/KeySentry-x64.exe
             signed/SHA256SUMS.txt
           if-no-files-found: error
@@ -123,7 +123,7 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           gh release create $tag `
-            signed\KeySentry.exe `
+            signed\KeySentry-x86.exe `
             signed\KeySentry-x64.exe `
             signed\SHA256SUMS.txt `
             --title $tag `
@@ -137,7 +137,7 @@ jobs:
 # ------------------------------------------------------------
 # <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
 #   <zip-file>
-#     <pe-file path="KeySentry.exe">
+#     <pe-file path="KeySentry-x86.exe">
 #       <authenticode-sign/>
 #     </pe-file>
 #     <pe-file path="KeySentry-x64.exe">

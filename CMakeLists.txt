@@ -43,9 +43,12 @@ target_compile_definitions(KeySentry PRIVATE
     NTDDI_VERSION=0x06010000
 )
 
-# 32 位为主输出（KeySentry.exe，Win7 SP1+ 全兼容）；64 位另名 KeySentry-x64.exe
+# 产物命名统一为 KeySentry-<架构>.exe：
+#   32 位 KeySentry-x86.exe（Win7 SP1+ 全兼容）、64 位 KeySentry-x64.exe
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set_target_properties(KeySentry PROPERTIES OUTPUT_NAME "KeySentry-x64")
+else()
+    set_target_properties(KeySentry PROPERTIES OUTPUT_NAME "KeySentry-x86")
 endif()
 
 if(MSVC)

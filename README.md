@@ -59,10 +59,10 @@
 
 | 文件 | 适用系统 |
 |------|---------|
-| `KeySentry.exe`（32 位，421KB）**推荐** | Windows 7 SP1 及更高（32/64 位通用） |
+| `KeySentry-x86.exe`（32 位，421KB）**推荐** | Windows 7 SP1 及更高（32/64 位通用） |
 | `KeySentry-x64.exe`（64 位，534KB） | Windows 10/11（64 位） |
 
-两版本功能完全一致，均无需安装任何运行库。不确定选哪个？直接下载 `KeySentry.exe` 即可。
+两版本功能完全一致，均无需安装任何运行库。不确定选哪个？直接下载 `KeySentry-x86.exe` 即可。
 
 ## 验证下载文件与安全说明
 
@@ -74,7 +74,7 @@
 **校验下载完整性（SHA-256）**：Releases 页面为每个文件附有 SHA-256 值，下载后可比对：
 
 ```powershell
-Get-FileHash .\KeySentry.exe -Algorithm SHA256
+Get-FileHash .\KeySentry-x86.exe -Algorithm SHA256
 ```
 
 ## 从源码构建
@@ -86,7 +86,7 @@ Get-FileHash .\KeySentry.exe -Algorithm SHA256
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
-# 产物位于 release\KeySentry.exe
+# 产物位于 release\KeySentry-x86.exe（64 位构建为 KeySentry-x64.exe）
 ```
 
 ## 使用注意事项
@@ -103,6 +103,7 @@ cmake --build build --config Release
 - 优化：默认透明度改为「低透明」；圆角消除锯齿、去除高光描边，改为平面风格；外观设置点「应用」后立即生效
 - 修复：输入迟滞/键盘响应缓慢甚至卡死，以及点「应用」后设置窗口卡死（跨进程窗口操作阻塞了承载键鼠钩子的 UI 线程）
 - 修复：窗口样式记录在异常退出后可能丢失、托盘告警被静默丢弃等稳定性问题
+- 优化：产物命名统一为 `KeySentry-<架构>.exe`（32 位 `KeySentry-x86.exe`、64 位 `KeySentry-x64.exe`）
 - 完整历史见 [README.txt](README.txt)
 
 ## 支持系统
