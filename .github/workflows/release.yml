@@ -1,0 +1,148 @@
+name: Release Build & SignPath 签名
+
+# ============================================================
+# 用途
+#   x86 / x64 全自动构建 -> 提交 SignPath Foundation 免费签名 -> 校验签名
+#   -> 生成 SHA-256 -> （标签触发时）创建 Release 草稿
+#
+# 前置条件（由仓库维护者在 GitHub / SignPath 各配置一次）
+#   1. 仓库需为公开仓库，且使用 OSI 认证协议（本项目 MIT）
+#   2. 所有维护者的 GitHub 账号需开启 MFA（SignPath 要求）
+#   3. SignPath Foundation 申请通过后：
+#      - 安装 SignPath GitHub App（github.com/apps/signpath）
+#      - 在 SignPath 建 Organization / Project / Signing Policy，
+#        并配置 Trusted Build System = GitHub.com 关联到该仓库
+#      - 创建 Artifact Configuration（内容见文件末尾注释）
+#      - 生成 API Token（需具备提交者权限）
+#   4. 仓库 Secrets（Settings → Secrets and variables → Actions）：
+#      SIGNPATH_API_TOKEN            SignPath API 令牌
+#      SIGNPATH_ORGANIZATION_ID      SignPath 组织 ID
+#      SIGNPATH_PROJECT_SLUG         SignPath 项目 slug
+#      SIGNPATH_SIGNING_POLICY_SLUG  SignPath 签名策略 slug
+#
+# 触发方式
+#   - 推送 v* 标签：构建 + 签名 + 校验 + 生成校验值 + 建 Release 草稿
+#   - 手动运行（workflow_dispatch）：仅构建 + 签名 + 校验，便于先验证流程
+#
+# 注意：SignPath 要求签名输入必须来自公开仓库 + GitHub 托管 runner 的构建，
+#       本地编译的产物不可用于签名，因此本流程在 CI 内完成构建与签名。
+# ============================================================
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# contents: write 用于创建 Release；actions: read 供 SignPath 读取工作流 artifact
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-sign-release:
+    # 固定 windows-2022：自带 VS 2022（生成器 "Visual Studio 17 2022"）+ MSVC v143，
+    # 满足 Win7 SP1 32 位兼容的硬性要求。
+    # 若该镜像日后退役，改用 windows-latest 并同步修改下面的 -G 生成器名称；
+    # 务必确认所用工具集仍为 v143，否则会失去 Windows 7 兼容性。
+    runs-on: windows-2022
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v5
+
+      - name: 构建 x86（Win32，主产物 KeySentry.exe）
+        run: |
+          cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32 -T v143
+          cmake --build build-x86 --config Release
+          New-Item -ItemType Directory -Force unsigned | Out-Null
+          Copy-Item release\KeySentry.exe unsigned\KeySentry.exe
+
+      - name: 构建 x64（产物 KeySentry-x64.exe）
+        run: |
+          cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64 -T v143
+          cmake --build build-x64 --config Release
+          Copy-Item release\KeySentry-x64.exe unsigned\KeySentry-x64.exe
+
+      - name: 上传未签名产物
+        id: upload-unsigned
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-binaries
+          path: |
+            unsigned/KeySentry.exe
+            unsigned/KeySentry-x64.exe
+          if-no-files-found: error
+
+      - name: 提交 SignPath 签名请求
+        id: signpath
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          # 每次签名需维护者人工审批；给足 30 分钟等待审批完成
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: signed
+
+      - name: 校验签名（必须 Valid 且主体为 SignPath Foundation）
+        run: |
+          $targets = @('signed\KeySentry.exe', 'signed\KeySentry-x64.exe')
+          foreach ($f in $targets) {
+            if (-not (Test-Path $f)) { throw "缺少已签名文件: $f" }
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host ("{0} -> {1} / {2}" -f $f, $sig.Status, $sig.SignerCertificate.Subject)
+            if ($sig.Status -ne 'Valid') { throw "签名无效: $f" }
+            if ($sig.SignerCertificate.Subject -notmatch 'SignPath Foundation') { throw "签名主体不符: $f" }
+          }
+
+      - name: 生成 SHA-256 校验文件
+        run: |
+          Get-FileHash signed\KeySentry.exe, signed\KeySentry-x64.exe -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash, (Split-Path $_.Path -Leaf) } |
+            Set-Content -Path signed\SHA256SUMS.txt -Encoding ascii
+          Get-Content signed\SHA256SUMS.txt
+
+      - name: 归档已签名产物（手动运行时也便于取回）
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-binaries
+          path: |
+            signed/KeySentry.exe
+            signed/KeySentry-x64.exe
+            signed/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: 创建 Release 草稿（仅标签触发；需人工确认后再发布）
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag `
+            signed\KeySentry.exe `
+            signed\KeySentry-x64.exe `
+            signed\SHA256SUMS.txt `
+            --title $tag `
+            --draft `
+            --generate-notes
+
+# ============================================================
+# 需在 SignPath 后台创建的 Artifact Configuration（XML 原文）
+# 说明：upload-artifact 默认把产物打成 ZIP，故根元素为 <zip-file>，
+#       路径对应 ZIP 内根目录下的两个 exe 文件名。
+# ------------------------------------------------------------
+# <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+#   <zip-file>
+#     <pe-file path="KeySentry.exe">
+#       <authenticode-sign/>
+#     </pe-file>
+#     <pe-file path="KeySentry-x64.exe">
+#       <authenticode-sign/>
+#     </pe-file>
+#   </zip-file>
+# </artifact-configuration>
+# ============================================================

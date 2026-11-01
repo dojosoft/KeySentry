@@ -62,7 +62,13 @@ static std::wstring g_iniPath;      // 配置文件（INI）路径
 static NOTIFYICONDATAW g_nid = {};  // 系统托盘图标数据结构
 static bool g_settingsOpen = false; // 设置对话框是否已打开
 static HWND g_settingsWnd = nullptr;   // 设置对话框窗口句柄
-static bool g_trayIconVisible = true;  // 托盘图标是否可见
+// 托盘图标是否可见。初值必须为 false：图标要等启动流程走到 AddTrayIcon 才真正添加，
+// 这期间产生的气泡提示若按"图标已存在"处理，会以 NIM_MODIFY 打到不存在的图标上被静默丢弃
+static bool g_trayIconVisible = false;
+// 托盘图标被老板键隐藏期间产生的气泡提示：气泡依附于图标，无图标时无法显示，
+// 先缓存下来，等图标恢复后再补发，避免"保护未生效"这类一次性告警被静默丢弃
+static std::wstring g_pendingTrayText;
+static bool g_pendingTrayWarning = false;
 static ULONGLONG g_lastCornerTick = 0; // 上次角落触发的时间戳，用于防抖
 static ULONGLONG g_lastAutoHideTry = 0; // 上次空闲自动隐藏尝试的时间戳（同上，防止无窗口时反复重试）
 static UINT g_msgTaskbarCreated = 0;  // TaskbarCreated 消息ID，用于 explorer 重启后恢复托盘图标
@@ -266,6 +272,14 @@ static void AddTrayIcon(HWND hwnd) {
     g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));  // 加载应用图标
     wcscpy_s(g_nid.szTip, APP_NAME);       // 鼠标悬停提示文字
     g_trayIconVisible = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
+    // 图标（重新）可见后补发此前被缓存的气泡提示（只保留最后一条，一次性告警不堆叠）
+    if (g_trayIconVisible && !g_pendingTrayText.empty()) {
+        std::wstring pending = g_pendingTrayText;
+        bool pendingWarning = g_pendingTrayWarning;
+        g_pendingTrayText.clear();
+        g_pendingTrayWarning = false;
+        ShowTrayNotification(pending, pendingWarning);
+    }
 }
 
 // ===== RemoveTrayIcon =====
@@ -277,20 +291,18 @@ static void RemoveTrayIcon() {
     }
 }
 
-// ===== ShowTrayIcon =====
-// 功能：重新显示系统托盘图标（在图标被系统资源管理器重启等情况隐藏后调用）
-static void ShowTrayIcon() {
-    if (!g_trayIconVisible) {
-        g_trayIconVisible = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
-    }
-}
-
 // ===== ShowTrayNotification =====
 // 功能：弹出托盘气泡通知（用于非阻塞式一次性提示）
 // 逻辑：复用已存在的托盘图标句柄，附加 NIF_INFO 后 NIM_MODIFY，
 //       随后恢复原 uFlags，避免影响后续托盘图标操作
 void ShowTrayNotification(const std::wstring& text, bool warning) {
-    if (!g_trayIconVisible) return;  // 无托盘图标时气泡无法显示
+    if (!g_trayIconVisible) {
+        // 气泡依附于托盘图标：启动早期图标尚未添加、或已移除时无处可显示，
+        // 缓存到最后一条，待图标重新添加（AddTrayIcon）后补发
+        g_pendingTrayText = text;
+        g_pendingTrayWarning = warning;
+        return;
+    }
     g_nid.uFlags = NIF_INFO;
     wcscpy_s(g_nid.szInfoTitle, APP_NAME);
     wcsncpy_s(g_nid.szInfo, text.c_str(), _TRUNCATE);
@@ -336,6 +348,49 @@ static void ForceNumLockOn() {
         keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);              // 按下 NumLock
         keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0); // 释放 NumLock
     }
+}
+
+// ===== NotifyExplorerSettingChanged =====
+// 功能：通知资源管理器刷新文件夹选项
+// 逻辑：只向资源管理器自己的顶层窗口发送 WM_SETTINGCHANGE，而不是 HWND_BROADCAST。
+//       广播的超时是按"每个顶层窗口"分别计的，遇到多个响应缓慢的第三方窗口会串行累加，
+//       在承载低级键鼠钩子的 UI 线程上表现为秒级卡顿；而这次变更实际只需要资源管理器知道。
+//       取不到资源管理器进程（未运行或被第三方外壳替换）时退化为小超时广播兜底。
+static void NotifyExplorerSettingChanged() {
+    const wchar_t* param = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
+
+    DWORD explorerPid = 0;
+    HWND shellWnd = GetShellWindow();
+    if (shellWnd) GetWindowThreadProcessId(shellWnd, &explorerPid);
+
+    if (explorerPid) {
+        struct Ctx {
+            DWORD pid;
+            const wchar_t* param;
+            ULONGLONG deadline;
+        } ctx = { explorerPid, param, GetTickCount64() + 150 };
+        // 整轮共享一次预算：预算耗尽后回调返回 FALSE 提前结束枚举，避免按窗口累加
+        auto sendToExplorer = [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != c->pid) return TRUE;
+            ULONGLONG now = GetTickCount64();
+            if (now >= c->deadline) return FALSE;
+            UINT timeout = (UINT)std::min<ULONGLONG>(150, c->deadline - now);
+            DWORD_PTR result = 0;
+            SendMessageTimeoutW(hwnd, WM_SETTINGCHANGE, 0, (LPARAM)c->param,
+                                SMTO_ABORTIFHUNG, timeout, &result);
+            return TRUE;
+        };
+        EnumWindows(sendToExplorer, reinterpret_cast<LPARAM>(&ctx));
+        return;
+    }
+
+    // 兜底：资源管理器未运行（例如被替换成第三方外壳）时仍广播，超时压到最小
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)param,
+                        SMTO_ABORTIFHUNG, 50, &result);
 }
 
 // ===== ApplyExplorerSettings =====
@@ -389,12 +444,8 @@ static void ApplyExplorerSettings() {
     // 注意：不使用 "Policy"（会被识别为组策略变更，非管理员权限时可能被 Explorer 忽略）
     // 改用注册表子键路径作为通知参数，并配合 SHChangeNotify 确保非管理员也能生效
     if (changed) {
-        DWORD_PTR dwResult = 0;
-        // 超时按每个顶层窗口分别计算，取值需足够小：遇到多个无响应窗口时
-        // 若沿用较长超时会串行累加，导致启动/点击"应用"时明显卡顿
-        SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
-                            (LPARAM)L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-                            SMTO_ABORTIFHUNG, 150, &dwResult);
+        // 只通知资源管理器自己的窗口，避免向全系统广播造成按窗口累加的超时阻塞
+        NotifyExplorerSettingChanged();
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     }
 }
@@ -543,6 +594,24 @@ static void AddHotkeyConflict(std::wstring& conflicts, const wchar_t* prefix, UI
         conflicts += detail;
     }
     conflicts += L"\n";
+}
+
+// ===== ShowAppMessage =====
+// 功能：显示应用级提示框，保证用户一定看得见、可操作
+// 背景：主窗口 g_mainWnd 常驻隐藏（仅用于接收消息）。以它作为 MessageBox 的
+//       owner 时，对话框会按不可见窗口的位置摆放，可能落到屏幕外或被其他窗口
+//       遮挡；其模态循环还会让设置对话框等本线程窗口全部无法接收输入，表现为
+//       "点击应用后设置窗口卡死、整机操作迟滞"。
+// 因此：优先挂到当前可见的设置对话框上；否则以无 owner + 强制置前/置顶显示
+// 返回值：与 MessageBox 相同（IDOK / IDYES / IDNO ...），便于需要分支的确认框复用
+static int ShowAppMessage(const std::wstring& text, UINT flags = MB_OK | MB_ICONWARNING,
+                          const wchar_t* caption = APP_NAME) {
+    HWND owner = nullptr;
+    if (g_settingsWnd && IsWindow(g_settingsWnd) && IsWindowVisible(g_settingsWnd)) {
+        owner = g_settingsWnd;  // 应用设置时以设置对话框为 owner，位置与层级正常
+    }
+    return (int)MessageBoxW(owner, text.c_str(), caption,
+                            flags | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
 // ===== PreCheckHotkeyConflicts =====
@@ -744,8 +813,7 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
 
     // 恢复失败时提示用户，避免热键静默失效且用户无感知
     if (restoreFailed) {
-        MessageBoxW(g_mainWnd, L"部分已生效的热键在冲突检测后未能重新注册，\n请重启程序或重新应用设置。",
-                    APP_NAME, MB_OK | MB_ICONWARNING);
+        ShowAppMessage(L"部分已生效的热键在冲突检测后未能重新注册，\n请重启程序或重新应用设置。");
     }
 
     return conflicts;
@@ -755,11 +823,14 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
 // 功能：热键注册失败提示（内容相同只提示一次）
 // 逻辑：ApplyConfig 在每次点击"应用/确定"时都会执行，若某热键被其他程序长期占用，
 //       反复弹窗会造成困扰；仅在提示内容发生变化时再次弹窗
+//       全部热键注册成功时会清空 g_lastHotkeyWarning（见 ApplyConfig），
+//       避免"曾经冲突过"的同一提示永久静默
+static std::wstring g_lastHotkeyWarning;
+
 static void WarnHotkeyOnce(const std::wstring& msg) {
-    static std::wstring lastWarned;
-    if (msg == lastWarned) return;
-    lastWarned = msg;
-    MessageBoxW(g_mainWnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
+    if (msg == g_lastHotkeyWarning) return;
+    g_lastHotkeyWarning = msg;
+    ShowAppMessage(msg);
 }
 
 // ===== ApplyConfig =====
@@ -771,6 +842,11 @@ static void ApplyConfig() {
     g_hook.SetShowOverlay(g_config.showLockKeyOverlay);            // 是否显示锁定键状态提示
     g_hook.SetShowMuteOverlay(g_config.showMuteOverlay);           // 是否显示静音状态提示
     g_overlay.SetPrimaryOnly(g_config.overlayPrimaryOnly);         // 提示是否仅在主显示器显示
+    g_overlay.SetAppearance(g_config.overlayPosition, g_config.overlayTheme,
+                            g_config.overlayCorner, g_config.overlayOpacity,
+                            g_config.overlayDelay);  // 浮窗位置/主题/边框/透明度/延时
+    // 两项提示都关闭时主动收起浮层，否则"保持显示"档位下已显示的浮层会一直留在屏幕上
+    if (!g_config.showLockKeyOverlay && !g_config.showMuteOverlay) g_overlay.HideAll();
     g_hook.SetDisableSpecifiedKeysEnabled(g_config.disableSpecifiedKeysEnabled);  // 是否启用禁用指定按键
     g_hook.SetDisableNumLock(g_config.disableNumLock);             // 是否禁用 NumLock 切换
     g_hook.SetForceInsertMode(g_config.forceInsertMode);           // 是否强制 Insert 模式
@@ -787,7 +863,7 @@ static void ApplyConfig() {
         static bool hookWarned = false;
         if (!g_hook.Install(g_mainWnd) && !hookWarned) {
             hookWarned = true;
-            MessageBoxW(g_mainWnd, L"键盘钩子安装失败，部分功能可能不可用。\n请检查是否有安全软件拦截。", APP_NAME, MB_OK | MB_ICONWARNING);
+            ShowAppMessage(L"键盘钩子安装失败，部分功能可能不可用。\n请检查是否有安全软件拦截。");
         }
     } else {
         g_hook.Uninstall();
@@ -825,6 +901,9 @@ static void ApplyConfig() {
         UnregisterHotKey(g_mainWnd, CUSTOM_HOTKEY_ID_START + (int)i);  // 注销所有自定义热键
     }
 
+    // 本轮所有热键是否都注册成功：成功则复位提示状态（冲突解决后再出现仍要提示）
+    bool hotkeyAllOk = true;
+
     // 注册窗口隐藏热键（老板键）
     // 兜底：mod/vk 为 0 时不注册，避免手改 INI 产生的裸键全局劫持普通按键
     if (g_config.bossKeyEnabled && g_config.bossKeyMod != 0 && g_config.bossKeyVK != 0) {
@@ -832,6 +911,7 @@ static void ApplyConfig() {
         if (!g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, bossMod, g_config.bossKeyVK)) {
             if (!g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, g_config.bossKeyMod, g_config.bossKeyVK)) {
                 // 启动路径没有热键冲突预检，注册失败必须提示，否则用户会以为热键已生效
+                hotkeyAllOk = false;
                 WarnHotkeyOnce(L"窗口隐藏热键注册失败，可能被其他程序占用。\n仍可通过鼠标按键或屏幕角落触发。");
             }
         }
@@ -845,6 +925,7 @@ static void ApplyConfig() {
         UINT closeMod = g_config.bossKeyCloseMod | MOD_NOREPEAT;
         if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, closeMod, g_config.bossKeyCloseVK)) {
             if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, g_config.bossKeyCloseMod, g_config.bossKeyCloseVK)) {
+                hotkeyAllOk = false;
                 WarnHotkeyOnce(L"关闭热键注册失败，可能被其他程序占用");
             }
         }
@@ -867,6 +948,7 @@ static void ApplyConfig() {
         }
     }
     if (!failedHotkeys.empty()) {
+        hotkeyAllOk = false;
         std::wstring msg = L"以下自定义热键注册失败，可能与其他热键或程序冲突：\n";
         size_t showCount = std::min(failedHotkeys.size(), (size_t)10);
         for (size_t i = 0; i < showCount; ++i) msg += L"• " + failedHotkeys[i] + L"\n";
@@ -875,6 +957,10 @@ static void ApplyConfig() {
         }
         WarnHotkeyOnce(msg);
     }
+
+    // 全部注册成功：复位提示状态，使同一冲突在解决后又出现时仍会提示，
+    // 不会因为"本进程曾经提示过"而永久静默
+    if (hotkeyAllOk) g_lastHotkeyWarning.clear();
 
     // --- 老板键附加功能配置 ---
     g_bossKey.SetMuteEnabled(g_config.bossKeyMute);                  // 隐藏窗口时是否同时静音
@@ -887,7 +973,7 @@ static void ApplyConfig() {
         static bool mouseHookWarned = false;
         if (!g_bossKey.InstallMouseHook(g_mainWnd) && !mouseHookWarned) {
             mouseHookWarned = true;
-            MessageBoxW(g_mainWnd, L"鼠标钩子安装失败，鼠标侧键触发老板键可能不可用。\n请检查是否有安全软件拦截。", APP_NAME, MB_OK | MB_ICONWARNING);
+            ShowAppMessage(L"鼠标钩子安装失败，鼠标侧键触发老板键可能不可用。\n请检查是否有安全软件拦截。");
         }
         g_bossKey.UpdateMouseHookSettings(
             g_config.bossKeyMiddleButton,
@@ -935,11 +1021,10 @@ static void ApplySettingsCallback() {
     if (!g_config.Save(g_iniPath)) {
         if (!saveFailedWarned) {
             saveFailedWarned = true;
-            MessageBoxW(g_mainWnd,
-                        (L"设置无法写入配置文件：\n" + g_iniPath +
-                         L"\n\n本次设置仅在当前运行期间生效，重启后可能丢失。\n"
-                         L"请检查该目录是否只读、磁盘是否已满。").c_str(),
-                        APP_NAME, MB_OK | MB_ICONWARNING);
+            std::wstring text = L"设置无法写入配置文件：\n" + g_iniPath +
+                                L"\n\n本次设置仅在当前运行期间生效，重启后可能丢失。\n"
+                                L"请检查该目录是否只读、磁盘是否已满。";
+            ShowAppMessage(text);
         }
     } else {
         saveFailedWarned = false;
@@ -1186,7 +1271,7 @@ void ShowAboutDialog(HWND parent) {
     SendMessageW(titleCtrl, WM_SETFONT, (WPARAM)fontTitle.get(), TRUE);
 
     // 版本号
-    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v1.40.0.1027",
+    HWND verCtrl = CreateWindowExW(0, L"STATIC", L"v2.0.0.1101",
                                      WS_CHILD | WS_VISIBLE | SS_LEFT,
                                      ScaleUi(80), ScaleUi(55), ScaleUi(260), ScaleUi(24),
                                      hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1396,7 +1481,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // 若配置了运行前确认，弹出确认对话框
                     if (hk.confirmBeforeRun) {
                         std::wstring confirmMsg = L"确定要执行: " + hk.DisplayName() + L" ?";
-                        if (MessageBoxW(hwnd, confirmMsg.c_str(), L"确认", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                        // 走 ShowAppMessage：确认框必须置前/置顶，否则从全屏程序里触发时
+                        // 会被前台窗口盖住，UI 线程停在看不到的模态循环里，表现为"热键没反应"
+                        if (ShowAppMessage(confirmMsg, MB_YESNO | MB_ICONQUESTION, L"确认") != IDYES)
                             return 0;
                     }
 
@@ -1455,7 +1542,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (result <= 32) {
                             // ShellExecute 返回值 <= 32 表示执行失败
                             std::wstring errMsg = L"执行失败: " + hk.command;
-                            MessageBoxW(hwnd, errMsg.c_str(), L"错误", MB_OK | MB_ICONERROR);
+                            ShowAppMessage(errMsg, MB_OK | MB_ICONERROR, L"错误");
                         }
                     }
                 }
@@ -1566,7 +1653,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // 否则全局 g_bossKey 的析构会在 COM 已反初始化的线程上 Release
         g_bossKey.ReleaseAudio();
         g_winDGuard.Cleanup();
-        if (!g_trayIconVisible) ShowTrayIcon();  // 确保托盘图标可见后再移除
+        // 直接删除：若图标已被老板键隐藏，托盘区本就没有条目，无需先补加再删
         RemoveTrayIcon();
         g_overlay.Destroy();  // 销毁悬浮提示窗口
         PostQuitMessage(0);   // 发送退出消息，结束消息循环

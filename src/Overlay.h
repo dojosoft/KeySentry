@@ -31,6 +31,16 @@ public:
     bool GetAudioState(bool& isMuted, int& volumeLevel);
     // 设置是否仅在主显示器显示浮层
     void SetPrimaryOnly(bool primaryOnly);
+    // 设置浮层外观与显示时长：
+    //   position 0=底部(默认) 1=顶部 2=居中 3=左侧 4=右侧
+    //   theme    0=深色(默认) 1=浅色
+    //   corner   0=直角 1=圆角(默认)
+    //   opacity  0=高透明 1=适中 2=低透明(默认) 3=不透明
+    //   delay    0=快速(0.5s) 1=适中(1s，默认) 2=缓慢(2s) 3=保持显示
+    void SetAppearance(int position, int theme, int corner, int opacityLevel, int delayLevel);
+    // 立即收起所有浮层：两项提示都关闭时调用，
+    // 否则"保持显示"档位下已显示的浮层不会自动消失
+    void HideAll();
 
 private:
     // 浮层窗口过程
@@ -38,6 +48,25 @@ private:
 
     // 创建单个浮层窗口
     HWND CreateOverlayWnd();
+    // 依据主题重建背景相关画刷
+    void RecreateBrushes();
+    // 将浮层内容渲染到 32 位离屏位图，并以逐像素透明度提交（圆角边缘抗锯齿）
+    void Render(HWND hwnd, int w, int h);
+    // 按当前内容与尺寸立即渲染所有浮层窗口（仅内容/尺寸变化时调用）
+    void RenderNow();
+    // 在指定 DC 上绘制浮层内容（背景、边框、图标与文字）
+    void PaintContent(HDC hdc, int w, int h);
+    // 重建离屏缓冲（尺寸变化时）
+    bool EnsureBackBuffer(int w, int h);
+    // 释放离屏缓冲
+    void DestroyBackBuffer();
+    // 依据位置设置计算浮层在指定工作区内的左上角坐标
+    void ComputePosition(const RECT& rcWork, int ovW, int ovH, int* x, int* y) const;
+    // 主题相关颜色
+    COLORREF BorderColor() const;
+    COLORREF LabelColor() const;
+    COLORREF DimColor() const;
+    COLORREF VolumeTextColor() const;
     // 获取目标显示器列表（根据 primaryOnly 设置）
     std::vector<HMONITOR> GetTargetMonitors();
     // 确保浮层窗口数量足够（每个显示器一个）
@@ -59,6 +88,18 @@ private:
     int m_audioVolume = 0;          // 当前音量百分比
     bool m_showMuteOverlay = false; // 是否显示静音浮层（而非锁键浮层）
     bool m_primaryOnly = false;     // 是否仅在主显示器显示
+    int m_position = 0;             // 浮层位置（0=底部 1=顶部 2=居中 3=左侧 4=右侧）
+    int m_theme = 0;                // 主题（0=深色 1=浅色）
+    int m_corner = 1;               // 边框（0=直角 1=圆角）
+    int m_alpha = OVERLAY_ALPHA_LOW_TRANSPARENCY; // 当前浮层不透明度（0-255），默认低透明档
+    int m_showDurationMs = 1000;    // 浮层显示时长（毫秒）；0 表示保持显示不自动隐藏
+    // 离屏渲染缓冲：逐像素透明度需要 32 位 DIB，尺寸随浮层变化重建
+    HDC m_memDC = nullptr;
+    HBITMAP m_memBmp = nullptr;
+    HBITMAP m_memOldBmp = nullptr;
+    void* m_memBits = nullptr;
+    int m_memW = 0;
+    int m_memH = 0;
     HINSTANCE m_hInst = nullptr;    // 应用实例句柄
     ULONGLONG m_lastShowTick = 0;   // 上次真正显示浮层的时刻（用于连发去抖）
     // 缓存的音频设备枚举器：MMDeviceEnumerator 可复用，避免每次查询都 CoCreateInstance
@@ -72,10 +113,15 @@ private:
 
     // --- 浮层尺寸和布局常量 ---
     static const int OVERLAY_SIZE = 130;              // 浮层宽度和高度（像素）
-    static const int OVERLAY_ALPHA = 170;             // 浮层透明度（0-255）
-    static const int OVERLAY_SHOW_DURATION_MS = 1000; // 浮层显示持续时间（毫秒）
+    static const int OVERLAY_ALPHA = 170;             // 浮层不透明度（0-255），适中档
+    static const int OVERLAY_ALPHA_TRANSPARENT = 110; // 高透明档
+    static const int OVERLAY_ALPHA_LOW_TRANSPARENCY = 225; // 低透明档
+    static const int OVERLAY_CORNER_RADIUS = 16;      // 圆角半径（Mac 风格）
+    static const int OVERLAY_DURATION_FAST_MS = 500;  // 快速档显示时长
+    static const int OVERLAY_DURATION_MEDIUM_MS = 1000; // 适中档显示时长
+    static const int OVERLAY_DURATION_SLOW_MS = 2000; // 缓慢档显示时长
     static const int OVERLAY_KEY_HEIGHT = 98;         // 锁键浮层高度（比静音浮层矮）
-    static const int OVERLAY_BOTTOM_MARGIN = 50;      // 浮层距屏幕底部的边距
+    static const int OVERLAY_BOTTOM_MARGIN = 50;      // 浮层距屏幕边缘的留空距离（各位置通用）
     // 连发去抖：距上次真正显示不足该毫秒数的重复通知直接丢弃，
     // 防止按键连发时高频置顶重绘（浮层闪烁、任务栏卡顿）
     static const ULONGLONG OVERLAY_MIN_REPEAT_MS = 80;

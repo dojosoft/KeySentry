@@ -377,6 +377,11 @@ struct AppConfig {
     bool showLockKeyOverlay = true;       // 显示锁键状态浮层
     bool showMuteOverlay = false;         // 显示静音状态浮层
     bool overlayPrimaryOnly = false;      // 仅在主显示器显示浮层
+    int overlayPosition = 0;              // 浮窗位置：0=底部 1=顶部 2=居中 3=左侧 4=右侧
+    int overlayTheme = 0;                 // 浮窗颜色：0=深色 1=浅色
+    int overlayCorner = 1;                // 浮窗边框：0=直角 1=圆角（默认）
+    int overlayOpacity = 2;               // 浮窗透明度：0=高透明 1=适中 2=低透明(默认) 3=不透明
+    int overlayDelay = 1;                 // 浮窗延时：0=快速(0.5s) 1=适中(1s) 2=缓慢(2s) 3=保持显示
     bool forceNumLockOn = false;          // 强制开启 NumLock
     bool disableStartupNotification = false; // 禁用启动通知
     // 资源管理器文件夹选项（0=不改变, 1=开启隐藏, 2=关闭隐藏即显示）

@@ -13,6 +13,21 @@ WinDGuard::WinDGuard() = default;
 // 每轮都调用 SWP_FRAMECHANGED 会让标题栏反复闪烁
 static const ULONGLONG STYLE_FIX_INTERVAL_MS = 15000;
 
+// 一次"应用/禁用守护"中，跨进程样式探测允许消耗的总时间上限。
+// 逐个窗口各等 100ms 会累加成 N × 100ms，匹配窗口较多时足以让
+// 承载低级键鼠钩子的 UI 线程出现可感知的迟滞，因此整轮共享一个预算
+static const ULONGLONG TOUCH_BUDGET_MS = 200;
+
+// 上次运行遗留、本轮未能恢复的样式记录（见 WinDGuard.h 声明说明）。
+// 定义为静态函数：RecoverOrphanedStyles 是静态函数，读文件时还没有可用的实例状态。
+// 内部数据放在堆上且从不释放——进程退出时 ~WinDGuard 会经 RemoveLock 落盘，
+// 而静态对象在不同翻译单元之间的析构顺序并无保证，用普通静态 vector
+// 可能在落盘时已被销毁
+std::vector<WinDGuard::LockedWindow>& WinDGuard::OrphanRecords() {
+    static auto* records = new std::vector<LockedWindow>();
+    return *records;
+}
+
 WinDGuard::~WinDGuard() {
     RemoveLock();
 }
@@ -73,6 +88,39 @@ namespace {
             ShowWindow(hwnd, showCmd);
         }
     }
+
+    // 能否安全地修改该窗口的样式（SetWindowLongPtrW 的 GWL_STYLE）。
+    // 说明：SetWindowLongPtrW 修改样式时窗口管理器会向目标窗口发送
+    //       WM_STYLECHANGING / WM_STYLECHANGED，对别的进程来说就是一次
+    //       同步的跨线程等待。目标进程繁忙（未响应的浏览器、游戏、脚本窗口）
+    //       时，承载低级键鼠钩子的 UI 线程会一起被挂住，表现为全系统输入迟滞。
+    //       因此改动前先做一次有界探测：100ms 内无响应就跳过本次修改，
+    //       交给下一轮定时检查重试，而不是冒险阻塞。
+    // accessDenied：回填是否因权限不足（提权窗口受 UIPI 限制）被拒绝——
+    //       这属于永久失败而非暂时繁忙，调用方据此保留"保护未生效"的提示
+    // deadline：整轮探测的总时间上限（0 表示不限）。预算用尽时直接放弃本次探测，
+    // 由调用方在下一轮重试，避免多个窗口的超时累加成秒级阻塞
+    bool CanTouchWindow(HWND hwnd, bool* accessDenied = nullptr, UINT timeoutMs = 100,
+                        ULONGLONG deadline = 0) {
+        if (accessDenied) *accessDenied = false;
+        if (!IsWindow(hwnd)) return false;
+        if (!IsForeignWindow(hwnd)) return true;  // 同进程窗口：直接修改，不会跨线程等待
+        if (IsWindowHung(hwnd)) return false;
+        UINT timeout = timeoutMs;
+        if (deadline) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) return false;
+            ULONGLONG remain = deadline - now;
+            if (remain < (ULONGLONG)timeout) timeout = (UINT)remain;
+        }
+        SetLastError(0);
+        DWORD_PTR result = 0;
+        if (SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, timeout, &result) != 0) {
+            return true;
+        }
+        if (accessDenied && GetLastError() == ERROR_ACCESS_DENIED) *accessDenied = true;
+        return false;
+    }
 }
 
 // ============================================================
@@ -109,13 +157,40 @@ std::wstring WinDGuard::GetLockFilePath() {
 }
 
 void WinDGuard::SaveLockFile() {
-    if (m_lockedWindows.empty()) {
+    // 先清掉已失效的孤儿记录（窗口已销毁或句柄被复用），避免记录文件无限增长
+    std::vector<LockedWindow>& orphans = OrphanRecords();
+    orphans.erase(
+        std::remove_if(orphans.begin(), orphans.end(),
+            [](const LockedWindow& lw) {
+                if (!IsWindow(lw.hwnd)) return true;
+                DWORD wpid = 0;
+                GetWindowThreadProcessId(lw.hwnd, &wpid);
+                return wpid != lw.processId;
+            }),
+        orphans.end());
+
+    // 合并"本次运行锁定的窗口"与"上次运行遗留、本轮未能恢复的窗口"。
+    // 后者若不同时落盘，一次 SaveLockFile 就会把它覆盖掉，
+    // 这些窗口的原始样式（最小化按钮）随之永久丢失，下次启动再也无法恢复
+    std::vector<LockedWindow> merged = orphans;
+    merged.reserve(merged.size() + m_lockedWindows.size());
+    for (const auto& lw : m_lockedWindows) {
+        auto dup = std::find_if(merged.begin(), merged.end(),
+                                [&lw](const LockedWindow& o) { return o.hwnd == lw.hwnd; });
+        if (dup != merged.end()) {
+            *dup = lw;      // 同一窗口已被本轮锁定：以本轮（含沿用过来的原始样式）记录为准
+        } else {
+            merged.push_back(lw);
+        }
+    }
+
+    if (merged.empty()) {
         ClearLockFile();
         return;
     }
 
     std::string content;
-    for (const auto& lw : m_lockedWindows) {
+    for (const auto& lw : merged) {
         char line[128] = {};
         snprintf(line, sizeof(line), "%lu\t%llu\t%lld\t%lld\n",
                  (unsigned long)lw.processId,
@@ -162,6 +237,12 @@ int WinDGuard::RecoverOrphanedStyles(bool removeFile) {
 
     size_t pos = 0;
     int repaired = 0;
+    // 本轮无法恢复的记录（目标无响应）先收集到类级存储，随后与普通记录一起
+    // 落盘，保证下次启动还能继续恢复
+    OrphanRecords().clear();
+    // 有窗口未响应而被跳过恢复：此时必须保留落盘记录，下次启动继续恢复，
+    // 否则样式会永久残留在这批窗口上
+    bool skipped = false;
     while (pos < data.size()) {
         size_t eol = data.find('\n', pos);
         if (eol == std::string::npos) eol = data.size();
@@ -189,7 +270,31 @@ int WinDGuard::RecoverOrphanedStyles(bool removeFile) {
         // 恢复 WS_MINIMIZEBOX（仅当原本有、当前没有时）
         LONG_PTR curStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
         bool needMinimizeBox = ((origStyle & WS_MINIMIZEBOX) != 0) && ((curStyle & WS_MINIMIZEBOX) == 0);
+        // 跨进程改样式会同步等待目标窗口响应：目标繁忙时跳过改样式，
+        // 由下次启动继续恢复（记录文件不删除）。但"取消置顶"是异步投递，
+        // 不依赖目标响应，所以不能跟着一起跳过，否则该窗口在本次运行期间
+        // 会一直保持上次残留的置顶状态
+        bool styleSkipped = false;
         if (needMinimizeBox) {
+            bool accessDenied = false;
+            if (!CanTouchWindow(hwnd, &accessDenied)) {
+                styleSkipped = true;
+                // 权限不足（提权窗口受 UIPI 限制）是永久失败，重试也不会成功：
+                // 不保留记录，否则孤儿条目会一直留在 .wguard 里、每次启动都白做一次探测
+                if (!accessDenied) {
+                    skipped = true;
+                    // 保留真正的原始样式：窗口当前已没有 WS_MINIMIZEBOX（上次运行残留），
+                    // 若只把"现状"记进新列表，后续 RemoveLock 不会恢复最小化按钮
+                    LockedWindow orphan;
+                    orphan.hwnd = hwnd;
+                    orphan.originalStyle = origStyle;
+                    orphan.originalExStyle = origExStyle;
+                    orphan.processId = pid;
+                    OrphanRecords().push_back(orphan);
+                }
+            }
+        }
+        if (needMinimizeBox && !styleSkipped) {
             // SetWindowLongPtr 返回 0 且 GetLastError 非 0 才算失败（UIPI 拦截提权窗口等），
             // 失败时不能计入"已修复"，否则提示数量会虚高
             SetLastError(0);
@@ -204,16 +309,18 @@ int WinDGuard::RecoverOrphanedStyles(bool removeFile) {
         if (needUntopmost) {
             SetWindowPosSafe(hwnd, HWND_NOTOPMOST,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        } else if (needMinimizeBox) {
+        } else if (needMinimizeBox && !styleSkipped) {
             SetWindowPosSafe(hwnd, nullptr,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
-        if (needUntopmost || needMinimizeBox) repaired++;
+        // styleSkipped 的窗口本轮并未真正恢复，不计入"已修复"数量
+        if (needUntopmost || (needMinimizeBox && !styleSkipped)) repaired++;
     }
 
     // 恢复动作全部完成后再删除记录文件：若恢复到一半再次异常退出，
-    // 文件仍保留，下次启动可继续恢复剩余窗口，避免样式永久残留
-    if (removeFile) DeleteFileW(path.c_str());
+    // 文件仍保留，下次启动可继续恢复剩余窗口，避免样式永久残留；
+    // 若本轮有窗口因无响应被跳过，同样保留记录
+    if (removeFile && !skipped) DeleteFileW(path.c_str());
     return repaired;
 }
 
@@ -262,24 +369,41 @@ static BOOL CALLBACK EnumAllTopLevelWindowsProc(HWND hwnd, LPARAM lParam) {
 //   2. 将窗口设为置顶
 //   3. 移除 WS_MINIMIZEBOX 样式（禁止最小化）
 // ============================================================
-void WinDGuard::LockWindow(HWND hwnd, DWORD pid) {
+void WinDGuard::LockWindow(HWND hwnd, DWORD pid, ULONGLONG deadline) {
     // 避免重复锁定（句柄被复用时进程 ID 会不同，需继续按新窗口处理）
     for (const auto& lw : m_lockedWindows) {
         if (lw.hwnd == hwnd && lw.processId == pid) return;
     }
 
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    LONG_PTR curStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR curExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    LONG_PTR origStyle = curStyle;
+    LONG_PTR origExStyle = curExStyle;
+
+    // 该窗口可能是上次运行锁定、本轮又因无响应未能恢复的：必须沿用记录中的
+    // 真正原始样式，否则会把"最小化按钮已被移除"的现状当成原始状态，
+    // 之后 RemoveLock 不再恢复最小化按钮，样式永久残留
+    std::vector<LockedWindow>& orphans = OrphanRecords();
+    auto orphan = std::find_if(orphans.begin(), orphans.end(),
+                               [hwnd, pid](const LockedWindow& o) {
+                                   return o.hwnd == hwnd && o.processId == pid;
+                               });
+    if (orphan != orphans.end()) {
+        origStyle = orphan->originalStyle;
+        origExStyle = orphan->originalExStyle;
+        orphans.erase(orphan);   // 已转入本轮正式记录，避免重复落盘
+    }
 
     LockedWindow lw;
     lw.hwnd = hwnd;
-    lw.originalStyle = style;
-    lw.originalExStyle = exStyle;
+    lw.originalStyle = origStyle;
+    lw.originalExStyle = origExStyle;
     lw.processId = pid;
     m_lockedWindows.push_back(lw);
 
-    // 目标无响应时跳过窗口操作，留给下一轮定时检查重试；
-    // 样式修改本身是内核操作，不会阻塞，仍先记录原始样式
+    // 目标无响应时跳过窗口操作，留给下一轮定时检查重试。
+    // 注意：跨进程 SetWindowLongPtrW 会向目标窗口发送 WM_STYLECHANGING/WM_STYLECHANGED，
+    // 属于同步等待，目标繁忙时必须一起跳过；原始样式先记录（只读内核操作，不会阻塞）
     bool hung = IsWindowHung(hwnd);
 
     // 设为置顶窗口（跨进程异步投递，避免拖住钩子线程；
@@ -290,21 +414,28 @@ void WinDGuard::LockWindow(HWND hwnd, DWORD pid) {
 
     // 移除最小化按钮并刷新窗口框架
     bool minimizeOk = true;
-    if (style & WS_MINIMIZEBOX) {
-        SetLastError(0);
-        LONG_PTR prev = SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_MINIMIZEBOX);
-        // SetWindowLongPtrW 失败返回 0，需用 GetLastError 区分"返回值恰为 0"与"调用失败"
-        minimizeOk = (prev != 0) || (GetLastError() == 0);
-        // 仅刷新框架，不改变 Z-order（上一步已设为 TOPMOST）
-        if (!hung) {
-            SetWindowPosSafe(hwnd, nullptr,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (curStyle & WS_MINIMIZEBOX) {
+        // 有界探测只在真正要改样式时做，避免每次锁定都白等一轮超时；
+        // accessDenied 用于区分"权限不足（永久失败）"与"暂时繁忙（下一轮重试）"
+        bool accessDenied = false;
+        bool canTouch = CanTouchWindow(hwnd, &accessDenied, 100, deadline);
+        if (canTouch) {
+            SetLastError(0);
+            LONG_PTR prev = SetWindowLongPtrW(hwnd, GWL_STYLE, curStyle & ~WS_MINIMIZEBOX);
+            // SetWindowLongPtrW 失败返回 0，需用 GetLastError 区分"返回值恰为 0"与"调用失败"
+            minimizeOk = (prev != 0) || (GetLastError() == 0);
+            // 仅刷新框架，不改变 Z-order（上一步已设为 TOPMOST）
+            if (!hung) {
+                SetWindowPosSafe(hwnd, nullptr,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
         }
-    }
 
-    // 保护未真正生效时提示一次，避免用户误以为已置顶/已禁止最小化。
-    // 置顶走异步投递无法拿到结果，故只以样式修改结果作为判据
-    if (!hung && !minimizeOk) WarnLockFailedOnce();
+        // 保护未真正生效时提示一次，避免用户误以为已置顶/已禁止最小化。
+        // 置顶走异步投递无法拿到结果，故只以样式修改结果作为判据；
+        // 提权窗口（权限不足）属于永久失败要提示，因目标暂时繁忙而跳过的窗口不提示
+        if (!hung && (accessDenied || (canTouch && !minimizeOk))) WarnLockFailedOnce();
+    }
 }
 
 // ============================================================
@@ -317,8 +448,9 @@ void WinDGuard::ReLockWindow(LockedWindow& lw) {
     DWORD wpid = 0;
     GetWindowThreadProcessId(lw.hwnd, &wpid);
     if (wpid != lw.processId) return;
-    // 目标无响应时跳过本轮，下一轮定时检查再试：
-    // ShowWindow / SetWindowPos 会同步等待目标线程，可能卡死承载钩子的 UI 线程
+    // 无响应窗口跳过本轮（IsHungAppWindow 是廉价内核查询，不发消息）。
+    // 恢复最小化/重新置顶走的是 SWP_ASYNCWINDOWPOS 异步投递，本就不会阻塞；
+    // 唯一可能同步等待目标的只有下面那次跨进程改样式，因此把有界探测放在那里
     if (IsWindowHung(lw.hwnd)) return;
 
     bool wasMinimized = IsIconic(lw.hwnd);
@@ -336,8 +468,11 @@ void WinDGuard::ReLockWindow(LockedWindow& lw) {
     bool minimizeBoxRestored = (currentStyle & WS_MINIMIZEBOX) != 0;
 
     if (minimizeBoxRestored) {
-        // 重新移除最小化按钮：SetWindowLongPtrW 不发送窗口消息、不会引起闪烁，
-        // 必须每次都执行；否则退避期间保护会失效，最小化按钮重新出现
+        // 重新移除最小化按钮：样式位修改本身不会引起重绘（只有
+        // SWP_FRAMECHANGED 才会让标题栏闪烁），必须每次都执行；
+        // 否则退避期间保护会失效，最小化按钮重新出现。
+        // 跨进程改样式是同步等待：目标繁忙时跳过本轮，交给下一轮定时检查
+        if (!CanTouchWindow(lw.hwnd)) return;
         SetWindowLongPtrW(lw.hwnd, GWL_STYLE, currentStyle & ~WS_MINIMIZEBOX);
 
         // 只有重绘框架（SWP_FRAMECHANGED）才会让标题栏闪烁，因此仅对它做退避：
@@ -371,16 +506,19 @@ void WinDGuard::ApplyLock() {
     EnumWindows(EnumAllTopLevelWindowsProc, reinterpret_cast<LPARAM>(&allWindows));
 
     ProcessUtils::PathCache cache;  // 单次枚举内复用进程路径，避免相同 pid 重复查询
+    // 整轮共享一次探测预算：逐个窗口各等 100ms 会累加，窗口较多时阻塞 UI 线程
+    ULONGLONG deadline = GetTickCount64() + TOUCH_BUDGET_MS;
     for (HWND hwnd : allWindows) {
         if (IsWindowMatched(hwnd, cache)) {
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
-            LockWindow(hwnd, pid);
+            LockWindow(hwnd, pid, deadline);
         }
     }
 
-    // 锁定结果落盘，供程序异常退出后恢复窗口样式
-    if (!m_lockedWindows.empty()) SaveLockFile();
+    // 锁定结果落盘，供程序异常退出后恢复窗口样式；
+    // 即使本轮没有窗口被锁定，也要在有遗留记录时重写，避免失效条目长期堆积
+    if (!m_lockedWindows.empty() || !OrphanRecords().empty()) SaveLockFile();
 }
 
 // 清理：移除所有保护并禁用功能
@@ -394,19 +532,37 @@ void WinDGuard::Cleanup() {
 // 恢复窗口的原始样式，取消置顶
 // ============================================================
 void WinDGuard::RemoveLock() {
-    for (auto& lw : m_lockedWindows) {
-        if (!IsWindow(lw.hwnd)) continue;
+    // 逐个处理：能恢复的立即恢复并从记录中移除；目标仍无响应的保留在列表里，
+    // 由下一次 RemoveLock（退出时析构还会再调一次）或下次启动的
+    // RecoverOrphanedStyles 继续恢复，避免样式永久残留
+    // 跨进程探测同样共享一次预算，避免"窗口多 + 目标繁忙"时累加阻塞 UI 线程
+    ULONGLONG deadline = GetTickCount64() + TOUCH_BUDGET_MS;
+    for (auto it = m_lockedWindows.begin(); it != m_lockedWindows.end(); ) {
+        LockedWindow& lw = *it;
 
-        // 校验进程 ID：句柄可能已被回收复用，指向无关窗口，此时跳过以免误改
-        DWORD wpid = 0;
-        GetWindowThreadProcessId(lw.hwnd, &wpid);
-        if (wpid != lw.processId) continue;
+        // 窗口已销毁或句柄被回收复用（进程 ID 不同）：无需也无法恢复，丢弃记录
+        bool stale = !IsWindow(lw.hwnd);
+        if (!stale) {
+            DWORD wpid = 0;
+            GetWindowThreadProcessId(lw.hwnd, &wpid);
+            stale = (wpid != lw.processId);
+        }
+        if (stale) {
+            it = m_lockedWindows.erase(it);
+            continue;
+        }
 
         // 仅恢复 WS_MINIMIZEBOX 位，保留窗口运行期间的其他样式变化；
         // 仅当样式确有变化时才写回并刷新框架，避免无谓的跨进程窗口操作
         LONG_PTR currentStyle = GetWindowLongPtrW(lw.hwnd, GWL_STYLE);
         LONG_PTR restoredStyle = (currentStyle & ~WS_MINIMIZEBOX) | (lw.originalStyle & WS_MINIMIZEBOX);
         bool styleChanged = (restoredStyle != currentStyle);
+
+        // 跨进程改样式会同步等待目标响应：目标繁忙时本轮跳过，记录保留待重试
+        if (styleChanged && !CanTouchWindow(lw.hwnd, nullptr, 100, deadline)) {
+            ++it;
+            continue;
+        }
         if (styleChanged) {
             SetWindowLongPtrW(lw.hwnd, GWL_STYLE, restoredStyle);
         }
@@ -427,10 +583,12 @@ void WinDGuard::RemoveLock() {
             SetWindowPosSafe(lw.hwnd, nullptr,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
+        it = m_lockedWindows.erase(it);  // 该窗口已恢复完毕
     }
-    m_lockedWindows.clear();
-    // 已全部恢复原始样式，删除落盘记录
-    ClearLockFile();
+
+    // 落盘记录与内存保持一致：全部恢复时 SaveLockFile 会删除记录文件；
+    // 仍有未恢复条目时写入剩余条目，供下次启动继续恢复
+    SaveLockFile();
 }
 
 // ============================================================

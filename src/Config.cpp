@@ -142,6 +142,19 @@ void AppConfig::Load(const std::wstring& iniPath) {
     showLockKeyOverlay = GetPrivateProfileIntW(L"General", L"ShowOverlay", 1, iniPath.c_str()) != 0;
     showMuteOverlay = GetPrivateProfileIntW(L"General", L"ShowMuteOverlay", 0, iniPath.c_str()) != 0;
     overlayPrimaryOnly = GetPrivateProfileIntW(L"General", L"OverlayPrimaryOnly", 0, iniPath.c_str()) != 0;
+    // 浮窗外观：越界值（手改 INI）统一收敛到默认，避免绘制/下拉框出现非法状态。
+    // 旧版本（v1.40 及更早）的 INI 不含这些键，将按默认值读取（深色/底部/圆角/低透明/适中），
+    // 不影响其余字段；新版写入的这些键在旧版本中会被当作未知键忽略
+    overlayPosition = GetPrivateProfileIntW(L"General", L"OverlayPosition", 0, iniPath.c_str());
+    if (overlayPosition < 0 || overlayPosition > 4) overlayPosition = 0;
+    overlayTheme = GetPrivateProfileIntW(L"General", L"OverlayTheme", 0, iniPath.c_str());
+    if (overlayTheme < 0 || overlayTheme > 1) overlayTheme = 0;
+    overlayCorner = GetPrivateProfileIntW(L"General", L"OverlayCorner", 1, iniPath.c_str());
+    if (overlayCorner < 0 || overlayCorner > 1) overlayCorner = 1;
+    overlayOpacity = GetPrivateProfileIntW(L"General", L"OverlayOpacity", 2, iniPath.c_str());
+    if (overlayOpacity < 0 || overlayOpacity > 3) overlayOpacity = 2;
+    overlayDelay = GetPrivateProfileIntW(L"General", L"OverlayDelay", 1, iniPath.c_str());
+    if (overlayDelay < 0 || overlayDelay > 3) overlayDelay = 1;
     forceNumLockOn = GetPrivateProfileIntW(L"General", L"ForceNumLockOn", 0, iniPath.c_str()) != 0;
     disableStartupNotification = GetPrivateProfileIntW(L"General", L"DisableStartupNotification", 0, iniPath.c_str()) != 0;
     // 资源管理器选项：合法值 0=保持原状 / 1=开启隐藏 / 2=关闭隐藏。
@@ -336,6 +349,11 @@ bool AppConfig::Save(const std::wstring& iniPath) const {
     IniUtils::Write(tmpPath, L"General", L"ShowOverlay", IniUtils::BoolToStr(showLockKeyOverlay));
     IniUtils::Write(tmpPath, L"General", L"ShowMuteOverlay", IniUtils::BoolToStr(showMuteOverlay));
     IniUtils::Write(tmpPath, L"General", L"OverlayPrimaryOnly", IniUtils::BoolToStr(overlayPrimaryOnly));
+    IniUtils::Write(tmpPath, L"General", L"OverlayPosition", std::to_wstring(overlayPosition));
+    IniUtils::Write(tmpPath, L"General", L"OverlayTheme", std::to_wstring(overlayTheme));
+    IniUtils::Write(tmpPath, L"General", L"OverlayCorner", std::to_wstring(overlayCorner));
+    IniUtils::Write(tmpPath, L"General", L"OverlayOpacity", std::to_wstring(overlayOpacity));
+    IniUtils::Write(tmpPath, L"General", L"OverlayDelay", std::to_wstring(overlayDelay));
     IniUtils::Write(tmpPath, L"General", L"ForceNumLockOn", IniUtils::BoolToStr(forceNumLockOn));
     IniUtils::Write(tmpPath, L"General", L"DisableStartupNotification", IniUtils::BoolToStr(disableStartupNotification));
     IniUtils::Write(tmpPath, L"General", L"ExplorerHideHidden", std::to_wstring(explorerHideHidden));

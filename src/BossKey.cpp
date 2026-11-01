@@ -54,12 +54,21 @@ namespace {
         return ra != nullptr && ra == rb;
     }
 
-    // 有界同步发送 WM_CANCELMODE：不使用 SMTO_BLOCK（它要求等待期间不处理
-    // 任何其它消息，会让承载鼠标钩子的线程停止派发），目标无响应时 50ms 放弃
-    void SendCancelModeBounded(HWND hwnd) {
+    // 单次跨进程发送超时：不使用 SMTO_BLOCK（它要求等待期间不处理
+    // 任何其它消息，会让承载鼠标钩子的线程停止派发），目标无响应时 50ms 放弃。
+    // deadline 是"整个窗口/整轮处理"共享的时间预算：目标只是"响应但缓慢"时，
+    // 每次最大 50ms 的等待会累加（多个模式对象 × 多个绑定窗口），用户按一次
+    // 热键就能感到输入停顿，因此预算用尽即停止发送，交给下一轮重试
+    constexpr UINT CANCEL_MODE_TIMEOUT_MS = 50;
+    constexpr ULONGLONG CANCEL_MODE_BUDGET_MS = 80;
+
+    void SendCancelModeBounded(HWND hwnd, ULONGLONG deadline) {
         if (!hwnd || !IsWindow(hwnd)) return;
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return;  // 预算已用尽：本轮跳过，下次重试
+        UINT timeout = (UINT)std::min<ULONGLONG>(CANCEL_MODE_TIMEOUT_MS, deadline - now);
         DWORD_PTR result = 0;
-        SendMessageTimeoutW(hwnd, WM_CANCELMODE, 0, 0, SMTO_ABORTIFHUNG, 50, &result);
+        SendMessageTimeoutW(hwnd, WM_CANCELMODE, 0, 0, SMTO_ABORTIFHUNG, timeout, &result);
     }
 
     // 强制解除系统鼠标捕获：捕获是系统级独占，本线程临时抢占再释放，
@@ -77,6 +86,9 @@ namespace {
     void CancelWindowModes(HWND target, HWND captureHost) {
         if (!IsWindow(target)) return;
 
+        // 整窗共享一份预算：多个模式对象/两个消息队列叠加时不会超出上限
+        ULONGLONG deadline = GetTickCount64() + CANCEL_MODE_BUDGET_MS;
+
         // 目标线程与前台线程可能不同：两个队列上的残留模式都要处理
         DWORD tid = GetWindowThreadProcessId(target, nullptr);
         InputModeState states[2] = {
@@ -85,16 +97,16 @@ namespace {
         };
         for (const InputModeState& st : states) {
             if (st.capture && IsSameWindowTree(st.capture, target)) {
-                SendCancelModeBounded(st.capture);
+                SendCancelModeBounded(st.capture, deadline);
                 // 自定义 WndProc 可能不把 WM_CANCELMODE 交给 DefWindowProc，
                 // 此时只能由本线程强行夺取捕获再释放（重复夺取无害）
                 ForceReleaseMouseCapture(captureHost);
             }
             if (st.moveSize && IsSameWindowTree(st.moveSize, target)) {
-                SendCancelModeBounded(st.moveSize);
+                SendCancelModeBounded(st.moveSize, deadline);
             }
             if (st.menuOwner && IsSameWindowTree(st.menuOwner, target)) {
-                SendCancelModeBounded(st.menuOwner);
+                SendCancelModeBounded(st.menuOwner, deadline);
             }
         }
     }
@@ -533,18 +545,21 @@ void BossKey::HealStuckInputMode() {
         }
     }
 
+    // 整轮修复共享一份预算：多个隐藏窗口各自的线程队列叠加时不会累加成
+    // N×300ms；被跳过的窗口在本次激活流程的后续调用里还会再试
+    ULONGLONG deadline = GetTickCount64() + CANCEL_MODE_BUDGET_MS;
     for (DWORD tid : queues) {
         InputModeState st = QueryInputModeState(tid);
         if (st.capture && isStuck(st.capture)) {
-            SendCancelModeBounded(st.capture);
+            SendCancelModeBounded(st.capture, deadline);
             // 目标忽略 WM_CANCELMODE 时由本线程强行夺走捕获再释放
             ForceReleaseMouseCapture(captureHost);
         }
         if (st.moveSize && isStuck(st.moveSize)) {
-            SendCancelModeBounded(st.moveSize);
+            SendCancelModeBounded(st.moveSize, deadline);
         }
         if (st.menuOwner && isStuck(st.menuOwner)) {
-            SendCancelModeBounded(st.menuOwner);
+            SendCancelModeBounded(st.menuOwner, deadline);
         }
     }
 }

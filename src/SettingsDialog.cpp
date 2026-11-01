@@ -796,10 +796,27 @@ void SettingsDialog::SaveCurrentTabState(HWND hwnd, AppConfig& config) {
         config.showLockKeyOverlay = chk(IDC_CHK_OVERLAY);
         config.showMuteOverlay = chk(IDC_CHK_MUTE_OVERLAY);
         config.overlayPrimaryOnly = chk(IDC_CHK_PRIMARY_ONLY);
+        // 浮窗外观：下拉框选中项越界时收敛到默认值，避免写入非法配置
+        auto styleCombo = [&](int id, int maxSel, int defVal) -> int {
+            // 控件不存在时 GetDlgItem 返回 NULL，CB_GETCURSEL 会拿到 0 并被误当成
+            // 合法选中项，因此先判空、直接返回该项对应的配置默认值
+            HWND cbo = GetDlgItem(hwnd, id);
+            if (!cbo) return defVal;
+            int sel = (int)SendMessageW(cbo, CB_GETCURSEL, 0, 0);
+            if (sel < 0 || sel > maxSel) return defVal;
+            return sel;
+        };
+        config.overlayPosition = styleCombo(IDC_CBO_OVERLAY_POS, 4, 0);
+        config.overlayTheme = styleCombo(IDC_CBO_OVERLAY_THEME, 1, 0);
+        config.overlayCorner = styleCombo(IDC_CBO_OVERLAY_CORNER, 1, 1);
+        config.overlayOpacity = styleCombo(IDC_CBO_OVERLAY_OPACITY, 3, 2);
+        config.overlayDelay = styleCombo(IDC_CBO_OVERLAY_DELAY, 3, 1);
         // 保存资源管理器文件夹选项下拉框（0=不改变, 1=开启, 2=关闭）
         // CB_GETCURSEL 失败返回 CB_ERR(-1)，必须收敛到 0~2，避免把非法值写入配置
         auto combo = [&](int id) -> int {
-            int sel = (int)SendMessageW(GetDlgItem(hwnd, id), CB_GETCURSEL, 0, 0);
+            HWND cbo = GetDlgItem(hwnd, id);
+            if (!cbo) return 0;
+            int sel = (int)SendMessageW(cbo, CB_GETCURSEL, 0, 0);
             if (sel < 0) sel = 0;
             if (sel > 2) sel = 2;
             return sel;
@@ -871,6 +888,34 @@ void SettingsDialog::UpdateRemapState(HWND hwnd, bool enabled) {
     if (btnAdd) EnableWindow(btnAdd, enabled);
     if (btnDel) EnableWindow(btnDel, enabled);
     if (btnClearCombo) EnableWindow(btnClearCombo, enabled);
+}
+
+// ===== 浮窗外观控件：是否处于可用状态 =====
+// 只有「显示锁定键状态提示」或「显示静音状态提示」至少一项开启时，
+// 位置/颜色/边框/透明度/延时等外观设置才有意义
+static bool OverlayAppearanceChecked(HWND hwnd) {
+    auto checked = [&](int id) {
+        HWND h = GetDlgItem(hwnd, id);
+        return h && SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    };
+    return checked(IDC_CHK_OVERLAY) || checked(IDC_CHK_MUTE_OVERLAY);
+}
+
+// 统一设置外观控件与「仅在主屏显示提示」的启用/禁用状态（连同"默认"按钮一并置灰）
+static void UpdateOverlayAppearanceState(HWND hwnd, bool enabled) {
+    static const int ids[] = {
+        IDC_CHK_PRIMARY_ONLY,
+        IDC_CBO_OVERLAY_THEME,
+        IDC_CBO_OVERLAY_POS,
+        IDC_CBO_OVERLAY_CORNER,
+        IDC_CBO_OVERLAY_OPACITY,
+        IDC_CBO_OVERLAY_DELAY,
+        IDC_BTN_OVERLAY_DEFAULT
+    };
+    for (int id : ids) {
+        HWND h = GetDlgItem(hwnd, id);
+        if (h) EnableWindow(h, enabled);
+    }
 }
 
 // ===== 取消进行中的内联热键捕获 =====
@@ -1064,8 +1109,46 @@ void SettingsDialog::SwitchTab(HWND hwnd, int tabIndex, AppConfig& config) {
             makeChk(IDC_CHK_PRIMARY_ONLY, L"仅在主屏显示提示", gbX + gbPad, innerY, gbW - gbPad * 2, config.overlayPrimaryOnly);
             innerY += lineH + 4;
 
+            // 浮窗外观自定义：颜色 / 位置 / 边框 一行三列，透明度 / 延时 接在下一行
+            // 下拉框宽度与下方"隐藏文件和文件夹"等选项保持一致
+            HFONT smallFont = GetSmallFont();
+            int lblW3 = 56;     // 标签宽度（容纳"透明度"三字）
+            int cboW3 = 80;     // 下拉框宽度
+            int cboH3 = 21;     // 下拉框/按钮高度
+            int colPitch = lblW3 + 6 + cboW3 + 28;  // 列间距
+            auto makeOverlayCombo = [&](int id, const wchar_t* labelText, int col,
+                                        int py, std::initializer_list<const wchar_t*> items, int selVal) {
+                int colX = gbX + gbPad + col * colPitch;
+                makeLabel(labelText, colX, py, lblW3, cboH3);
+                HWND cbo = CreateWindowExW(0, L"COMBOBOX", L"",
+                                            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                            colX + lblW3 + 6, py, cboW3, 200,
+                                            hwnd, (HMENU)(LONG_PTR)id, GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(cbo, WM_SETFONT, (WPARAM)smallFont, TRUE);
+                for (const wchar_t* it : items) SendMessageW(cbo, CB_ADDSTRING, 0, (LPARAM)it);
+                SendMessageW(cbo, CB_SETCURSEL, selVal, 0);
+            };
+            makeOverlayCombo(IDC_CBO_OVERLAY_THEME, L"颜色", 0, innerY,
+                             { L"深色", L"浅色" }, config.overlayTheme);
+            makeOverlayCombo(IDC_CBO_OVERLAY_POS, L"位置", 1, innerY,
+                             { L"底部", L"顶部", L"居中", L"左侧", L"右侧" }, config.overlayPosition);
+            makeOverlayCombo(IDC_CBO_OVERLAY_CORNER, L"边框", 2, innerY,
+                             { L"直角", L"圆角" }, config.overlayCorner);
+            innerY += cboH3 + 4;
+            makeOverlayCombo(IDC_CBO_OVERLAY_OPACITY, L"透明度", 0, innerY,
+                             { L"高透明", L"适中", L"低透明", L"不透明" }, config.overlayOpacity);
+            makeOverlayCombo(IDC_CBO_OVERLAY_DELAY, L"延时", 1, innerY,
+                             { L"快速", L"适中", L"缓慢", L"保持显示" }, config.overlayDelay);
+            // "默认"按钮放在延时右侧（即上一行"边框"所在的第三列），
+            // 左边缘与上一行"边框"文字左对齐
+            makeButton(IDC_BTN_OVERLAY_DEFAULT, L"默认",
+                       gbX + gbPad + 2 * colPitch, innerY, cboW3, cboH3);
+            innerY += cboH3 + 4;
+
             MoveWindow(gbOverlay, gbX, gbY, gbW, innerY - gbY + 4, TRUE);
             SetWindowPos(gbOverlay, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+            // 两个提示开关都未开启时，外观设置与"仅在主屏显示提示"整体置灰
+            UpdateOverlayAppearanceState(hwnd, OverlayAppearanceChecked(hwnd));
             y = innerY + 8;
         }
 
@@ -3076,6 +3159,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (HIWORD(wp) == BN_CLICKED) {
                 bool checked = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 data->workingCopy.showLockKeyOverlay = checked;
+                // 与"显示静音状态提示"任一开启时才允许设置外观
+                UpdateOverlayAppearanceState(hwnd, OverlayAppearanceChecked(hwnd));
             }
             return 0;
         }
@@ -3084,6 +3169,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (HIWORD(wp) == BN_CLICKED) {
                 bool checked = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 data->workingCopy.showMuteOverlay = checked;
+                // 与"显示锁定键状态提示"任一开启时才允许设置外观
+                UpdateOverlayAppearanceState(hwnd, OverlayAppearanceChecked(hwnd));
             }
             return 0;
         }
@@ -3092,6 +3179,29 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (HIWORD(wp) == BN_CLICKED) {
                 bool checked = SendMessageW((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 data->workingCopy.overlayPrimaryOnly = checked;
+            }
+            return 0;
+        }
+
+        case IDC_BTN_OVERLAY_DEFAULT: {
+            // 恢复浮窗默认外观：颜色-深色、位置-底部、边框-圆角、透明度-低透明、延时-适中
+            if (HIWORD(wp) == BN_CLICKED) {
+                data->workingCopy.overlayTheme = 0;
+                data->workingCopy.overlayPosition = 0;
+                data->workingCopy.overlayCorner = 1;
+                data->workingCopy.overlayOpacity = 2;
+                data->workingCopy.overlayDelay = 1;
+                const struct { int id; int sel; } pairs[] = {
+                    { IDC_CBO_OVERLAY_THEME, 0 },
+                    { IDC_CBO_OVERLAY_POS, 0 },
+                    { IDC_CBO_OVERLAY_CORNER, 1 },
+                    { IDC_CBO_OVERLAY_OPACITY, 2 },
+                    { IDC_CBO_OVERLAY_DELAY, 1 }
+                };
+                for (const auto& p : pairs) {
+                    HWND h = GetDlgItem(hwnd, p.id);
+                    if (h) SendMessageW(h, CB_SETCURSEL, p.sel, 0);
+                }
             }
             return 0;
         }

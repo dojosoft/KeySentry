@@ -47,7 +47,9 @@ private:
     // 移除所有窗口保护，恢复原始样式
     void RemoveLock();
     // 对单个窗口应用保护（置顶 + 移除最小化按钮）
-    void LockWindow(HWND hwnd, DWORD pid);
+    // deadline 非 0 时为本轮跨进程探测的总时间上限（GetTickCount64 基准），
+    // 预算耗尽即跳过该窗口的样式修改，交给下一轮重试
+    void LockWindow(HWND hwnd, DWORD pid, ULONGLONG deadline = 0);
     // 重新应用保护（恢复最小化的窗口、重新移除最小化按钮）
     void ReLockWindow(LockedWindow& lw);
     // 检查指定窗口是否匹配保护规则（cache 用于复用进程路径查询结果）
@@ -63,5 +65,9 @@ private:
     bool m_enabled = false;                             // 是否启用
     std::vector<BoundWindowInfo> m_protectedWindows;    // 受保护窗口匹配规则
     std::vector<LockedWindow> m_lockedWindows;          // 已锁定保护的窗口列表
+    // 上次运行遗留、本轮因目标无响应而未能恢复的样式记录。
+    // 必须与 m_lockedWindows 一起落盘：单独存放期间若被一次 SaveLockFile
+    // 覆盖丢失，这些窗口的原始样式就再也无法恢复（最小化按钮永久消失）
+    static std::vector<LockedWindow>& OrphanRecords();
     int m_enumCounter = 0;                              // EnumWindows 调用计数器，降低枚举频率
 };
