@@ -1,6 +1,8 @@
 #include "Overlay.h"
 #include "Resource.h"
 #include "Utils.h"
+#include "FluentTheme.h"
+#include "Lang.h"
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <algorithm>
@@ -10,8 +12,60 @@ const wchar_t* OverlayWindow::CLASS_NAME = L"KeySentryOverlayWnd";
 
 OverlayWindow::OverlayWindow() = default;
 
+namespace {
+// 启动浮层自动隐藏定时器；创建失败时直接隐藏浮层，
+// 避免它永久停留在屏幕上（R14-A2）
+void ArmOverlayTimer(HWND hwnd, UINT durationMs) {
+    if (!hwnd || durationMs == 0) return;
+    if (SetTimer(hwnd, TIMER_OVERLAY, durationMs, nullptr)) return;
+    OutputDebugStringW(L"[KeySentry] 浮层自动隐藏定时器创建失败，已隐藏浮层\n");
+    ShowWindow(hwnd, SW_HIDE);
+}
+}
+
 OverlayWindow::~OverlayWindow() {
     Destroy();
+}
+
+// 按显示器 DPI 计算浮层缩放；工作区用于限制最大尺寸
+float OverlayWindow::ScaleForMonitor(HMONITOR monitor, RECT* workArea) {
+    MONITORINFO mi = { sizeof(mi) };
+    if (monitor && GetMonitorInfoW(monitor, &mi)) {
+        if (workArea) *workArea = mi.rcWork;
+        return DpiUtils::ScaleForDpi(DpiUtils::GetDpiForMonitorSafe(monitor), &mi.rcWork);
+    }
+    return DpiUtils::ScaleForDpi(DpiUtils::GetDpiForMonitorSafe(monitor));
+}
+
+// 按 DPI 懒创建字体：同一进程可能同时在多个不同 DPI 的显示器上显示浮层
+OverlayWindow::FontSet& OverlayWindow::FontsForDpi(UINT dpi, float scale) {
+    // 与布局使用同一个下限：极小工作区允许 0.75 缩放，
+    // 字体若仍按 1.0 创建会比文字区更大而溢出（R13-M3）
+    if (scale < 0.75f) scale = 0.75f;
+    if (scale > 3.0f) scale = 3.0f;
+    // 以千分位量化缩放系数作为缓存键，避免浮点误差造成重复创建字体
+    const int scaleKey = (int)(scale * 1000.0f + 0.5f);
+    const auto key = std::make_pair(dpi, scaleKey);
+    auto it = m_fontSets.find(key);
+    if (it != m_fontSets.end()) return it->second;
+
+    FontSet fs;
+    fs.large = CreateUiFontAtScale(30, FW_BOLD, scale);
+    fs.medium = CreateUiFontAtScale(14, FW_SEMIBOLD, scale);
+    fs.smallFont = CreateUiFontAtScale(12, FW_NORMAL, scale);
+    auto inserted = m_fontSets.emplace(key, fs);
+    return inserted.first->second;
+}
+
+void OverlayWindow::DestroyFontSets() {
+    for (auto& entry : m_fontSets) {
+        FontSet& fs = entry.second;
+        if (fs.large) DeleteObject(fs.large);
+        if (fs.medium) DeleteObject(fs.medium);
+        if (fs.smallFont) DeleteObject(fs.smallFont);
+    }
+    m_fontSets.clear();
+    m_paintFonts = nullptr;
 }
 
 void OverlayWindow::SetPrimaryOnly(bool primaryOnly) {
@@ -46,7 +100,7 @@ void OverlayWindow::SetAppearance(int position, int theme, int corner, int opaci
         // 否则它会一直留在屏幕上；切到"保持显示"则取消自动隐藏定时器
         if (m_showDurationMs > 0 && IsWindowVisible(hwnd)) {
             KillTimer(hwnd, TIMER_OVERLAY);
-            SetTimer(hwnd, TIMER_OVERLAY, (UINT)m_showDurationMs, nullptr);
+            ArmOverlayTimer(hwnd, (UINT)m_showDurationMs);
         } else if (m_showDurationMs == 0) {
             KillTimer(hwnd, TIMER_OVERLAY);
         }
@@ -63,8 +117,6 @@ void OverlayWindow::SetAppearance(int position, int theme, int corner, int opaci
     if (anyVisible) {
         auto monitors = GetTargetMonitors();
         EnsureWindowCount((int)monitors.size());
-        int ovW = ScaleUi(OVERLAY_SIZE);
-        int ovH = m_showMuteOverlay ? ovW : ScaleUi(OVERLAY_KEY_HEIGHT);
         for (size_t i = 0; i < m_hwnds.size(); ++i) {
             HWND h = m_hwnds[i];
             if (!h) continue;
@@ -76,13 +128,31 @@ void OverlayWindow::SetAppearance(int position, int theme, int corner, int opaci
                 }
                 continue;
             }
-            if (!IsWindowVisible(h)) continue;
             MONITORINFO mi = { sizeof(mi) };
-            if (!GetMonitorInfoW(monitors[i], &mi)) continue;
+            if (!GetMonitorInfoW(monitors[i], &mi)) {
+                // 显示器句柄在枚举与定位之间失效：隐藏该浮层并停止定时器，
+                // 避免它停留在旧位置（R14-A1）
+                ShowWindow(h, SW_HIDE);
+                KillTimer(h, TIMER_OVERLAY);
+                continue;
+            }
+            ScopedUiScale scoped(ScaleForMonitor(monitors[i]));
+            int ovW = ScaleUi(OVERLAY_SIZE);
+            int ovH = m_showMuteOverlay ? ovW : ScaleUi(OVERLAY_KEY_HEIGHT);
             int x = 0, y = 0;
             ComputePosition(mi.rcWork, ovW, ovH, &x, &y);
-            // 不改变 Z-order：已置顶，重复 HWND_TOPMOST 会让任务栏/DWM 重新排序
-            SetWindowPos(h, nullptr, x, y, ovW, ovH, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (!IsWindowVisible(h)) {
+                // 显示器集合新增（或该浮层此前被隐藏）：跟随当前"有浮层可见"的
+                // 状态补显示，否则新增/切换显示器后副屏一直看不到浮层
+                SetWindowPos(h, HWND_TOPMOST, x, y, ovW, ovH,
+                             SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                if (m_showDurationMs > 0) {
+                    ArmOverlayTimer(h, (UINT)m_showDurationMs);
+                }
+            } else {
+                // 不改变 Z-order：已置顶，重复 HWND_TOPMOST 会让任务栏/DWM 重新排序
+                SetWindowPos(h, nullptr, x, y, ovW, ovH, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
     }
 
@@ -101,12 +171,29 @@ void OverlayWindow::HideAll() {
     }
 }
 
+// 语言切换后重绘当前可见浮层：浮层文本在 Show/ShowMute 时按当时语言生成，
+// 不重绘会让"保持显示"档位下的浮层一直停留在旧语言（R9-M6）
+void OverlayWindow::RefreshContent() {
+    RenderNow();
+}
+
+// 仅关闭某一类提示：若当前显示的正是被关闭的类型则收起，
+// 避免"保持显示"档位下用户取消勾选后浮层仍留在屏幕上
+void OverlayWindow::HideIfDisabled(bool lockEnabled, bool muteEnabled) {
+    if ((m_showMuteOverlay && !muteEnabled) || (!m_showMuteOverlay && !lockEnabled)) {
+        HideAll();
+    }
+}
+
 // 依据主题重建背景画刷（深色为深底浅字，浅色为浅底深字）
 void OverlayWindow::RecreateBrushes() {
     if (m_bgBrush) { DeleteObject(m_bgBrush); m_bgBrush = nullptr; }
     if (m_barBgBrush) { DeleteObject(m_barBgBrush); m_barBgBrush = nullptr; }
+    if (m_barBorderPen) { DeleteObject(m_barBorderPen); m_barBorderPen = nullptr; }
     m_bgBrush = CreateSolidBrush(m_theme == 1 ? RGB(246, 246, 250) : RGB(30, 30, 42));
     m_barBgBrush = CreateSolidBrush(m_theme == 1 ? RGB(212, 212, 224) : RGB(55, 55, 75));
+    // 边框颜色随主题变化：在此一次性创建，绘制时不再逐帧 Create/Delete（R13-A7）
+    m_barBorderPen = CreatePen(PS_SOLID, 1, BorderColor());
 }
 
 // ============================================================
@@ -114,7 +201,42 @@ void OverlayWindow::RecreateBrushes() {
 // ============================================================
 bool OverlayWindow::EnsureBackBuffer(int w, int h) {
     if (m_memDC && m_memW == w && m_memH == h) return true;
-    DestroyBackBuffer();
+
+    // 当前缓冲先放入缓存而不是销毁：多个显示器尺寸不同时，
+    // 每次切换窗口都重建 32 位 DIB 会造成明显卡顿和闪烁。
+    // 缓存必须限量：4K 32bpp 单张约 33MB，反复修改分辨率/缩放时
+    // 无限累积会造成内存持续增长（R8-M9）
+    if (m_memDC) {
+        constexpr size_t MAX_CACHED_BUFFERS = 3;
+        if (m_backBufferCache.size() >= MAX_CACHED_BUFFERS) {
+            BackBuffer& victim = m_backBufferCache.begin()->second;
+            if (victim.dc) {
+                if (victim.oldBmp) SelectObject(victim.dc, victim.oldBmp);
+                DeleteDC(victim.dc);
+            }
+            if (victim.bmp) DeleteObject(victim.bmp);
+            m_backBufferCache.erase(m_backBufferCache.begin());
+        }
+        m_backBufferCache[{ m_memW, m_memH }] =
+            { m_memDC, m_memBmp, m_memOldBmp, m_memBits, m_memW, m_memH };
+        m_memDC = nullptr;
+        m_memBmp = nullptr;
+        m_memOldBmp = nullptr;
+        m_memBits = nullptr;
+        m_memW = m_memH = 0;
+    }
+
+    auto cached = m_backBufferCache.find({ w, h });
+    if (cached != m_backBufferCache.end()) {
+        m_memDC = cached->second.dc;
+        m_memBmp = cached->second.bmp;
+        m_memOldBmp = cached->second.oldBmp;
+        m_memBits = cached->second.bits;
+        m_memW = cached->second.w;
+        m_memH = cached->second.h;
+        m_backBufferCache.erase(cached);
+        return true;
+    }
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -139,13 +261,26 @@ bool OverlayWindow::EnsureBackBuffer(int w, int h) {
 }
 
 void OverlayWindow::DestroyBackBuffer() {
-    if (m_memDC) {
-        if (m_memOldBmp) SelectObject(m_memDC, m_memOldBmp);
-        DeleteDC(m_memDC);
-        m_memDC = nullptr;
+    auto release = [](HDC& dc, HBITMAP& bmp, HBITMAP& oldBmp) {
+        if (dc) {
+            if (oldBmp) SelectObject(dc, oldBmp);
+            DeleteDC(dc);
+            dc = nullptr;
+        }
+        oldBmp = nullptr;
+        if (bmp) {
+            DeleteObject(bmp);
+            bmp = nullptr;
+        }
+    };
+
+    for (auto& entry : m_backBufferCache) {
+        BackBuffer& b = entry.second;
+        release(b.dc, b.bmp, b.oldBmp);
     }
-    m_memOldBmp = nullptr;
-    if (m_memBmp) { DeleteObject(m_memBmp); m_memBmp = nullptr; }
+    m_backBufferCache.clear();
+
+    release(m_memDC, m_memBmp, m_memOldBmp);
     m_memBits = nullptr;
     m_memW = m_memH = 0;
 }
@@ -157,6 +292,15 @@ void OverlayWindow::DestroyBackBuffer() {
 void OverlayWindow::Render(HWND hwnd, int w, int h) {
     if (!hwnd || w <= 0 || h <= 0) return;
     if (!EnsureBackBuffer(w, h)) return;
+
+    // 按该窗口所在显示器的 DPI 绘制：不同显示器可同时存在不同缩放
+    UINT dpi = DpiUtils::GetDpiForWindowSafe(hwnd);
+    RECT work = {};
+    DpiUtils::GetWorkAreaForWindow(hwnd, &work);
+    const float scale = DpiUtils::ScaleForDpi(dpi, &work);
+    ScopedUiScale scoped(scale);
+    // 字体与布局使用同一缩放系数：工作区偏小时两者一起收缩，避免文字溢出
+    m_paintFonts = &FontsForDpi(dpi, scale);
 
     PaintContent(m_memDC, w, h);
 
@@ -198,6 +342,7 @@ void OverlayWindow::Render(HWND hwnd, int w, int h) {
         }
     }
 
+    m_paintFonts = nullptr;
     RECT wr = {};
     GetWindowRect(hwnd, &wr);
     POINT ptDst = { wr.left, wr.top };
@@ -208,7 +353,10 @@ void OverlayWindow::Render(HWND hwnd, int w, int h) {
     blend.BlendFlags = 0;
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
-    UpdateLayeredWindow(hwnd, nullptr, &ptDst, &sz, m_memDC, &ptSrc, 0, &blend, ULW_ALPHA);
+    // 渲染失败时隐藏窗口：否则会停留在上一帧的旧内容（"保持显示"档位下尤其明显）
+    if (!UpdateLayeredWindow(hwnd, nullptr, &ptDst, &sz, m_memDC, &ptSrc, 0, &blend, ULW_ALPHA)) {
+        ShowWindow(hwnd, SW_HIDE);
+    }
 }
 
 // ============================================================
@@ -350,6 +498,15 @@ std::vector<HMONITOR> OverlayWindow::GetTargetMonitors() {
 
 // 确保浮层窗口数量足够，不足则创建新窗口
 void OverlayWindow::EnsureWindowCount(int count) {
+    // 先剔除已被外部销毁的窗口：死句柄会让对应显示器永久失去浮层，
+    // 且后续 IsWindowVisible/SetWindowPos 全部静默失败（R14-A3）
+    for (size_t i = 0; i < m_hwnds.size(); ) {
+        if (m_hwnds[i] && IsWindow(m_hwnds[i])) {
+            ++i;
+            continue;
+        }
+        m_hwnds.erase(m_hwnds.begin() + (std::ptrdiff_t)i);
+    }
     while ((int)m_hwnds.size() < count) {
         HWND hwnd = CreateOverlayWnd();
         if (hwnd) {
@@ -375,9 +532,7 @@ bool OverlayWindow::Create(HINSTANCE hInst) {
         wc.lpszClassName = CLASS_NAME;
         wc.hbrBackground = nullptr;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        if (!RegisterClassW(&wc)) {
-            if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
-        }
+        if (!WindowUtils::RegisterClassOnce(wc)) return false;
         registered = true;
     }
 
@@ -385,10 +540,7 @@ bool OverlayWindow::Create(HINSTANCE hInst) {
     if (!hwnd) return false;
     m_hwnds.push_back(hwnd);
 
-    // 创建字体和画刷资源
-    m_fontLarge = CreateUiFont(30, FW_BOLD);
-    m_fontMedium = CreateUiFont(14, FW_SEMIBOLD);
-    m_fontSmall = CreateUiFont(12, FW_NORMAL);
+    // 创建画刷资源；字体按显示器 DPI 在首次绘制时懒创建
     RecreateBrushes();                                    // 背景画刷按当前主题创建
     m_barFillBrush = CreateSolidBrush(RGB(100, 200, 130));// 绿色填充
     m_barMuteBrush = CreateSolidBrush(RGB(200, 80, 80));  // 红色静音
@@ -408,13 +560,12 @@ void OverlayWindow::Destroy() {
     if (m_pVolume) { m_pVolume->Release(); m_pVolume = nullptr; }
     m_volumeDeviceId.clear();
     if (m_pEnumerator) { m_pEnumerator->Release(); m_pEnumerator = nullptr; }
-    if (m_fontLarge) { DeleteObject(m_fontLarge); m_fontLarge = nullptr; }
-    if (m_fontMedium) { DeleteObject(m_fontMedium); m_fontMedium = nullptr; }
-    if (m_fontSmall) { DeleteObject(m_fontSmall); m_fontSmall = nullptr; }
+    DestroyFontSets();
     if (m_bgBrush) { DeleteObject(m_bgBrush); m_bgBrush = nullptr; }
     if (m_barBgBrush) { DeleteObject(m_barBgBrush); m_barBgBrush = nullptr; }
     if (m_barFillBrush) { DeleteObject(m_barFillBrush); m_barFillBrush = nullptr; }
     if (m_barMuteBrush) { DeleteObject(m_barMuteBrush); m_barMuteBrush = nullptr; }
+    if (m_barBorderPen) { DeleteObject(m_barBorderPen); m_barBorderPen = nullptr; }
 }
 
 // ============================================================
@@ -440,17 +591,34 @@ bool OverlayWindow::GetAudioState(bool& isMuted, int& volumeLevel) {
 
     IMMDevice* pDevice = nullptr;
     HRESULT hr = m_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        // 音频服务重启或设备不可用时，缓存的枚举器会持续失效；
+        // 若只返回 false 而不重建，静音浮层会直到重启程序都不再显示（R12-M4）。
+        // 释放枚举器与绑定的音量接口，下次查询时重新创建
+        m_pEnumerator->Release();
+        m_pEnumerator = nullptr;
+        if (m_pVolume) { m_pVolume->Release(); m_pVolume = nullptr; }
+        m_volumeDeviceId.clear();
+        return false;
+    }
 
     // 读取默认设备 ID：设备切换（插拔耳机、切换输出）时需重建音量接口，
     // 否则会一直查询旧设备的静音/音量状态
     LPWSTR devId = nullptr;
     std::wstring deviceId;
-    if (SUCCEEDED(pDevice->GetId(&devId)) && devId) {
+    const bool gotId = SUCCEEDED(pDevice->GetId(&devId)) && devId != nullptr;
+    if (gotId) {
         deviceId = devId;
         CoTaskMemFree(devId);
+    } else if (m_pVolume) {
+        // 无法读取设备 ID 时不能继续复用缓存的音量接口：
+        // 默认设备可能已经切换，复用会把旧设备的状态当成当前状态。
+        // 释放后按当前设备重新 Activate（下次查询会再次重建，避免错误缓存）
+        m_pVolume->Release();
+        m_pVolume = nullptr;
+        m_volumeDeviceId.clear();
     }
-    if (!m_pVolume || deviceId != m_volumeDeviceId) {
+    if (!m_pVolume || !gotId || deviceId != m_volumeDeviceId) {
         if (m_pVolume) { m_pVolume->Release(); m_pVolume = nullptr; }
         if (SUCCEEDED(pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
                                         nullptr, reinterpret_cast<void**>(&m_pVolume)))) {
@@ -517,7 +685,14 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
     // 在每个显示器上定位并显示浮层
     for (size_t i = 0; i < monitors.size() && i < m_hwnds.size(); i++) {
         MONITORINFO mi = { sizeof(mi) };
-        GetMonitorInfoW(monitors[i], &mi);
+        // 显示器句柄可能在枚举与定位之间失效：取不到工作区就隐藏该浮层，
+        // 否则全 0 的 rcWork 会把浮层摆到屏幕左上角之外（R14-A1）
+        if (!GetMonitorInfoW(monitors[i], &mi)) {
+            ShowWindow(m_hwnds[i], SW_HIDE);
+            KillTimer(m_hwnds[i], TIMER_OVERLAY);
+            continue;
+        }
+        ScopedUiScale scoped(ScaleForMonitor(monitors[i]));
         int ovW = ScaleUi(OVERLAY_SIZE);
         int ovH = ScaleUi(OVERLAY_KEY_HEIGHT);
         int x = 0, y = 0;
@@ -536,7 +711,7 @@ void OverlayWindow::Show(int vkCode, bool state, bool locked) {
         KillTimer(m_hwnds[i], TIMER_OVERLAY);
         // 保持显示档（时长为 0）只置顶显示，不启动自动隐藏定时器
         if (m_showDurationMs > 0) {
-            SetTimer(m_hwnds[i], TIMER_OVERLAY, (UINT)m_showDurationMs, nullptr);
+            ArmOverlayTimer(m_hwnds[i], (UINT)m_showDurationMs);
         }
     }
 
@@ -559,8 +734,12 @@ void OverlayWindow::ShowMute() {
     // 先查询当前音频状态，用于判断浮层内容是否真的变化
     bool isMuted = false;
     int volume = 0;
-    // 端点不可用时不显示浮层：否则会把默认值（未静音/0%）当作真实状态展示
-    if (!GetAudioState(isMuted, volume)) return;
+    // 端点不可用时不显示新浮层：否则会把默认值（未静音/0%）当作真实状态展示。
+    // 若当前显示的正是静音浮层，必须收起：否则"保持显示"档位下旧状态会永久停留
+    if (!GetAudioState(isMuted, volume)) {
+        if (m_showMuteOverlay) HideAll();
+        return;
+    }
 
     // 连发去抖：静音键被按住时系统会持续产生 keydown，仅在"内容一致且过密"时丢弃；
     // 静音状态确实切换时即使间隔很近也照常显示，避免真实状态变化被误丢
@@ -580,7 +759,12 @@ void OverlayWindow::ShowMute() {
 
     for (size_t i = 0; i < monitors.size() && i < m_hwnds.size(); i++) {
         MONITORINFO mi = { sizeof(mi) };
-        GetMonitorInfoW(monitors[i], &mi);
+        if (!GetMonitorInfoW(monitors[i], &mi)) {
+            ShowWindow(m_hwnds[i], SW_HIDE);
+            KillTimer(m_hwnds[i], TIMER_OVERLAY);
+            continue;
+        }
+        ScopedUiScale scoped(ScaleForMonitor(monitors[i]));
         int ovSize = ScaleUi(OVERLAY_SIZE);
         int x = 0, y = 0;
         ComputePosition(mi.rcWork, ovSize, ovSize, &x, &y);
@@ -597,7 +781,7 @@ void OverlayWindow::ShowMute() {
         KillTimer(m_hwnds[i], TIMER_OVERLAY);
         // 保持显示档（时长为 0）只置顶显示，不启动自动隐藏定时器
         if (m_showDurationMs > 0) {
-            SetTimer(m_hwnds[i], TIMER_OVERLAY, (UINT)m_showDurationMs, nullptr);
+            ArmOverlayTimer(m_hwnds[i], (UINT)m_showDurationMs);
         }
     }
 
@@ -689,13 +873,13 @@ void OverlayWindow::PaintContent(HDC hdc, int w, int h) {
                         m_audioMuted, m_theme == 1);
 
         // 静音/取消静音标签
-        const wchar_t* muteLabel = m_audioMuted ? L"静音" : L"取消静音";
+        const wchar_t* muteLabel = Tr(m_audioMuted ? L"静音" : L"取消静音");
         COLORREF muteColor = m_audioMuted
             ? (m_theme == 1 ? RGB(190, 60, 60) : RGB(200, 80, 80))
             : (m_theme == 1 ? RGB(30, 140, 70) : RGB(100, 200, 130));
         RECT labelRect = { 0, ScaleUi(OVERLAY_MUTE_LABEL_TOP), w, ScaleUi(OVERLAY_MUTE_LABEL_BOTTOM) };
         SetTextColor(hdc, muteColor);
-        HFONT oldFontM = (HFONT)SelectObject(hdc, m_fontMedium);
+        HFONT oldFontM = (HFONT)SelectObject(hdc, m_paintFonts ? m_paintFonts->medium : Fluent::UiFont());
         DrawTextW(hdc, muteLabel, -1, &labelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldFontM);
 
@@ -705,44 +889,47 @@ void OverlayWindow::PaintContent(HDC hdc, int w, int h) {
             swprintf_s(volText, L"%d%%", m_audioVolume);
             RECT volRect = { 0, ScaleUi(OVERLAY_VOL_LABEL_TOP), w, ScaleUi(OVERLAY_VOL_LABEL_BOTTOM) };
             SetTextColor(hdc, VolumeTextColor());
-            HFONT oldFontS = (HFONT)SelectObject(hdc, m_fontSmall);
+            HFONT oldFontS = (HFONT)SelectObject(hdc, m_paintFonts ? m_paintFonts->smallFont : Fluent::SmallFont());
             DrawTextW(hdc, volText, -1, &volRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(hdc, oldFontS);
         }
 
-        // 绘制音量条
-        int barLeft = ScaleUi(OVERLAY_BAR_MARGIN);
-        int barRight = w - ScaleUi(OVERLAY_BAR_MARGIN);
-        int barTop = m_audioMuted ? ScaleUi(OVERLAY_MUTE_LABEL_BOTTOM) + ScaleUi(4)
-                                  : ScaleUi(OVERLAY_VOL_LABEL_BOTTOM) + ScaleUi(6);
-        int barBottom = barTop + ScaleUi(OVERLAY_BAR_HEIGHT);
-        int barW = barRight - barLeft;
+        // 绘制音量条：音量未知（-1）且未静音时不画。
+        // 空进度条会被用户误读为"音量 0%"，与实际不符
+        if (m_audioMuted || m_audioVolume >= 0) {
+            int barLeft = ScaleUi(OVERLAY_BAR_MARGIN);
+            int barRight = w - ScaleUi(OVERLAY_BAR_MARGIN);
+            int barTop = m_audioMuted ? ScaleUi(OVERLAY_MUTE_LABEL_BOTTOM) + ScaleUi(4)
+                                      : ScaleUi(OVERLAY_VOL_LABEL_BOTTOM) + ScaleUi(6);
+            int barBottom = barTop + ScaleUi(OVERLAY_BAR_HEIGHT);
+            int barW = barRight - barLeft;
 
-        // 音量条背景
-        RECT barBgRect = { barLeft, barTop, barRight, barBottom };
-        FillRect(hdc, &barBgRect, m_barBgBrush);
+            // 音量条背景
+            RECT barBgRect = { barLeft, barTop, barRight, barBottom };
+            FillRect(hdc, &barBgRect, m_barBgBrush);
 
-        if (m_audioMuted) {
-            // 静音时整个音量条填充红色
-            RECT barMuteRect = { barLeft, barTop, barRight, barBottom };
-            FillRect(hdc, &barMuteRect, m_barMuteBrush);
-        } else {
-            // 非静音时按音量百分比填充绿色
-            int fillW = barW * m_audioVolume / 100;
-            if (fillW > 0) {
-                RECT barFillRect = { barLeft, barTop, barLeft + fillW, barBottom };
-                FillRect(hdc, &barFillRect, m_barFillBrush);
+            if (m_audioMuted) {
+                // 静音时整个音量条填充红色
+                RECT barMuteRect = { barLeft, barTop, barRight, barBottom };
+                FillRect(hdc, &barMuteRect, m_barMuteBrush);
+            } else {
+                // 非静音时按音量百分比填充绿色
+                int fillW = barW * m_audioVolume / 100;
+                if (fillW > 0) {
+                    RECT barFillRect = { barLeft, barTop, barLeft + fillW, barBottom };
+                    FillRect(hdc, &barFillRect, m_barFillBrush);
+                }
+            }
+
+            // 音量条边框：使用随主题重建的缓存画笔，避免每次绘制 Create/Delete（R13-A7）
+            if (m_barBorderPen) {
+                HPEN prevPen2 = (HPEN)SelectObject(hdc, m_barBorderPen);
+                HBRUSH prevBrush2 = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, barLeft, barTop, barRight, barBottom);
+                SelectObject(hdc, prevBrush2);
+                SelectObject(hdc, prevPen2);
             }
         }
-
-        // 音量条边框
-        HPEN barPen = CreatePen(PS_SOLID, 1, BorderColor());
-        HPEN prevPen2 = (HPEN)SelectObject(hdc, barPen);
-        HBRUSH prevBrush2 = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, barLeft, barTop, barRight, barBottom);
-        SelectObject(hdc, prevBrush2);
-        SelectObject(hdc, prevPen2);
-        DeleteObject(barPen);
     } else {
         // --- 锁键浮层绘制 ---
         const wchar_t* iconText = L"";
@@ -763,7 +950,7 @@ void OverlayWindow::PaintContent(HDC hdc, int w, int h) {
         // 绘制锁键图标
         RECT iconRect = { 0, ScaleUi(OVERLAY_KEY_ICON_TOP), w, ScaleUi(OVERLAY_KEY_ICON_BOTTOM) };
         SetTextColor(hdc, iconColor);
-        HFONT oldFontL = (HFONT)SelectObject(hdc, m_fontLarge);
+        HFONT oldFontL = (HFONT)SelectObject(hdc, m_paintFonts ? m_paintFonts->large : Fluent::UiFont());
         DrawTextW(hdc, iconText, -1, &iconRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldFontL);
 
@@ -775,14 +962,14 @@ void OverlayWindow::PaintContent(HDC hdc, int w, int h) {
 
         wchar_t label[64] = {};
         if (m_locked) {
-            swprintf_s(label, L"%s: 锁", keyName);
+            swprintf_s(label, L"%s: %s", keyName, Tr(L"锁"));
         } else {
-            swprintf_s(label, L"%s: %s", keyName, m_state ? L"开" : L"关");
+            swprintf_s(label, L"%s: %s", keyName, m_state ? Tr(L"开") : Tr(L"关"));
         }
 
         RECT labelRect = { 0, ScaleUi(OVERLAY_KEY_LABEL_TOP), w, ScaleUi(OVERLAY_KEY_LABEL_BOTTOM) };
         SetTextColor(hdc, LabelColor());
-        HFONT oldFontM = (HFONT)SelectObject(hdc, m_fontMedium);
+        HFONT oldFontM = (HFONT)SelectObject(hdc, m_paintFonts ? m_paintFonts->medium : Fluent::UiFont());
         DrawTextW(hdc, label, -1, &labelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldFontM);
     }
@@ -817,6 +1004,31 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             KillTimer(hwnd, TIMER_OVERLAY);
             ShowWindow(hwnd, SW_HIDE);
         }
+        return 0;
+    case WM_DPICHANGED: {
+        // 浮层被移动到不同 DPI 的显示器：按建议矩形调整尺寸，
+        // 并按新 DPI 重新选择字体/缩放绘制
+        RECT* suggested = reinterpret_cast<RECT*>(lp);
+        if (suggested) {
+            SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        auto* self = reinterpret_cast<OverlayWindow*>(
+            GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self) {
+            // 只重绘当前窗口：其他显示器上的浮层没有变化，
+            // 全量渲染会重复执行逐像素预乘 alpha，占用 UI 线程。
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            self->Render(hwnd, rc.right, rc.bottom);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        // 浮层窗口由 OverlayWindow 统一管理，不能被外部 WM_CLOSE 销毁；
+        // 否则句柄失效后该显示器将不再显示浮层（R14-A3）
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_OVERLAY);

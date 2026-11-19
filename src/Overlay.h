@@ -2,7 +2,9 @@
 #include <Windows.h>
 #include <mmdeviceapi.h>
 #include <string>
+#include <utility>
 #include <vector>
+#include <map>
 
 // 前向声明：仅作指针成员使用，避免头文件引入 endpointvolume.h
 struct IAudioEndpointVolume;
@@ -41,6 +43,11 @@ public:
     // 立即收起所有浮层：两项提示都关闭时调用，
     // 否则"保持显示"档位下已显示的浮层不会自动消失
     void HideAll();
+    // 只关闭某一类提示时收起对应的已显示浮层（两项都关等价于 HideAll）
+    void HideIfDisabled(bool lockEnabled, bool muteEnabled);
+    // 按当前语言/主题立即重绘正在显示的浮层（语言切换后调用）：
+    // 浮层文本在显示时生成，刷新前会一直保留旧语言（R9-M6）
+    void RefreshContent();
 
 private:
     // 浮层窗口过程
@@ -62,6 +69,17 @@ private:
     void DestroyBackBuffer();
     // 依据位置设置计算浮层在指定工作区内的左上角坐标
     void ComputePosition(const RECT& rcWork, int ovW, int ovH, int* x, int* y) const;
+    // 按显示器 DPI 返回浮层缩放系数
+    static float ScaleForMonitor(HMONITOR monitor, RECT* workArea = nullptr);
+    // 获取指定 DPI 与最终缩放系数对应的字体集合（按需创建）。
+    // 工作区过小时布局会收缩缩放系数，字体必须使用同一系数，否则文字会偏大。
+    struct FontSet {
+        HFONT large = nullptr;
+        HFONT medium = nullptr;
+        HFONT smallFont = nullptr;
+    };
+    FontSet& FontsForDpi(UINT dpi, float scale);
+    void DestroyFontSets();
     // 主题相关颜色
     COLORREF BorderColor() const;
     COLORREF LabelColor() const;
@@ -73,13 +91,15 @@ private:
     void EnsureWindowCount(int count);
 
     std::vector<HWND> m_hwnds;      // 浮层窗口句柄列表（每个显示器一个）
-    HFONT m_fontLarge = nullptr;    // 大号字体（锁键图标）
-    HFONT m_fontMedium = nullptr;   // 中号字体（标签文字）
-    HFONT m_fontSmall = nullptr;    // 小号字体（音量百分比）
+    // 按 (DPI, 实际缩放系数) 缓存字体：同一 DPI 在不同工作区限制下
+    // 可能得到不同缩放系数，不能只按 DPI 复用。
+    std::map<std::pair<UINT, int>, FontSet> m_fontSets;
+    FontSet* m_paintFonts = nullptr;    // 当前绘制使用的字体集合
     HBRUSH m_bgBrush = nullptr;     // 背景画刷（深色）
     HBRUSH m_barBgBrush = nullptr;  // 音量条背景画刷
     HBRUSH m_barFillBrush = nullptr;// 音量条填充画刷（绿色）
     HBRUSH m_barMuteBrush = nullptr;// 静音状态画刷（红色）
+    HPEN m_barBorderPen = nullptr;  // 音量条边框画笔（随主题重建，避免每帧创建）
 
     int m_vkCode = 0;               // 当前显示的锁键虚拟码
     bool m_state = false;           // 当前锁键状态
@@ -93,7 +113,17 @@ private:
     int m_corner = 1;               // 边框（0=直角 1=圆角）
     int m_alpha = OVERLAY_ALPHA_LOW_TRANSPARENCY; // 当前浮层不透明度（0-255），默认低透明档
     int m_showDurationMs = 1000;    // 浮层显示时长（毫秒）；0 表示保持显示不自动隐藏
-    // 离屏渲染缓冲：逐像素透明度需要 32 位 DIB，尺寸随浮层变化重建
+    // 离屏渲染缓冲：逐像素透明度需要 32 位 DIB。
+    // 多显示器尺寸不同时按 (宽,高) 缓存，避免每次切换窗口都重建位图。
+    struct BackBuffer {
+        HDC dc = nullptr;
+        HBITMAP bmp = nullptr;
+        HBITMAP oldBmp = nullptr;
+        void* bits = nullptr;
+        int w = 0;
+        int h = 0;
+    };
+    std::map<std::pair<int, int>, BackBuffer> m_backBufferCache;
     HDC m_memDC = nullptr;
     HBITMAP m_memBmp = nullptr;
     HBITMAP m_memOldBmp = nullptr;

@@ -1,6 +1,7 @@
 #pragma code_page(65001)
 
 #include "Resource.h"
+#include "../src/Version.h"
 
 #ifndef VS_FFI_FILEFLAGSMASK
 #define VS_FFI_FILEFLAGSMASK 0x3F
@@ -14,14 +15,19 @@
 #ifndef VFT2_UNKNOWN
 #define VFT2_UNKNOWN 0x00000000
 #endif
+// RC 预处理器默认不定义 RT_MANIFEST；不补此宏会把清单写成字符串资源类型，
+// 导致 exe 实际没有 RT_MANIFEST(24) 资源，UAC/DPI 清单不生效
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
 
 IDI_APP ICON "KeySentry.ico"
 
 1 RT_MANIFEST "KeySentry.manifest"
 
 1 VERSIONINFO
-FILEVERSION 2,0,0,1101
-PRODUCTVERSION 2,0,0,1101
+FILEVERSION KS_VERSION_MAJOR,KS_VERSION_MINOR,KS_VERSION_PATCH,KS_VERSION_BUILD
+PRODUCTVERSION KS_VERSION_MAJOR,KS_VERSION_MINOR,KS_VERSION_PATCH,KS_VERSION_BUILD
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 FILEFLAGS 0
 FILEOS VOS_NT_WINDOWS32
@@ -34,12 +40,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Marvin"
             VALUE "FileDescription", "Key Sentry 键客"
-            VALUE "FileVersion", "2.0.0.1101"
+            VALUE "FileVersion", KS_VERSION_STRING_A
             VALUE "InternalName", "KeySentry"
             VALUE "LegalCopyright", "Copyright 2026 Marvin 翁敏峰"
-            VALUE "OriginalFilename", "KeySentry.exe"
             VALUE "ProductName", "Key Sentry 键客"
-            VALUE "ProductVersion", "2.0.0.1101"
+            VALUE "ProductVersion", KS_VERSION_STRING_A
         END
     END
     BLOCK "VarFileInfo"

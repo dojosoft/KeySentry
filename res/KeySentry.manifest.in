@@ -3,8 +3,21 @@
   <assemblyIdentity
     type="win32"
     name="KeySentry"
-    version="1.0.1.512"/>
+    version="@KS_VERSION_DOTTED@"/>
   <description>KeySentry</description>
+  <!-- 使用 Visual Styles 通用控件（comctl32 v6）：Win7 及以上均支持，
+       复选框、下拉框、滚动条等系统控件才会呈现现代主题外观 -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"/>
+    </dependentAssembly>
+  </dependency>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -14,10 +27,12 @@
   </trustInfo>
   <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
     <asmv3:windowsSettings>
-      <!-- 高 DPI 适配：声明系统级 DPI 感知，配合 Utils.h 中的 UI 缩放，
-           使字体与控件随系统 DPI 同比放大，避免高分辨率下界面偏小。
-           不使用 dpiAwareness(PerMonitorV2)，以保持 Win7 SP1 兼容。 -->
+      <!-- 高 DPI 适配：Win10 1703+ 使用 PerMonitorV2（配合 WM_DPICHANGED），
+           Win7/8.1 不认识 dpiAwareness 时回退到系统级 dpiAware=true。 -->
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <!-- 长路径支持：需系统开启 LongPathsEnabled（Win10 1607+），旧系统忽略 -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </asmv3:windowsSettings>
   </asmv3:application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

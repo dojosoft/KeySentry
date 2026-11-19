@@ -4,7 +4,7 @@
 #include "Config.h"
 
 // ===== 设置对话框类 =====
-// 管理键客 KeySentry 的所有设置界面，包括常规、按键禁用、按键映射、
+// 管理键客 KeySentry 的所有设置界面，包括常规、按键屏蔽、按键映射、
 // 热键管理、窗口隐藏、窗口置顶六个选项卡页面的创建、交互和配置保存。
 class SettingsDialog {
 public:
@@ -27,6 +27,11 @@ public:
     // 设置应用回调函数，在配置被应用后通知外部模块
     static void SetApplyCallback(void (*callback)());
     static void (*s_applyCallback)();
+
+    // 外观/语言偏好回调：设置窗口内的小图标按钮修改配置后立即通知主窗口
+    // 应用主题、语言并保存配置（这两个偏好不受「取消」回滚）
+    static void SetUiPreferenceCallback(void (*callback)());
+    static void (*s_uiPreferenceCallback)();
 
     // 设置按键捕获模式回调，进入/退出捕获模式时通知钩子模块
     static void SetCaptureModeCallback(void (*callback)(bool));
@@ -52,8 +57,10 @@ public:
 
     // 将窗口隐藏热键重置为默认值（Win+`）
     static void ResetHotKey(HWND hwnd);
-    // 将一键关闭程序热键重置为默认值（Win+Esc）
+    // 清除一键关闭程序热键（清除后显示为“未设置”；默认值为 Win+Esc）
     static void ResetCloseHotKey(HWND hwnd);
+    // 恢复一键关闭程序热键为默认值（Win+Esc）
+    static void DefaultCloseHotKey(HWND hwnd);
 
     // 刷新禁用按键列表视图的内容
     static void RefreshDisabledKeyList(HWND hwnd, AppConfig& config);
@@ -67,6 +74,8 @@ public:
 
     // 添加一条按键映射规则（先捕获源按键，再从键盘选择器选目标按键）
     static void AddRemapEntry(HWND hwnd, AppConfig& config);
+    // 添加按键互换：捕获两个键，生成 A→B 与 B→A 两条联动映射
+    static void AddSwapMapping(HWND hwnd, AppConfig& config);
     // 从按键映射列表中删除选中项
     static void RemoveRemapEntry(HWND hwnd, AppConfig& config);
     // 刷新按键映射列表视图的内容
@@ -105,6 +114,8 @@ public:
         UINT captureCloseMod;       // 捕获到的一键关闭热键修饰键
         UINT captureCloseVK;        // 捕获到的一键关闭热键虚拟键码
         bool applied = false;       // 本次会话是否应用过设置（关闭时决定是否需要回滚）
+        HWND themeTip = nullptr;    // 外观图标按钮的悬浮提示
+        HWND langTip = nullptr;     // 语言图标按钮的悬浮提示
         std::vector<BoundWindowInfo> allWindowsCache; // 所有可选窗口的缓存
     };
 };

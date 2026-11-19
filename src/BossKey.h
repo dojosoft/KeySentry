@@ -2,7 +2,9 @@
 #include <Windows.h>
 #include <vector>
 #include <string>
+#include <mutex>
 #include "Config.h"
+#include "HookThread.h"
 
 // 前向声明：仅在成员中作指针使用，避免头文件引入 COM 头
 struct IMMDeviceEnumerator;
@@ -61,6 +63,9 @@ public:
     void VerifyPendingHide();
     // 释放缓存的音频 COM 接口：正常退出时须在 CoUninitialize 之前调用
     void ReleaseAudio();
+    // 正常退出路径：若系统静音由本程序造成则立即解除。
+    // 必须在 ReleaseAudio() 与 CoUninitialize 之前调用，否则 COM 已反初始化会静默失败
+    void RestoreSystemMute();
 
     // 安装鼠标低级钩子（用于中键/侧键触发）
     bool InstallMouseHook(HWND notifyWnd);
@@ -86,17 +91,28 @@ private:
     // 鼠标低级钩子回调
     static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-    // 获取恢复文件路径（优先 exe 同目录的 KeySentry.recover，目录只读时回退 %APPDATA%\KeySentry）
+    // 恢复文件的全部候选位置（exe 同目录、%APPDATA%\KeySentry）
+    static std::vector<std::wstring> GetRecoverFileCandidates();
+    // 首选写入路径的缓存：写失败后可切换到另一候选位置（R15-M04）
+    static std::wstring& RecoverPathCache();
+    // 获取首选恢复文件路径（优先 exe 同目录，目录只读时回退 AppData）
     static std::wstring GetRecoverFilePath();
+    // 将恢复记录原子写入恢复文件（content 为 v2/v3/v4 文本行）：
+    // 首选位置失败时尝试其他候选；deleteOtherCandidates=false 用于
+    // 保留另一份无法读取的旧记录供后续诊断/提权处理（R15-M04/M05）
+    static bool SaveRecoverContent(const std::wstring& content,
+                                   bool deleteOtherCandidates = true);
     // 删除恢复文件（窗口恢复/进程关闭后调用）
     void ClearRecoverFile();
 
+
     bool m_active = false;          // 当前是否处于激活（隐藏）状态
     bool m_pendingVerify = false;   // 是否等待"异步隐藏延迟确认"（见 VerifyPendingHide）
+    // 异步隐藏的确认重试次数：隐藏可能晚于首次确认才生效，
+    // 过早清账会让迟到隐藏的窗口失去恢复记录
+    int m_pendingVerifyRetries = 0;
     HWND m_hwnd = nullptr;          // 热键所属窗口句柄
     int m_hotkeyId = 0;             // 热键ID
-    UINT m_modifiers = 0;           // 热键修饰键
-    UINT m_vk = 0;                  // 热键虚拟键码
     bool m_registered = false;      // 热键是否已注册
     bool m_muteEnabled = true;      // 隐藏时是否静音
     bool m_hideCurrentWindow = false; // 是否隐藏当前活动窗口
@@ -107,17 +123,38 @@ private:
         HWND hwnd;                  // 窗口句柄
         int showCmd;                // 隐藏前的窗口显示状态（正常/最小化/最大化）
         DWORD pid;                  // 进程ID
+        // 枚举时缓存的标题与进程名：写恢复文件时直接复用，
+        // 避免对每个窗口再次执行跨进程 WM_GETTEXT / OpenProcess
+        std::wstring title;
+        std::wstring processName;
+        // 隐藏请求已异步投递但尚未确认生效：窗口当前可见时也不能当作
+        // “从未隐藏/已经恢复”，否则迟到的 SW_HIDE 会让它失去恢复记录（R15-M03）
+        bool hidePending = false;
     };
     std::vector<HiddenWindow> m_hiddenWindows; // 被隐藏的窗口列表
+    // 上一轮启动未能恢复的遗留记录（原样保存的 v2/v3/v4 行）。
+    // 本会话任何 ClearRecoverFile 都必须保留它们，避免“没有可隐藏窗口”的
+    // 一次切换把遗留窗口的恢复线索删除；后续保存时与新记录合并写回
+    std::wstring m_legacyRecoverContent;
+    // 启动时存在无法读取/异常膨胀的恢复文件：保留该文件供人工检查或提权处理，
+    // 本会话的保存/清理不得删除它（R15-M05）
+    bool m_recoverHasUnreadableFile = false;
     std::vector<BoundWindowInfo> m_boundWindows; // 绑定的窗口匹配规则
-    bool m_wasMuted = false;        // 隐藏前系统是否已静音
-    // m_wasMuted 是否有效：GetMute 失败时不能用陈旧值恢复，否则会把
-    // 用户本来的静音状态改错（恢复成上一轮的记录）
-    bool m_wasMutedValid = false;
+    // 本程序静音过的输出端点。隐藏期间默认设备可能被切换，
+    // 每个端点单独保存“静音前状态”，恢复时按设备 ID 逐个还原；
+    // 同一端点重复静音时保留最早快照，不能被“本程序造成的静音”覆盖。
+    struct MutedEndpoint {
+        std::wstring deviceId;  // 空表示无法获取设备 ID，退回当前默认端点
+        bool wasMuted = false;  // 静音前该端点是否已静音
+        bool valid = false;     // wasMuted 是否可信（GetMute 成功）
+    };
+    std::vector<MutedEndpoint> m_mutedEndpoints;
     bool m_mutedByUs = false;       // 本次静音是否由本程序发起（据此决定恢复时是否解除静音）
     ULONGLONG m_lastDeactivateTick = 0; // 上次停用的时间戳
 
-    HHOOK m_mouseHook = nullptr;    // 鼠标低级钩子句柄
+    HookThread m_mouseHookThread;   // 鼠标钩子专用线程：避免 UI 阻塞导致钩子被移除
+    // 保护钩子线程与 UI 线程共享的鼠标触发设置（UI 侧只做短赋值）
+    std::recursive_mutex m_mouseStateMutex;
     HWND m_mouseNotifyWnd = nullptr; // 鼠标事件通知窗口
     bool m_middleBtnEnabled = false; // 中键触发老板键
     bool m_sideBtn1Enabled = false;  // 侧键1触发老板键
@@ -128,6 +165,7 @@ private:
     // 缓存的音量接口：按默认输出设备 ID 复用，设备变化时重建
     IAudioEndpointVolume* m_pVolume = nullptr;
     std::wstring m_volumeDeviceId;  // m_pVolume 对应的默认输出设备 ID
-    std::wstring m_mutedDeviceId;   // 本程序静音时所作用的设备 ID
-    static BossKey* s_instance;     // 单例指针，供静态回调使用
+    // 单例指针供钩子线程回调使用：UI 线程在构造/析构时写入，必须用原子类型，
+    // 避免 Stop 超时放弃线程时与回调读取形成数据竞争（R9-A8）
+    static std::atomic<BossKey*> s_instance;
 };
