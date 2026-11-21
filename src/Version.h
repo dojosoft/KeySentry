@@ -7,10 +7,10 @@
 // ============================================================
 #define KS_VERSION_MAJOR 3
 #define KS_VERSION_MINOR 0
-#define KS_VERSION_PATCH 0
-#define KS_VERSION_BUILD 1120
+#define KS_VERSION_PATCH 1
+#define KS_VERSION_BUILD 1121
 
 // RC 的 VALUE 字符串使用窄字符串宏
-#define KS_VERSION_STRING_A "3.0.0.1120"
+#define KS_VERSION_STRING_A "3.0.1.1121"
 // C++ 界面使用宽字符串
-#define KS_VERSION_STRING_W L"3.0.0.1120"
+#define KS_VERSION_STRING_W L"3.0.1.1121"

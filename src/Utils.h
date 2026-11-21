@@ -540,8 +540,10 @@ extern HWND g_mainWnd;
 extern std::atomic<bool> g_suppressHotkeys;
 
 struct AppConfig;
-// 预检查热键冲突（在设置对话框中应用前调用）
-extern std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig);
+// 预检查热键冲突（在设置对话框中应用前调用）。
+// occupancyOnly=true 时只检测是否被其他程序占用（打开设置时提醒用）
+extern std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig,
+                                            bool occupancyOnly = false);
 // 弹出托盘气泡通知（warning 为 true 时用警告图标）；实现见 Main.cpp
 extern void ShowTrayNotification(const std::wstring& text, bool warning);
 

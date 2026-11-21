@@ -629,6 +629,18 @@ INT_PTR SettingsDialog::Show(HWND parent, AppConfig& config) {
     UpdateWindow(hwnd);
     FocusFirstPageControl(hwnd);
 
+    // 打开设置时检查热键是否被其他程序占用。只做占用检测，
+    // 不重复提示逻辑冲突/危险快捷键，避免每次进入设置都被打扰（R16）
+    {
+        const std::wstring occupied = PreCheckHotkeyConflicts(data.workingCopy, true);
+        if (!occupied.empty()) {
+            const std::wstring msg =
+                Tr(L"检测到以下热键被其他程序占用：\n\n") + occupied;
+            Fluent::ShowMessageBoxRaw(hwnd, msg.c_str(), Tr(L"热键被占用"),
+                                      MB_OK | MB_ICONWARNING);
+        }
+    }
+
     // 模态消息循环
     MSG msg;
     while (IsWindow(hwnd)) {

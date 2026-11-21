@@ -679,7 +679,11 @@ static void ShowTrayMenu(HWND hwnd) {
                     IDM_LANG_ZH, L"中文");
         AppendMenuW(hLang, MF_STRING | (g_config.appLanguage == 1 ? MF_CHECKED : 0),
                     IDM_LANG_EN, L"English");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hLang, L"Language");
+        // 语言菜单项故意使用与当前界面相反的语言：中文界面显示 "Language"，
+        // 英文界面显示 "语言"，便于用户在当前语言下找到切换入口
+        const wchar_t* langMenuText =
+            (GetAppLanguage() == AppLanguage::Chinese) ? L"Language" : L"语言";
+        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hLang, langMenuText);
     }
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_ABOUT, Tr(L"关于"));
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, Tr(L"退出"));
@@ -1421,10 +1425,13 @@ static std::wstring ConfigLoadFailureText() {
 //   4. 检查所有热键与危险快捷键的冲突
 //   5. 尝试注册热键检测是否被其他程序占用
 //   6. 检测完成后恢复当前配置的热键注册
-std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
+std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig, bool occupancyOnly) {
     std::wstring conflicts;
     s_conflictLinesTruncated = false;  // 每次预检独立统计，避免上次结果影响本次提示
 
+    // occupancyOnly 用于“打开设置时”的提醒：只检查是否被其他程序占用，
+    // 不检查逻辑冲突与危险快捷键，避免每次进入设置都弹出大量建议（R16）
+    if (!occupancyOnly) {
     // --- 第一阶段：逻辑冲突检查 ---
 
     // 检查窗口隐藏热键与一键关闭热键是否相同
@@ -1500,6 +1507,8 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
             }
         }
     }
+
+    }  // !occupancyOnly
 
     // --- 第三阶段：热键注册占用检测 ---
 
@@ -1608,8 +1617,9 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
         }
     }
 
-    // 恢复失败时提示用户，避免热键静默失效且用户无感知
-    if (restoreFailed) {
+    // 恢复失败时提示用户，避免热键静默失效且用户无感知。
+    // 占用检测模式下由调用方统一展示占用列表，避免连续弹两个对话框（R16）
+    if (restoreFailed && !occupancyOnly) {
         ShowAppMessage(L"部分已生效的热键在冲突检测后未能重新注册，\n请重启程序或重新应用设置。");
     }
 
@@ -1622,20 +1632,11 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig) {
     return conflicts;
 }
 
-// ===== WarnHotkeyOnce =====
-// 功能：热键注册失败提示（内容相同只提示一次）
-// 逻辑：ApplyConfig 在每次点击"应用/确定"时都会执行，若某热键被其他程序长期占用，
-//       反复弹窗会造成困扰；仅在提示内容发生变化时再次弹窗
-//       全部热键注册成功时会清空 g_lastHotkeyWarning（见 ApplyConfig），
-//       避免"曾经冲突过"的同一提示永久静默
+// ===== 热键注册失败提示去重 =====
+// ApplyConfig 在每次点击"应用/确定"时都会执行，若某热键被其他程序长期占用，
+// 反复弹窗会造成困扰；仅在提示内容发生变化时再次弹窗。
+// 全部热键注册成功时会清空该集合（见 ApplyConfig），避免永久静默。
 static std::set<std::wstring> g_warnedHotkeyMessages;
-
-static void WarnHotkeyOnce(const std::wstring& msg) {
-    // 按失败内容去重：多条不同失败交替出现时，每条只提示一次，
-    // 避免每次“应用”都在两条提示之间来回弹窗
-    if (!g_warnedHotkeyMessages.insert(msg).second) return;
-    ShowAppMessage(msg);
-}
 
 // 含用户字段（热键描述/命令）的失败提示：原样展示，禁止片段翻译改写用户数据（R9-M5）。
 // 标题仍需按当前语言翻译（R10-A1）
@@ -1746,6 +1747,9 @@ static void ApplyConfig() {
 
     // 本轮所有热键是否都注册成功：成功则复位提示状态（冲突解决后再出现仍要提示）
     bool hotkeyAllOk = true;
+    // 三类热键的注册失败集中为一条提醒：窗口隐藏、关闭程序、自定义热键，
+    // 避免多条托盘气泡互相覆盖导致用户漏看（R16）
+    std::vector<std::wstring> failedHotkeyLines;
 
     // 注册窗口隐藏热键（老板键）
     // 兜底：mod/vk 为 0 时不注册，避免手改 INI 产生的裸键全局劫持普通按键
@@ -1755,7 +1759,9 @@ static void ApplyConfig() {
             if (!g_bossKey.Register(g_mainWnd, BOSS_HOTKEY_ID, g_config.bossKeyMod, g_config.bossKeyVK)) {
                 // 启动路径没有热键冲突预检，注册失败必须提示，否则用户会以为热键已生效
                 hotkeyAllOk = false;
-                WarnHotkeyOnce(L"窗口隐藏热键注册失败，可能被其他程序占用。\n仍可通过鼠标按键或屏幕角落触发。");
+                failedHotkeyLines.push_back(
+                    Tr(L"窗口隐藏热键: ") +
+                    FormatHKName(g_config.bossKeyMod, g_config.bossKeyVK));
             }
         }
     }
@@ -1769,14 +1775,15 @@ static void ApplyConfig() {
         if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, closeMod, g_config.bossKeyCloseVK)) {
             if (!RegisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID, g_config.bossKeyCloseMod, g_config.bossKeyCloseVK)) {
                 hotkeyAllOk = false;
-                WarnHotkeyOnce(L"关闭热键注册失败，可能被其他程序占用");
+                failedHotkeyLines.push_back(
+                    Tr(L"关闭程序热键: ") +
+                    FormatHKName(g_config.bossKeyCloseMod, g_config.bossKeyCloseVK));
             }
         }
     }
 
     // 注册自定义热键
     // 注册失败的条目聚合为一条提示，避免失效/冲突条目较多时连环弹窗
-    std::vector<std::wstring> failedHotkeys;
     if (g_config.customHotkeysEnabled) {
         for (size_t i = 0; i < g_config.customHotkeys.size() && i < MAX_CUSTOM_HOTKEYS; i++) {
             const auto& hk = g_config.customHotkeys[i];
@@ -1787,20 +1794,24 @@ static void ApplyConfig() {
                 regOk = RegisterHotKey(g_mainWnd, CUSTOM_HOTKEY_ID_START + (int)i, hk.mod, hk.vk);
                 if (!regOk) {
                     std::wstring name = hk.DisplayName();
-                    failedHotkeys.push_back(name.empty() ? L"(未命名热键)" : ShortenForMessage(name));
+                    if (name.empty()) name = Tr(L"(未命名热键)");
+                    else name = ShortenForMessage(name);
+                    failedHotkeyLines.push_back(
+                        Tr(L"自定义热键: ") + name + L" (" +
+                        FormatHKName(hk.mod, hk.vk) + L")");
                 }
             }
         }
     }
-    if (!failedHotkeys.empty()) {
+    if (!failedHotkeyLines.empty()) {
         hotkeyAllOk = false;
-        // 热键名称来自用户填写的描述/命令：固定标签先翻译，名称原样拼接，
+        // 热键名称来自用户填写的描述：固定标签先翻译，名称原样拼接，
         // 整段不走片段翻译，避免用户数据被改写（R9-M5）
-        std::wstring msg = Tr(L"以下自定义热键注册失败，可能与其他热键或程序冲突：\n");
-        size_t showCount = std::min(failedHotkeys.size(), (size_t)10);
-        for (size_t i = 0; i < showCount; ++i) msg += L"• " + failedHotkeys[i] + L"\n";
-        if (failedHotkeys.size() > showCount) {
-            msg += Tr(L"……等共 ") + std::to_wstring(failedHotkeys.size()) + Tr(L" 个");
+        std::wstring msg = Tr(L"以下热键注册失败，可能被其他程序占用：\n");
+        size_t showCount = std::min(failedHotkeyLines.size(), (size_t)10);
+        for (size_t i = 0; i < showCount; ++i) msg += L"• " + failedHotkeyLines[i] + L"\n";
+        if (failedHotkeyLines.size() > showCount) {
+            msg += Tr(L"……等共 ") + std::to_wstring(failedHotkeyLines.size()) + Tr(L" 个");
         }
         WarnHotkeyOnceRaw(msg);
     }
