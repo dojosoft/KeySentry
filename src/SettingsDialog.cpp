@@ -1557,10 +1557,15 @@ void SettingsDialog::RefreshCustomHotkeyList(HWND hwnd, AppConfig& config) {
         // 明确标注为无效，避免列表看起来正常却始终不生效；仍保留行以便选中删除
         std::wstring keyName = (hk.mod == 0 || hk.vk == 0)
             ? Tr(L"（无效）") : FormatHotKey(hk.mod, hk.vk);
-        // 模拟按键模式显示被模拟的按键/组合键，命令模式显示命令路径
-        std::wstring cmd = hk.simulateKey
-            ? (Tr(L"模拟按键: ") + FormatHotKey(hk.targetMod, hk.targetVK))
-            : (hk.command.empty() ? L"" : hk.command);
+        // 模拟按键模式显示被模拟的按键/组合键，打开模式显示目标路径，命令模式显示命令
+        std::wstring cmd;
+        if (hk.simulateKey) {
+            cmd = Tr(L"模拟按键: ") + FormatHotKey(hk.targetMod, hk.targetVK);
+        } else if (hk.openPath) {
+            cmd = Tr(L"打开: ") + hk.command;
+        } else {
+            cmd = hk.command;
+        }
         std::wstring desc = hk.description.empty() ? L"" : hk.description;
 
         LVITEMW item = {};

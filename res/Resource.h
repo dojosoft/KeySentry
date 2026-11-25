@@ -61,9 +61,8 @@
 #define IDC_CHK_CUSTOM_HK_ENABLE 3144
 #define IDC_BTN_FIX_ZORDER       3145
 
-// 自定义热键对话框：触发动作模式（运行命令/模拟按键）
-#define IDC_RADIO_HK_CMD         3146
-#define IDC_RADIO_HK_SIMKEY      3147
+// 自定义热键对话框：触发动作下拉框（运行命令/模拟按键/打开文件或目录）
+#define IDC_CBO_HK_ACTION        3146
 #define IDC_BTN_HK_PICKKEY       3148
 #define IDC_EDT_HK_SIMKEY        3149
 #define IDC_LBL_HK_CMDLABEL      3153
@@ -135,6 +134,7 @@
 #define TIMER_MUTE_REFRESH  7
 #define TIMER_BOSSKEY_VERIFY 8
 #define TIMER_HOOK_WATCH    9
+#define TIMER_MUTE_RESTORE_RETRY 10
 
 #ifndef IDAPPLY
 #define IDAPPLY             0x3021

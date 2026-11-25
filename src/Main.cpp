@@ -45,6 +45,10 @@ static constexpr UINT TIMER_NUMLOCK_DELAY_MS = 2000;  // 启动后延迟开启 N
 // 保证浮层显示的静音状态与系统实际状态一致（约 500ms 上限后强制按真实状态显示）
 static constexpr UINT TIMER_MUTE_REFRESH_MS = 50;     // 静音状态轮询间隔（毫秒）
 static constexpr UINT TIMER_HOOK_WATCH_MS = 5000;     // 键盘钩子探活间隔（毫秒）
+// 启动时音频服务/默认端点可能尚未就绪，静音恢复失败后按此间隔静默重试
+static constexpr UINT TIMER_MUTE_RESTORE_RETRY_MS = 5000;
+static constexpr int MUTE_RESTORE_RETRY_MAX = 24;     // 最多重试约 2 分钟，仍失败则留待下次启动
+
 static constexpr int  MUTE_REFRESH_MAX_TRIES = 6;     // 最大轮询次数（约 300ms，避免长延迟与过多 COM 查询）
 
 // ===== 角落检测常量 =====
@@ -100,6 +104,7 @@ static bool g_numLockFeatureWasOn = false; // 上次应用配置时 NumLock 守�
 // 该标记用于让 WM_DESTROY 跳过会阻塞关机的重复进程关闭，
 // 并让 wWinMain 跳过退出保存（避免在关机路径弹出"配置冲突"对话框）
 static bool g_sessionEnding = false;
+static int g_muteRestoreRetries = 0;      // 启动静音恢复的静默重试次数
 
 // ===== SetSettingsWnd =====
 // 功能：设置设置对话框的窗口句柄，供外部模块调用
@@ -256,20 +261,6 @@ static HWND FindSameProductMainWindow() {
     HWND found = nullptr;
     EnumWindows(FindSameProductMainWindowProc, reinterpret_cast<LPARAM>(&found));
     return found;
-}
-
-// 当前进程是否以提升后的管理员令牌运行。
-// 提权运行时配置文件仍在用户可写目录，若完全信任其中的自定义热键，
-// 同用户的中完整性进程可直接改 INI 绕过“执行前确认”实现高完整性执行。
-static bool IsProcessElevated() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-    TOKEN_ELEVATION elevation = {};
-    DWORD returned = 0;
-    const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation,
-                                        sizeof(elevation), &returned);
-    CloseHandle(token);
-    return ok && elevation.TokenIsElevated != 0;
 }
 
 // ===== SimulateTargetKeyPress =====
@@ -1662,14 +1653,6 @@ static void SetFeatureTimer(UINT id, UINT elapse, const wchar_t* failText) {
 // 逻辑：依次配置键盘钩子、悬浮窗、NumLock 守护、老板键、一键关闭热键、
 //       自定义热键、鼠标钩子、角落检测、自动隐藏、Win+D 守护、开机自启动等
 static void ApplyConfig() {
-    // 提权会话：每次应用配置时都重新强制命令型热键确认，
-    // 防止运行中通过设置页新增/编辑出无确认的提权执行路径
-    if (g_processElevated) {
-        for (auto& hk : g_config.customHotkeys) {
-            if (!hk.simulateKey) hk.confirmBeforeRun = true;
-        }
-    }
-
     // --- 键盘钩子相关配置 ---
     g_hook.SetShowOverlay(g_config.showLockKeyOverlay);            // 是否显示锁定键状态提示
     g_hook.SetShowMuteOverlay(g_config.showMuteOverlay);           // 是否显示静音状态提示
@@ -1882,16 +1865,6 @@ static void ApplyConfig() {
 // 功能：设置对话框中"应用"按钮的回调函数
 // 逻辑：保存配置到 INI 文件（原子写入），然后应用新配置
 static void ApplySettingsCallback() {
-    // 提权模式下先完成确认强制再落盘：否则磁盘保存的是未归一化的旧值，
-    // 崩溃/断电后重启前配置显示与实际运行不一致（R8-A7）
-    if (g_processElevated) {
-        for (auto& hk : g_config.customHotkeys) {
-            if (!hk.simulateKey && !hk.confirmBeforeRun) {
-                hk.confirmBeforeRun = true;
-                g_elevatedHotkeyGuard = true;
-            }
-        }
-    }
     // 落盘失败必须提示：否则界面显示"已应用"，重启后设置全部丢失。
     // 同一会话只提示一次，避免反复点"应用"时连环弹窗
     static bool saveFailedWarned = false;
@@ -2605,6 +2578,15 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 老板键异步隐藏的延迟确认（一次性）：迟到的隐藏生效后重新进入激活态
             KillTimer(g_mainWnd, TIMER_BOSSKEY_VERIFY);
             g_bossKey.VerifyPendingHide();
+        } else if (wp == TIMER_MUTE_RESTORE_RETRY) {
+            // 启动静音恢复的静默重试：等待音频服务/默认端点就绪后自动解除静音。
+            // 老板键激活期间不能解除静音，等恢复窗口后再继续
+            if (g_bossKey.IsActive()) return 0;
+            ++g_muteRestoreRetries;
+            const bool done = g_bossKey.RetryPendingMuteRestore();
+            if (done || g_muteRestoreRetries >= MUTE_RESTORE_RETRY_MAX) {
+                KillTimer(g_mainWnd, TIMER_MUTE_RESTORE_RETRY);
+            }
         } else if (wp == TIMER_MUTE_REFRESH) {
             // 轮询等待系统完成静音切换：状态达到目标值（或超时）后按真实状态显示浮层
             bool curMuted = false;
@@ -2691,8 +2673,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (!hk.command.empty()) {
                     // 执行前确认：自定义热键可指向任意程序，确认框必须展示真实执行内容。
-                    // “以管理员运行”即使未勾选确认也强制展示一次，避免静默提权执行
-                    if (hk.confirmBeforeRun || hk.runAsAdmin || g_processElevated) {
+                    // “以管理员运行”不再强制确认：非提权进程会通过 UAC 征求用户同意；
+                    // 提权进程仍由 g_processElevated 强制确认，防止可写配置静默提权执行
+                    if (hk.confirmBeforeRun || g_processElevated) {
                         // 固定标签按当前语言翻译；用户字段只清洗控制字符、原样展示，
                         // 且整段消息不做片段翻译，保证“确认什么就执行什么”（R8-H6）。
                         // 字段不做截断：确认框使用可滚动编辑框完整展示，
@@ -2702,22 +2685,50 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             confirmMsg += Tr(L"描述：");
                             confirmMsg += SanitizeConfirmField(hk.description) + L"\n";
                         }
-                        confirmMsg += Tr(L"程序：");
+                        confirmMsg += hk.openPath ? Tr(L"文件/目录：") : Tr(L"程序：");
                         confirmMsg += SanitizeConfirmField(hk.command) + L"\n";
-                        if (!hk.parameters.empty()) {
+                        if (!hk.openPath && !hk.parameters.empty()) {
                             confirmMsg += Tr(L"参数：");
                             confirmMsg += SanitizeConfirmField(hk.parameters) + L"\n";
                         }
-                        if (!hk.workDir.empty()) {
+                        if (!hk.openPath && !hk.workDir.empty()) {
                             confirmMsg += Tr(L"工作目录：");
                             confirmMsg += SanitizeConfirmField(hk.workDir) + L"\n";
                         }
-                        if (hk.runAsAdmin) {
-                            confirmMsg += Tr(L"\n注意：将以管理员权限运行，随后会弹出系统 UAC 提示。");
+                        if (!hk.openPath && hk.runAsAdmin) {
+                            confirmMsg += g_processElevated
+                                ? Tr(L"\n注意：当前已以管理员身份运行，子进程将继承管理员权限。")
+                                : Tr(L"\n注意：将以管理员权限运行，随后会弹出系统 UAC 提示。");
                         }
                         // 走确认封装：确认框必须置前/置顶，否则从全屏程序里触发时
                         // 会被前台窗口盖住，UI 线程停在看不到的模态循环里，表现为"热键没反应"
                         if (!ConfirmCustomHotkey(confirmMsg)) return 0;
+                    }
+
+                    // 统一规范化命令（去掉用户误粘贴的首尾引号），
+                    // CreateProcess、ShellExecute 与打开路径共用同一份路径
+                    std::wstring command = hk.command;
+                    if (command.size() >= 2 && command.front() == L'"' && command.back() == L'"') {
+                        const std::wstring unquoted = command.substr(1, command.size() - 2);
+                        if (GetFileAttributesW(unquoted.c_str()) != INVALID_FILE_ATTRIBUTES)
+                            command = unquoted;
+                    }
+
+                    // 打开文件/目录：交给 Shell 用默认关联程序打开，不经过 CreateProcess。
+                    // 提权会话中该操作同样以管理员权限执行，因此确认条件与命令型一致
+                    if (hk.openPath) {
+                        if (command.empty()) return 0;
+                        INT_PTR result = (INT_PTR)ShellExecuteW(nullptr, L"open", command.c_str(),
+                                                               nullptr, nullptr, SW_SHOWNORMAL);
+                        if (result <= 32) {
+                            std::wstring errMsg = std::wstring(Tr(L"打开失败: ")) +
+                                                  SanitizeConfirmField(command);
+                            const bool prevSuppress = g_suppressHotkeys;
+                            g_suppressHotkeys = true;
+                            ShowAppMessageRaw(errMsg, MB_OK | MB_ICONERROR, Tr(L"错误"));
+                            g_suppressHotkeys = prevSuppress;
+                        }
+                        return 0;
                     }
 
                     // 根据配置设置启动窗口状态
@@ -2725,15 +2736,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (hk.windowState == HotkeyWindowState::Minimized) showCmd = SW_SHOWMINIMIZED;
                     else if (hk.windowState == HotkeyWindowState::Maximized) showCmd = SW_SHOWMAXIMIZED;
                     else if (hk.windowState == HotkeyWindowState::Hidden) showCmd = SW_HIDE;
-
-                    // 统一规范化命令（去掉用户误粘贴的首尾引号），
-                    // CreateProcess 与 ShellExecute 共用同一份路径
-                    std::wstring command = hk.command;
-                    if (command.size() >= 2 && command.front() == L'"' && command.back() == L'"') {
-                        const std::wstring unquoted = command.substr(1, command.size() - 2);
-                        if (GetFileAttributesW(unquoted.c_str()) != INVALID_FILE_ATTRIBUTES)
-                            command = unquoted;
-                    }
 
                     bool launched = false;
 
@@ -2886,6 +2888,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, TIMER_MUTE_REFRESH);   // 清理静音状态刷新定时器
             KillTimer(hwnd, TIMER_BOSSKEY_VERIFY); // 清理老板键延迟确认定时器
             KillTimer(hwnd, TIMER_HOOK_WATCH);     // 清理键盘钩子探活定时器
+            KillTimer(hwnd, TIMER_MUTE_RESTORE_RETRY); // 清理启动静音恢复重试定时器
             // 先卸载钩子再做窗口恢复/进程关闭：这些操作会跨进程同步调用，
             // 若仍持有低级钩子，整个系统的键鼠输入会随 UI 线程一起被拖住
             g_hook.Uninstall();             // 卸载键盘钩子
@@ -2938,6 +2941,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_MUTE_REFRESH);   // 清理静音状态刷新定时器
         KillTimer(hwnd, TIMER_BOSSKEY_VERIFY); // 清理老板键延迟确认定时器
         KillTimer(hwnd, TIMER_HOOK_WATCH);     // 清理键盘钩子探活定时器
+        KillTimer(hwnd, TIMER_MUTE_RESTORE_RETRY); // 清理启动静音恢复重试定时器
         // 先卸载钩子：恢复窗口/关闭进程可能阻塞 UI 线程，不能让系统输入继续挂在钩子上
         g_hook.Uninstall();             // 卸载键盘钩子
         g_bossKey.UninstallMouseHook(); // 卸载鼠标钩子
@@ -3111,14 +3115,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_config.Load(g_iniPath);       // 加载配置
     RefreshConfigStamp();           // 记录载入时的文件时间，退出时用于检测外部编辑
     // 提权运行时配置文件仍位于用户可写目录：同用户的中完整性进程可以直接
-    // 改写 CustomHotkeys 并关闭“执行前确认”。这里对所有从磁盘加载的命令型
-    // 自定义热键强制启用确认，保证用户总能看到真实执行内容
-    g_processElevated = IsProcessElevated();
+    // 改写 CustomHotkeys 并关闭“执行前确认”。执行阶段会按 g_processElevated
+    // 强制确认，但不再回写 confirmBeforeRun —— 否则用户取消勾选后会被
+    // 提权会话永久改回勾选并落盘，非提权运行时就再也取消不掉（R16）
+    g_processElevated = ProcessUtils::IsElevated();
     if (g_processElevated) {
-        for (auto& hk : g_config.customHotkeys) {
-            if (!hk.simulateKey && !hk.confirmBeforeRun) {
-                hk.confirmBeforeRun = true;
+        for (const auto& hk : g_config.customHotkeys) {
+            // 模拟按键没有“确认”配置，提权时同样会强制确认；
+            // 命令型只在原本未勾选确认时提示，避免重复打扰
+            if (hk.simulateKey || !hk.confirmBeforeRun) {
                 g_elevatedHotkeyGuard = true;
+                break;
             }
         }
     }
@@ -3179,6 +3186,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // ApplyConfig 会安装键盘/鼠标低级钩子，而恢复窗口需要跨进程同步调用，
     // 先装钩子再做恢复会让系统输入悬挂在尚未就绪的 UI 线程上
     int recoveredWindows = g_bossKey.RecoverOrphanedWindows();
+    // 开机自启动时音频服务/默认端点可能尚未就绪，启动恢复静音可能暂时失败：
+    // 静默重试一段时间，避免开机就弹“音频设备暂不可用”的提示
+    if (g_bossKey.HasPendingMuteRestore()) {
+        g_muteRestoreRetries = 0;
+        SetTimer(g_mainWnd, TIMER_MUTE_RESTORE_RETRY, TIMER_MUTE_RESTORE_RETRY_MS, nullptr);
+    }
 
     ApplyConfig();
     ApplyExplorerSettings();  // 启动时重置资源管理器文件夹选项

@@ -345,7 +345,8 @@ void BossKey::RestoreSystemMute() {
     // 有逐端点记录时按原始状态恢复：用户原本就静音的端点保持静音，
     // 不能被退出兜底强制解除。只有崩溃恢复（无记录、原状态未知）
     // 才强制解除当前默认端点，避免无声状态持续。
-    SetMute(false, m_mutedEndpoints.empty());
+    // 退出阶段静默处理：失败记录已写回恢复文件，无需在退出瞬间弹气泡
+    SetMute(false, m_mutedEndpoints.empty(), true);
 }
 
 // 注册老板键热键，先注销旧热键再注册新热键
@@ -861,7 +862,7 @@ static void WarnMuteRestoreFailedOnce() {
 
 static void ResetMuteRestoreWarn() { s_muteRestoreWarned = false; }
 
-void BossKey::SetMute(bool mute, bool forceUnmute) {
+void BossKey::SetMute(bool mute, bool forceUnmute, bool quiet) {
     // COM 已在主线程 wWinMain 中初始化，无需重复初始化
 
     // 复用缓存的设备枚举器：老板键可由鼠标中键/侧键频繁切换，
@@ -871,7 +872,7 @@ void BossKey::SetMute(bool mute, bool forceUnmute) {
                                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&m_pEnumerator));
         if (FAILED(hr)) {
             m_pEnumerator = nullptr;
-            if (!mute) WarnMuteRestoreFailedOnce();
+            if (!mute && !quiet) WarnMuteRestoreFailedOnce();
             return;
         }
     }
@@ -917,13 +918,20 @@ void BossKey::SetMute(bool mute, bool forceUnmute) {
 
     // 按设备 ID 打开历史端点：隐藏期间切换默认输出后仍需恢复旧设备，
     // 否则旧设备会一直保持静音（用户切回该设备时无声）。
-    auto openEndpointVolume = [this](const std::wstring& id) -> IAudioEndpointVolume* {
+    // hrOut 返回打开结果：E_NOTFOUND/E_INVALIDARG 表示端点已不存在，
+    // 与音频服务暂不可用（其他错误）区分，前者可以直接丢弃记录
+    auto openEndpointVolume = [this](const std::wstring& id,
+                                     HRESULT* hrOut) -> IAudioEndpointVolume* {
+        if (hrOut) *hrOut = E_FAIL;
         if (id.empty() || !m_pEnumerator) return nullptr;
         IMMDevice* device = nullptr;
-        if (FAILED(m_pEnumerator->GetDevice(id.c_str(), &device)) || !device) return nullptr;
+        HRESULT hr = m_pEnumerator->GetDevice(id.c_str(), &device);
+        if (hrOut) *hrOut = hr;
+        if (FAILED(hr) || !device) return nullptr;
         IAudioEndpointVolume* volume = nullptr;
-        device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-                         nullptr, reinterpret_cast<void**>(&volume));
+        hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+                              nullptr, reinterpret_cast<void**>(&volume));
+        if (hrOut) *hrOut = hr;
         device->Release();
         return volume;
     };
@@ -958,23 +966,33 @@ void BossKey::SetMute(bool mute, bool forceUnmute) {
         // 没有逐端点记录（崩溃恢复或旧版本状态）：只处理当前默认端点
         if (m_mutedByUs || forceUnmute) {
             if (FAILED(m_pVolume->SetMute(FALSE, nullptr))) {
-                if (!forceUnmute) WarnMuteRestoreFailedOnce();
+                if (!forceUnmute && !quiet) WarnMuteRestoreFailedOnce();
                 return;
             }
             m_mutedByUs = false;
+            m_muteRestorePending = false;
             ResetMuteRestoreWarn();
+            DropResolvedMuteRecordsFromLegacyContent();
         }
         return;
     }
 
-    // 逐个端点恢复。设备已拔出/不可用时保留记录，等下次恢复或下次启动重试；
-    // 强制解除（崩溃恢复/退出）时无法恢复的设备只提示一次，不再无限重试。
+    // 逐个端点恢复。端点已被系统移除（E_NOTFOUND/E_INVALIDARG）时记录永久失效，
+    // 直接丢弃，避免每次启动都重试并提示“设备暂不可用”；
+    // 其他错误（音频服务暂不可用等）保留记录，等本次重试或下次启动继续。
     std::vector<MutedEndpoint> stillMuted;
     bool restoreFailed = false;
     for (const auto& endpoint : m_mutedEndpoints) {
         const bool useCurrent = endpoint.deviceId.empty() || endpoint.deviceId == m_volumeDeviceId;
-        IAudioEndpointVolume* volume = useCurrent ? m_pVolume : openEndpointVolume(endpoint.deviceId);
+        HRESULT openHr = S_OK;
+        IAudioEndpointVolume* volume = useCurrent ? m_pVolume
+                                                  : openEndpointVolume(endpoint.deviceId, &openHr);
         if (!volume) {
+            // 只有按设备 ID 打开时才可能确认“设备已不存在”；
+            // 当前默认端点失败属于服务/驱动暂不可用，仍需保留记录
+            if (!useCurrent && (openHr == E_NOTFOUND || openHr == E_INVALIDARG)) {
+                continue;
+            }
             restoreFailed = true;
             if (!forceUnmute) stillMuted.push_back(endpoint);
             continue;
@@ -993,12 +1011,62 @@ void BossKey::SetMute(bool mute, bool forceUnmute) {
     m_mutedEndpoints.swap(stillMuted);
     if (!restoreFailed) {
         m_mutedByUs = false;
+        m_muteRestorePending = false;
         ResetMuteRestoreWarn();
+        DropResolvedMuteRecordsFromLegacyContent();
     } else {
         // 非强制恢复：保留失败项继续重试；强制恢复：清空记录但保留标志，
         // 供恢复文件/下次启动兜底解除当前默认设备
         m_mutedByUs = true;
-        if (!forceUnmute) WarnMuteRestoreFailedOnce();
+        if (!forceUnmute && !quiet) WarnMuteRestoreFailedOnce();
+    }
+}
+
+// 静默重试启动时未完成的静音恢复。
+// 开机自启动时音频服务/默认端点可能尚未就绪，第一次恢复会失败；
+// 由定时器稍后重试，失败不弹气泡，成功则清理恢复文件中的静音记录。
+bool BossKey::RetryPendingMuteRestore() {
+    if (!m_muteRestorePending) return true;
+    // 老板键再次激活（窗口被隐藏并重新静音）时不能解除静音，
+    // 等恢复窗口后的 SetMute(false) 自行处理
+    if (m_active) return false;
+
+    SetMute(false, false, true);
+    if (!m_mutedByUs) {
+        m_muteRestorePending = false;
+        DropResolvedMuteRecordsFromLegacyContent();
+        return true;
+    }
+    return false;
+}
+
+// 静音记录已恢复：从 m_legacyRecoverContent 中删除 m5 行并落盘。
+// 不删除其他遗留窗口记录；全部清空时才删除恢复文件。
+void BossKey::DropResolvedMuteRecordsFromLegacyContent() {
+    if (m_legacyRecoverContent.empty()) return;
+    std::wstring filtered;
+    filtered.reserve(m_legacyRecoverContent.size());
+    bool changed = false;
+    size_t start = 0;
+    const std::wstring& src = m_legacyRecoverContent;
+    while (start < src.size()) {
+        size_t end = src.find(L'\n', start);
+        if (end == std::wstring::npos) end = src.size();
+        const size_t len = end - start;
+        if (len >= 3 && src.compare(start, 3, L"m5\t") == 0) {
+            changed = true;
+        } else {
+            filtered.append(src, start, len);
+            if (end < src.size()) filtered += L'\n';
+        }
+        start = end + 1;
+    }
+    if (!changed) return;
+    m_legacyRecoverContent.swap(filtered);
+    if (m_legacyRecoverContent.empty()) {
+        ClearRecoverFile();
+    } else {
+        SaveRecoverContent(m_legacyRecoverContent, !m_recoverHasUnreadableFile);
     }
 }
 
@@ -1691,16 +1759,20 @@ int BossKey::RecoverOrphanedWindows() {
     if (!recoveredMuteEndpoints.empty()) {
         m_mutedEndpoints = std::move(recoveredMuteEndpoints);
         m_mutedByUs = true;
-        SetMute(false);
+        // 启动阶段音频服务/端点可能尚未就绪：静默恢复，失败交给定时器稍后重试，
+        // 不再开机就弹“音频设备暂不可用”的告警
+        SetMute(false, false, true);
         // SetMute 会把失败/设备暂不可用的端点保留在 m_mutedEndpoints：
-        // 写回文件供下次启动继续尝试，不能删除恢复线索
+        // 写回文件供本次重试失败后下次启动继续尝试，不能删除恢复线索
         for (const auto& endpoint : m_mutedEndpoints) {
             failedLines += MakeMuteRecoverLine(endpoint.deviceId,
                                                endpoint.wasMuted, endpoint.valid);
         }
+        m_muteRestorePending = !m_mutedEndpoints.empty();
     } else if (wasMutedByUs) {
         // 崩溃后内存中的原静音状态已丢失，强制解除当前默认端点，避免无声状态持续
-        SetMute(false, true);
+        SetMute(false, true, true);
+        m_muteRestorePending = m_mutedByUs;
     }
 
     // 未处理的记录排在失败记录之前写回：下一次启动从上次的预算边界继续，

@@ -284,6 +284,31 @@ static void TestHotkeyFormatCompatibility() {
     CHECK(!cmdOut.simulateKey);
     CHECK(cmdOut.targetVK == 0);
     CHECK(cmdOut.targetMod == 0);
+
+    // “确认后执行”取消勾选后必须原样往返，不能被解析回 true
+    CustomHotkey noConfirm;
+    noConfirm.mod = MOD_CONTROL;
+    noConfirm.vk = 'H';
+    noConfirm.command = L"notepad.exe";
+    noConfirm.confirmBeforeRun = false;
+    const CustomHotkey noConfirmOut = CustomHotkey::Deserialize(noConfirm.Serialize());
+    CHECK(!noConfirmOut.confirmBeforeRun);
+    CHECK(!noConfirmOut.runAsAdmin);
+
+    // 打开文件/目录：仍写 11 字段，第 10 字段为 2，不能与模拟按键混淆
+    CustomHotkey open;
+    open.mod = MOD_ALT;
+    open.vk = 'O';
+    open.command = L"D:\\Docs";
+    open.openPath = true;
+    const std::wstring openText = open.Serialize();
+    CHECK(CountPipes(openText) == 10);
+    const CustomHotkey openOut = CustomHotkey::Deserialize(openText);
+    CHECK(openOut.openPath);
+    CHECK(!openOut.simulateKey);
+    CHECK(openOut.command == L"D:\\Docs");
+    CHECK(openOut.targetVK == 0);
+    CHECK(openOut.targetMod == 0);
 }
 
 static void TestEscapingAndPidRoundTrip() {

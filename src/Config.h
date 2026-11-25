@@ -190,6 +190,7 @@ struct CustomHotkey {
     bool confirmBeforeRun = false;       // 执行前是否需要确认
     bool runAsAdmin = false;             // 是否以管理员权限运行
     bool simulateKey = false;            // 触发动作类型：true=模拟按键（targetVK 为被模拟键），false=运行命令
+    bool openPath = false;               // 触发动作类型：true=打开文件/目录（command 为路径）
     UINT targetVK = 0;                   // 模拟按键模式下被模拟的按键虚拟键码
     UINT targetMod = 0;                  // 模拟按键模式下目标组合的修饰键（0 表示单键）
 
@@ -205,7 +206,9 @@ struct CustomHotkey {
                std::to_wstring((int)windowState) + L"|" +
                IniUtils::BoolToStr(confirmBeforeRun) + L"|" +
                IniUtils::BoolToStr(runAsAdmin) + L"|" +
-               IniUtils::BoolToStr(simulateKey) + L"|" +
+               // 第 10 字段为触发动作：0=运行命令，1=模拟按键，2=打开文件/目录。
+               // 旧版本按“非 0 即模拟按键”读取，看到 2 时会退化为模拟按键（不影响本版本）
+               std::to_wstring(simulateKey ? 1 : (openPath ? 2 : 0)) + L"|" +
                std::to_wstring(targetVK);
         // 仅模拟组合键才追加第 12 字段。命令型热键即使残留 targetMod，
         // 也不能写出 12 字段，否则会与旧 sound/opacity/autoStart 格式产生歧义。
@@ -242,10 +245,12 @@ struct CustomHotkey {
                 hk.windowState = ConfigUtils::ClampWindowState(ConfigUtils::SafeParseInt(str.substr(pipes[5] + 1, pipes[6] - pipes[5] - 1)));
                 hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[6] + 1, pipes[7] - pipes[6] - 1)) != 0;
                 hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[7] + 1, pipes[8] - pipes[7] - 1)) != 0;
-                hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1)) != 0;
+                const int action = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1));
+                hk.simulateKey = (action == 1);
+                hk.openPath = (action == 2);
                 hk.targetVK = (UINT)vkVal;
                 hk.targetMod = (UINT)modVal;
-                // 命令型热键不应携带模拟目标；历史数据可能残留，加载时归一化，
+                // 非模拟按键动作不应携带模拟目标；历史数据可能残留，加载时归一化，
                 // 避免保存后继续写出 12 字段并放大格式歧义。
                 if (!hk.simulateKey) {
                     hk.targetVK = 0;
@@ -272,10 +277,12 @@ struct CustomHotkey {
                 (pipes.size() >= 12 ? pipes[11] : str.size()) - pipes[10] - 1)) != 0;
             // 模拟按键字段：仅当存在第 13/14 字段时解析
             if (pipes.size() >= 13) {
-                hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[11] + 1, pipes[12] - pipes[11] - 1)) != 0;
+                const int action = ConfigUtils::SafeParseInt(str.substr(pipes[11] + 1, pipes[12] - pipes[11] - 1));
+                hk.simulateKey = (action == 1);
+                hk.openPath = (action == 2);
                 hk.targetVK = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[12] + 1));
             }
-            // 命令型热键不保留模拟目标，与 11/12 字段格式保持一致
+            // 非模拟按键动作不保留模拟目标，与 11/12 字段格式保持一致
             if (!hk.simulateKey) {
                 hk.targetVK = 0;
                 hk.targetMod = 0;
@@ -294,9 +301,11 @@ struct CustomHotkey {
             hk.windowState = ConfigUtils::ClampWindowState(ConfigUtils::SafeParseInt(str.substr(pipes[5] + 1, pipes[6] - pipes[5] - 1)));
             hk.confirmBeforeRun = ConfigUtils::SafeParseInt(str.substr(pipes[6] + 1, pipes[7] - pipes[6] - 1)) != 0;
             hk.runAsAdmin = ConfigUtils::SafeParseInt(str.substr(pipes[7] + 1, pipes[8] - pipes[7] - 1)) != 0;
-            hk.simulateKey = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1)) != 0;
+            const int action = ConfigUtils::SafeParseInt(str.substr(pipes[8] + 1, pipes[9] - pipes[8] - 1));
+            hk.simulateKey = (action == 1);
+            hk.openPath = (action == 2);
             hk.targetVK = (UINT)ConfigUtils::SafeParseInt(str.substr(pipes[9] + 1));
-            // 命令型热键不保留模拟目标，避免保存后反复写出 targetVK/targetMod
+            // 非模拟按键动作不保留模拟目标，避免保存后反复写出 targetVK/targetMod
             if (!hk.simulateKey) {
                 hk.targetVK = 0;
                 hk.targetMod = 0;

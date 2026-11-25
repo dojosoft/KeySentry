@@ -21,7 +21,7 @@ const wchar_t* const HELP_DISABLE_KEYS =
 const wchar_t* const HELP_KEY_REMAP =
     L"按键映射为组合键后，单独按下原始按键将失效；发生按键冲突时请删除对应映射项。";
 const wchar_t* const HELP_CUSTOM_HOTKEY =
-    L"添加热键执行命令/程序，或通过热键模拟按键和组合键。";
+    L"添加热键执行命令/程序、打开文件或目录，或通过热键模拟按键和组合键。";
 const wchar_t* const HELP_WIND_GUARD =
     L"对指定窗口保持置顶，禁止窗口最小化。出现窗口异常时，点击「修复窗口层级」取消所有窗口置顶。";
 

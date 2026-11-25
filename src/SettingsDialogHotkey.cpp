@@ -1,5 +1,5 @@
 // ===== 自定义热键编辑对话框 =====
-// 支持运行命令与模拟按键两种触发动作，主键可通过内联捕获或虚拟键盘选择。
+// 支持运行命令、模拟按键、打开文件/目录三种触发动作，主键可通过内联捕获或虚拟键盘选择。
 // 从 SettingsDialog.cpp 拆出，行为保持不变。
 
 #include "SettingsDialog.h"
@@ -14,6 +14,9 @@
 
 static const wchar_t* ADD_HOTKEY_CLASS = L"KeySentryAddHotkeyDlg";
 
+// 触发动作：运行命令 / 模拟按键 / 打开文件或目录
+enum class HotkeyAction { Command = 0, SimulateKey = 1, OpenPath = 2 };
+
 // 自定义热键对话框数据
 struct AddHotkeyData {
     AppConfig* workingCopy;     // 工作副本配置
@@ -23,7 +26,7 @@ struct AddHotkeyData {
     bool confirmed;             // 用户是否确认
     bool isEdit;                // 是否为编辑模式
     int editIndex;              // 编辑模式下对应的配置索引
-    bool simMode = false;       // 触发动作模式：true=模拟按键，false=运行命令
+    HotkeyAction action = HotkeyAction::Command;  // 当前触发动作
     UINT simVK = 0;             // 模拟按键模式下选中的被模拟键
     UINT simMods = 0;           // 模拟按键模式下目标组合的修饰键（0 表示单键）
 };
@@ -31,13 +34,20 @@ struct AddHotkeyData {
 // ===== 切换自定义热键对话框的触发动作模式 =====
 // 运行命令模式：命令/程序行显示可用，其余命令相关选项启用
 // 模拟按键模式：命令行位置切换为按键选择行，参数/工作目录/窗口状态等选项置灰
-static void UpdateAddHotkeyMode(HWND hwnd, bool simMode) {
+// 打开文件/目录：命令行位置显示目标路径，只保留路径输入与浏览
+static void UpdateAddHotkeyMode(HWND hwnd, HotkeyAction action) {
     auto* ahd = reinterpret_cast<AddHotkeyData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    if (ahd) ahd->simMode = simMode;
+    if (ahd) ahd->action = action;
 
-    // 动态标签："命令/程序:" <-> "模拟按键:"
+    const bool simMode = (action == HotkeyAction::SimulateKey);
+    const bool openMode = (action == HotkeyAction::OpenPath);
+
+    // 动态标签："命令/程序:" / "模拟按键:" / "文件/目录:"
     HWND lbl = GetDlgItem(hwnd, IDC_LBL_HK_CMDLABEL);
-    if (lbl) SetWindowTextW(lbl, Tr(simMode ? L"模拟按键:" : L"命令/程序:"));
+    if (lbl) {
+        SetWindowTextW(lbl, Tr(simMode ? L"模拟按键:"
+                                      : (openMode ? L"文件/目录:" : L"命令/程序:")));
+    }
 
     // 命令行控件与模拟行控件同位置互斥显示
     ShowWindow(GetDlgItem(hwnd, IDC_EDT_HK_CMD), simMode ? SW_HIDE : SW_SHOW);
@@ -45,14 +55,14 @@ static void UpdateAddHotkeyMode(HWND hwnd, bool simMode) {
     ShowWindow(GetDlgItem(hwnd, IDC_EDT_HK_SIMKEY), simMode ? SW_SHOW : SW_HIDE);
     ShowWindow(GetDlgItem(hwnd, IDC_BTN_HK_PICKKEY), simMode ? SW_SHOW : SW_HIDE);
 
-    // 仅命令模式有意义的选项：模拟模式下置灰
+    // 仅命令模式有意义的选项：模拟按键与打开路径模式下置灰
     const int cmdOnlyCtrls[] = {
         IDC_EDT_HK_PARAMS, IDC_EDT_HK_WORKDIR, IDC_BTN_HK_WORKDIR_BROWSE,
         IDC_CBO_HK_WINSTATE, IDC_CHK_HK_CONFIRM, IDC_CHK_HK_ADMIN
     };
     for (int id : cmdOnlyCtrls) {
         HWND h = GetDlgItem(hwnd, id);
-        if (h) EnableWindow(h, !simMode);
+        if (h) EnableWindow(h, action == HotkeyAction::Command);
     }
 }
 
@@ -139,13 +149,24 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 
             HWND edtCmd = GetDlgItem(hwnd, IDC_EDT_HK_CMD);
             std::wstring cmdText = ReadWindowText(edtCmd);
-            if (!ahd->simMode && cmdText.empty()) {
+            if (ahd->action == HotkeyAction::OpenPath) {
+                // 路径首尾空白来自复制粘贴，去掉后才能被 ShellExecute 正确识别
+                const size_t first = cmdText.find_first_not_of(L" \t\r\n");
+                const size_t last = cmdText.find_last_not_of(L" \t\r\n");
+                cmdText = (first == std::wstring::npos) ? L""
+                                                        : cmdText.substr(first, last - first + 1);
+                if (cmdText.empty()) {
+                    Fluent::ShowMessageBox(hwnd, L"请选择或输入要打开的文件或目录", L"提示",
+                                 MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+            } else if (ahd->action == HotkeyAction::Command && cmdText.empty()) {
                 Fluent::ShowMessageBox(hwnd, L"请输入命令或程序路径", L"提示", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
 
             // 模拟按键模式：必须已选择被模拟的按键
-            if (ahd->simMode && ahd->simVK == 0) {
+            if (ahd->action == HotkeyAction::SimulateKey && ahd->simVK == 0) {
                 Fluent::ShowMessageBox(hwnd, L"请点击\"选择按键\"按钮设置要模拟的按键", L"提示", MB_OK | MB_ICONWARNING);
                 return 0;
             }
@@ -157,18 +178,22 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             hk.mod = hotkeyMod;
             hk.vk = ahd->captureVK;
 
-            hk.simulateKey = ahd->simMode;
-            hk.targetVK = ahd->simMode ? ahd->simVK : 0;
-            hk.targetMod = ahd->simMode ? ahd->simMods : 0;
+            const bool simMode = (ahd->action == HotkeyAction::SimulateKey);
+            const bool openMode = (ahd->action == HotkeyAction::OpenPath);
+            const bool cmdMode = (ahd->action == HotkeyAction::Command);
+            hk.simulateKey = simMode;
+            hk.openPath = openMode;
+            hk.targetVK = simMode ? ahd->simVK : 0;
+            hk.targetMod = simMode ? ahd->simMods : 0;
 
-            hk.command = ahd->simMode ? L"" : cmdText;
+            hk.command = simMode ? L"" : cmdText;
 
             // 用动态读取替代固定 512/256 栈缓冲：编辑框没有长度限制，
             // 超长粘贴会被静默截断，保存后无法恢复
-            hk.parameters = ahd->simMode ? L"" : ReadWindowText(GetDlgItem(hwnd, IDC_EDT_HK_PARAMS));
+            hk.parameters = cmdMode ? ReadWindowText(GetDlgItem(hwnd, IDC_EDT_HK_PARAMS)) : L"";
 
             std::wstring workDirText = ReadWindowText(GetDlgItem(hwnd, IDC_EDT_HK_WORKDIR));
-            hk.workDir = ahd->simMode ? L"" : workDirText;
+            hk.workDir = cmdMode ? workDirText : L"";
 
             hk.description = ReadWindowText(GetDlgItem(hwnd, IDC_EDT_HK_DESC));
 
@@ -192,21 +217,10 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 
             HWND cboWinState = GetDlgItem(hwnd, IDC_CBO_HK_WINSTATE);
             int wsSel = (int)SendMessageW(cboWinState, CB_GETCURSEL, 0, 0);
-            hk.windowState = ahd->simMode ? HotkeyWindowState::Normal : ConfigUtils::ClampWindowState(wsSel);
+            hk.windowState = cmdMode ? ConfigUtils::ClampWindowState(wsSel) : HotkeyWindowState::Normal;
 
-            hk.confirmBeforeRun = !ahd->simMode && SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_CONFIRM), BM_GETCHECK, 0, 0) == BST_CHECKED;
-            hk.runAsAdmin = !ahd->simMode && SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_ADMIN), BM_GETCHECK, 0, 0) == BST_CHECKED;
-
-            // 管理员模式且未启用“执行前确认”：配置可被他人改写为任意命令，
-            // 保存前明确提醒一次（执行时还会再弹一次真实命令确认）
-            if (hk.runAsAdmin && !hk.confirmBeforeRun) {
-                if (Fluent::ShowMessageBox(hwnd,
-                                L"该热键将以管理员权限运行，且未启用“执行前确认”。\n"
-                                L"任何能修改配置文件的人都可能借此触发提权执行。\n\n是否继续保存？",
-                                L"安全提示", MB_YESNO | MB_ICONWARNING) != IDYES) {
-                    return 0;
-                }
-            }
+            hk.confirmBeforeRun = cmdMode && SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_CONFIRM), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            hk.runAsAdmin = cmdMode && SendMessageW(GetDlgItem(hwnd, IDC_CHK_HK_ADMIN), BM_GETCHECK, 0, 0) == BST_CHECKED;
 
             // 检查热键是否已存在（编辑模式下跳过自身）
             for (size_t i = 0; i < ahd->workingCopy->customHotkeys.size(); i++) {
@@ -246,22 +260,25 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             }
             SetFocus(hwnd);
             return 0;
-        case IDC_RADIO_HK_CMD:
-            UpdateAddHotkeyMode(hwnd, false);
-            return 0;
-        case IDC_RADIO_HK_SIMKEY:
-            UpdateAddHotkeyMode(hwnd, true);
-            // 首次切入模拟模式且尚未选键时，直接弹出键盘选择界面
-            if (ahd->simVK == 0) {
-                // 键盘选择界面需要接收键盘输入，先退出捕获态
-                StopAddHotkeyCapture(hwnd, ahd);
-                UINT pickedMods = 0;
-                int picked = SettingsDialog::ShowKeyboardPicker(hwnd, &pickedMods, true);
-                if (picked > 0) {
-                    ahd->simVK = (UINT)picked;
-                    ahd->simMods = pickedMods;
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_SIMKEY),
-                                   SettingsDialog::FormatHotKey(pickedMods, (UINT)picked).c_str());
+        case IDC_CBO_HK_ACTION:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                const int sel = (int)SendMessageW(GetDlgItem(hwnd, IDC_CBO_HK_ACTION),
+                                                  CB_GETCURSEL, 0, 0);
+                const HotkeyAction action = (sel == 1) ? HotkeyAction::SimulateKey
+                    : (sel == 2 ? HotkeyAction::OpenPath : HotkeyAction::Command);
+                UpdateAddHotkeyMode(hwnd, action);
+                // 首次切入模拟模式且尚未选键时，直接弹出键盘选择界面
+                if (action == HotkeyAction::SimulateKey && ahd->simVK == 0) {
+                    // 键盘选择界面需要接收键盘输入，先退出捕获态
+                    StopAddHotkeyCapture(hwnd, ahd);
+                    UINT pickedMods = 0;
+                    int picked = SettingsDialog::ShowKeyboardPicker(hwnd, &pickedMods, true);
+                    if (picked > 0) {
+                        ahd->simVK = (UINT)picked;
+                        ahd->simMods = pickedMods;
+                        SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_SIMKEY),
+                                       SettingsDialog::FormatHotKey(pickedMods, (UINT)picked).c_str());
+                    }
                 }
             }
             return 0;
@@ -279,8 +296,55 @@ static LRESULT CALLBACK AddHotkeyWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             return 0;
         }
         case IDC_BTN_HK_BROWSE: {
-            // 浏览选择可执行文件：文件对话框需要键盘输入，先退出捕获态
+            // 浏览选择目标：对话框需要键盘输入，先退出捕获态
             StopAddHotkeyCapture(hwnd, ahd);
+
+            // 打开文件/目录：目标可能不是可执行文件，用菜单让用户选择文件或文件夹
+            if (ahd->action == HotkeyAction::OpenPath) {
+                HMENU menu = CreatePopupMenu();
+                if (!menu) return 0;
+                AppendMenuW(menu, MF_STRING, 1, Tr(L"选择文件..."));
+                AppendMenuW(menu, MF_STRING, 2, Tr(L"选择文件夹..."));
+                // 以按钮下沿作为菜单起点：键盘激活按钮时鼠标可能不在按钮上
+                RECT btnRect = {};
+                GetWindowRect(GetDlgItem(hwnd, IDC_BTN_HK_BROWSE), &btnRect);
+                POINT pt = { btnRect.left, btnRect.bottom };
+                SetForegroundWindow(hwnd);
+                const int picked = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+                                                       pt.x, pt.y, 0, hwnd, nullptr);
+                DestroyMenu(menu);
+                if (picked == 1) {
+                    OPENFILENAMEW ofn = {};
+                    std::wstring szFile(32768, L'\0');
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFile = &szFile[0];
+                    ofn.nMaxFile = (DWORD)szFile.size();
+                    ofn.lpstrFilter = (GetAppLanguage() == AppLanguage::English)
+                        ? L"All files\0*.*\0"
+                        : L"所有文件\0*.*\0";
+                    ofn.nFilterIndex = 1;
+                    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    if (GetOpenFileNameW(&ofn)) {
+                        SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_CMD), szFile.c_str());
+                    }
+                } else if (picked == 2) {
+                    std::vector<wchar_t> dir(32768, L'\0');
+                    BROWSEINFOW bi = {};
+                    bi.hwndOwner = hwnd;
+                    bi.lpszTitle = Tr(L"选择要打开的文件夹");
+                    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+                    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+                    if (pidl) {
+                        if (SHGetPathFromIDListW(pidl, dir.data())) {
+                            SetWindowTextW(GetDlgItem(hwnd, IDC_EDT_HK_CMD), dir.data());
+                        }
+                        CoTaskMemFree(pidl);
+                    }
+                }
+                return 0;
+            }
+
             OPENFILENAMEW ofn = {};
             // 使用长路径上限缓冲（32768），避免路径超过 MAX_PATH 时被截断
             std::wstring szFile(32768, L'\0');
@@ -378,7 +442,9 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         const auto& existing = config.customHotkeys[editIndex];
         ahd.captureMod = existing.mod;
         ahd.captureVK = existing.vk;
-        ahd.simMode = existing.simulateKey;
+        ahd.action = existing.openPath
+            ? HotkeyAction::OpenPath
+            : (existing.simulateKey ? HotkeyAction::SimulateKey : HotkeyAction::Command);
         ahd.simVK = existing.targetVK;
         ahd.simMods = existing.targetMod;
     }
@@ -442,15 +508,6 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         SetControlFont(h, font);
     };
 
-    // 单选按钮（用于触发动作模式选择），group 参数标记单选组起始
-    auto dlgRadio = [&](int id, const wchar_t* text, int px, int py, int w, bool group) {
-        HWND h = CreateWindowExW(0, L"BUTTON", text,
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | (group ? WS_GROUP : 0),
-                                   px, py, w, lineH,
-                                   dlg, (HMENU)(LONG_PTR)id, GetModuleHandleW(nullptr), nullptr);
-        SetControlFont(h, font);
-    };
-
     dlgLabel(L"修饰键:", cx, y, labelW, btnH);
     dlgChk(IDC_CHK_HK_CTRL, L"Ctrl", editX, y, 55);
     dlgChk(IDC_CHK_HK_SHIFT, L"Shift", editX + 60, y, 60);
@@ -480,17 +537,20 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     }
     y += btnH + 6;
 
-    // 触发动作：运行命令（默认）/ 模拟按键
+    // 触发动作：运行命令（默认）/ 模拟按键 / 打开文件或目录
+    // 三项互斥，用下拉框选择，避免单选按钮在英文界面下挤在同一行
     dlgLabel(L"触发动作:", cx, y, labelW, btnH);
-    dlgRadio(IDC_RADIO_HK_CMD, L"运行命令", editX, y + 5, 90, true);
-    dlgRadio(IDC_RADIO_HK_SIMKEY, L"模拟按键", editX + 100, y + 5, 90, false);
-    if (isEdit) {
-        const auto& existing = config.customHotkeys[editIndex];
-        SendMessageW(GetDlgItem(dlg, IDC_RADIO_HK_CMD), BM_SETCHECK, existing.simulateKey ? BST_UNCHECKED : BST_CHECKED, 0);
-        SendMessageW(GetDlgItem(dlg, IDC_RADIO_HK_SIMKEY), BM_SETCHECK, existing.simulateKey ? BST_CHECKED : BST_UNCHECKED, 0);
-    } else {
-        SendMessageW(GetDlgItem(dlg, IDC_RADIO_HK_CMD), BM_SETCHECK, BST_CHECKED, 0);
-    }
+    HWND cboAction = CreateWindowExW(0, L"COMBOBOX", L"",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                      CBS_DROPDOWNLIST | WS_VSCROLL,
+                                      editX, y, 200, 200,
+                                      dlg, (HMENU)(LONG_PTR)IDC_CBO_HK_ACTION,
+                                      GetModuleHandleW(nullptr), nullptr);
+    SetControlFont(cboAction, font);
+    SendMessageW(cboAction, CB_ADDSTRING, 0, (LPARAM)L"运行命令");
+    SendMessageW(cboAction, CB_ADDSTRING, 0, (LPARAM)L"模拟按键");
+    SendMessageW(cboAction, CB_ADDSTRING, 0, (LPARAM)L"打开文件/目录");
+    SendMessageW(cboAction, CB_SETCURSEL, (WPARAM)ahd.action, 0);
     y += btnH + 6;
 
     // 命令/程序行 与 模拟按键选择行同位置，按触发动作模式互斥显示
@@ -529,7 +589,7 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         }
     }
     // 按当前模式（新增默认命令模式，编辑恢复原模式）应用控件显示/启用状态
-    UpdateAddHotkeyMode(dlg, ahd.simMode);
+    UpdateAddHotkeyMode(dlg, ahd.action);
     y += btnH + 6;
 
     dlgLabel(L"运行参数:", cx, y, labelW, btnH);
@@ -593,6 +653,19 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     if (isEdit) {
         SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_CONFIRM), BM_SETCHECK, config.customHotkeys[editIndex].confirmBeforeRun ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_ADMIN), BM_SETCHECK, config.customHotkeys[editIndex].runAsAdmin ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
+    // 说明执行阶段的确认规则：复选框状态按用户选择保存；
+    // 本程序自身以管理员身份运行时，所有自定义热键执行前强制确认（安全防护）
+    {
+        const wchar_t* hintText = ProcessUtils::IsElevated()
+            ? L"当前以管理员身份运行：所有自定义热键执行前将强制确认。"
+            : L"勾选“以管理员运行”时，将通过 UAC 提权运行。";
+        HWND hint = CreateWindowExW(0, L"STATIC", hintText,
+                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     cx, y + btnH - 2, cw, 30,
+                                     dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetControlFont(hint, font);
     }
     // 按钮固定在窗口底部（距底边 14px），符合 Windows 常规对话框的底部留白
     const int bottomBtnY = 440 - 30 - 14;

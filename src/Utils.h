@@ -639,6 +639,24 @@ namespace IniUtils {
     inline std::wstring BoolToStr(bool v) { return std::to_wstring(v ? 1 : 0); }
 }
 
+// ============================================================
+// 进程工具
+// ============================================================
+namespace ProcessUtils {
+    // 当前进程是否以管理员（高完整性）身份运行。
+    // 提权会话会强制命令型热键执行前确认，界面需要据此展示说明。
+    inline bool IsElevated() {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+        TOKEN_ELEVATION elevation = {};
+        DWORD returned = 0;
+        const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                            sizeof(elevation), &returned);
+        CloseHandle(token);
+        return ok && elevation.TokenIsElevated != 0;
+    }
+}
+
 // 关闭进程的超时时间（毫秒），超时后强制终止
 static constexpr DWORD PROCESS_CLOSE_TIMEOUT_MS = 3000;
 

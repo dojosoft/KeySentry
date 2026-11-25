@@ -56,6 +56,11 @@ public:
     void CloseBoundProcesses(DWORD timeoutMs = PROCESS_CLOSE_TIMEOUT_MS);
     // 恢复上次异常退出时被隐藏的窗口（启动时调用），返回恢复的窗口数
     int RecoverOrphanedWindows();
+    // 启动时静音恢复是否仍未完成（音频服务/端点可能尚未就绪）
+    bool HasPendingMuteRestore() const { return m_muteRestorePending; }
+    // 静默重试启动时未完成的静音恢复；返回 true 表示已解决。
+    // 由调用方的定时器驱动，失败不弹气泡，避免开机时误报设备暂不可用
+    bool RetryPendingMuteRestore();
     // 将当前被隐藏窗口的信息持久化到恢复文件（关机前调用）
     void SaveRecoverFile();
     // 延迟确认"异步隐藏是否最终生效"（由调用方的定时器驱动）：
@@ -84,7 +89,11 @@ private:
     // 表现为目标窗口按钮与任务栏点击无响应（键盘不受影响）
     void HealStuckInputMode();
     // 设置系统静音/取消静音（通过 Windows Core Audio API）
-    void SetMute(bool mute, bool forceUnmute = false);
+    // quiet=true：恢复失败时不弹托盘气泡（启动阶段的静默重试使用）
+    void SetMute(bool mute, bool forceUnmute = false, bool quiet = false);
+    // 静音恢复成功后，从遗留恢复内容中移除 m5 端点记录并落盘，
+    // 避免下次启动再次尝试已恢复的端点
+    void DropResolvedMuteRecordsFromLegacyContent();
     // 发送媒体暂停/播放按键
     void SendMediaPause();
 
@@ -150,6 +159,8 @@ private:
     };
     std::vector<MutedEndpoint> m_mutedEndpoints;
     bool m_mutedByUs = false;       // 本次静音是否由本程序发起（据此决定恢复时是否解除静音）
+    // 启动恢复时因音频设备暂不可用未能解除静音：由定时器静默重试
+    bool m_muteRestorePending = false;
     ULONGLONG m_lastDeactivateTick = 0; // 上次停用的时间戳
 
     HookThread m_mouseHookThread;   // 鼠标钩子专用线程：避免 UI 阻塞导致钩子被移除

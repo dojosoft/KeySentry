@@ -447,9 +447,15 @@ static void LoadCustomHotkeysSection(AppConfig& cfg, const std::wstring& iniPath
         clampText(hk.workDir, MAX_CUSTOM_WORKDIR_CHARS);
         clampText(hk.description, MAX_CUSTOM_DESC_CHARS);
         // 模拟按键模式下目标键非法时动作必然失败，同样丢弃。
-        // 命令型热键不保留模拟目标字段：历史/手改配置可能残留 targetMod，
+        // 非模拟动作不保留模拟目标字段：历史/手改配置可能残留 targetMod，
         // 继续序列化会写出 12 字段并增加新旧格式判别歧义。
-        if (!hk.simulateKey) {
+        // “打开文件/目录”动作没有路径时必然失败，同样丢弃。
+        if (hk.openPath) {
+            hk.simulateKey = false;
+            hk.targetVK = 0;
+            hk.targetMod = 0;
+            if (hk.command.empty()) continue;
+        } else if (!hk.simulateKey) {
             hk.targetVK = 0;
             hk.targetMod = 0;
         } else {
