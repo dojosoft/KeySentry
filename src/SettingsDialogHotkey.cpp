@@ -648,25 +648,13 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     // 与窗口状态下拉框挤在同一行会被截断或超出对话框边界（R8-M5）
     y += btnH + 6;
     dlgChk(IDC_CHK_HK_CONFIRM, L"确认后执行", cx, y, 165);
-    dlgChk(IDC_CHK_HK_ADMIN, L"以管理员运行", cx + 170, y, 160);
+    dlgChk(IDC_CHK_HK_ADMIN, L"以管理员运行（UAC）", cx + 170, y, 220);
 
     if (isEdit) {
         SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_CONFIRM), BM_SETCHECK, config.customHotkeys[editIndex].confirmBeforeRun ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_ADMIN), BM_SETCHECK, config.customHotkeys[editIndex].runAsAdmin ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
-    // 说明执行阶段的确认规则：复选框状态按用户选择保存；
-    // 本程序自身以管理员身份运行时，所有自定义热键执行前强制确认（安全防护）
-    {
-        const wchar_t* hintText = ProcessUtils::IsElevated()
-            ? L"当前以管理员身份运行：所有自定义热键执行前将强制确认。"
-            : L"勾选“以管理员运行”时，将通过 UAC 提权运行。";
-        HWND hint = CreateWindowExW(0, L"STATIC", hintText,
-                                     WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                     cx, y + btnH - 2, cw, 30,
-                                     dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-        SetControlFont(hint, font);
-    }
     // 按钮固定在窗口底部（距底边 14px），符合 Windows 常规对话框的底部留白
     const int bottomBtnY = 440 - 30 - 14;
     dlgButton(IDOK, L"确定", cx + cw - 180, bottomBtnY, 80, 30);

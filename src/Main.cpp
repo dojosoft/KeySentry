@@ -81,9 +81,7 @@ static HWND g_settingsWnd = nullptr;   // 设置对话框窗口句柄
 // 自定义热键确认框打开期间禁止再打开设置：确认框会进入模态消息循环，
 // 若此时应用新配置，确认框持有的旧配置快照/引用会失效
 static bool g_modalHotkeyConfirm = false;
-// 以管理员身份运行时，是否为自定义热键强制开启了“执行前确认”
-static bool g_elevatedHotkeyGuard = false;
-// 当前进程是否提权运行（启动时缓存）：提权会话中所有命令型热键都必须确认
+// 当前进程是否提权运行（启动时缓存）：用于决定子进程是否需要降权启动
 static bool g_processElevated = false;
 // 托盘图标是否可见。初值必须为 false：图标要等启动流程走到 AddTrayIcon 才真正添加，
 // 这期间产生的气泡提示若按"图标已存在"处理，会以 NIM_MODIFY 打到不存在的图标上被静默丢弃
@@ -1052,17 +1050,90 @@ namespace {
 constexpr wchar_t kHotkeyConfirmClass[] = L"KeySentryHotkeyConfirmWnd";
 constexpr int kConfirmIdHeader = 4001;
 constexpr int kConfirmIdEdit = 4002;
+constexpr int kConfirmIdSubtitle = 4003;
+constexpr int kConfirmIdAdminNote = 4004;
 
 struct HotkeyConfirmState {
     std::wstring body;
+    std::wstring adminNote;
+    HFONT adminNoteFont = nullptr;  // 管理员提示使用的小号粗体
     bool confirmed = false;
 };
+
+struct HotkeyConfirmLayout {
+    RECT icon = {};
+    RECT header = {};
+    RECT subtitle = {};
+    RECT adminNote = {};
+    RECT edit = {};
+    RECT ok = {};
+    RECT cancel = {};
+    int dividerY = 0;
+    int dividerLeft = 0;
+    int dividerRight = 0;
+    bool hasAdminNote = false;
+};
+
+HotkeyConfirmLayout ComputeHotkeyConfirmLayout(HWND hwnd) {
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    const int margin = ScaleUi(18);
+    const int iconSize = ScaleUi(24);
+    const int iconGap = ScaleUi(10);
+    const int headerH = ScaleUi(26);
+    const int subtitleH = ScaleUi(20);
+    const int gap = ScaleUi(10);
+    const int buttonH = ScaleUi(32);
+    const int buttonW = ScaleUi(96);
+
+    HotkeyConfirmLayout layout;
+    const int headerX = margin + iconSize + iconGap;
+
+    layout.icon = { margin, margin + (headerH - iconSize) / 2,
+                    margin + iconSize, margin + (headerH - iconSize) / 2 + iconSize };
+    layout.header = { headerX, margin, rc.right - margin, margin + headerH };
+    layout.subtitle = { headerX, margin + headerH + ScaleUi(2),
+                        rc.right - margin, margin + headerH + ScaleUi(2) + subtitleH };
+    layout.dividerY = margin + headerH + ScaleUi(2) + subtitleH + gap;
+    layout.dividerLeft = margin;
+    layout.dividerRight = rc.right - margin;
+
+    const int buttonTop = rc.bottom - margin - buttonH;
+    int editTop = layout.dividerY + ScaleUi(12);
+    layout.hasAdminNote = GetDlgItem(hwnd, kConfirmIdAdminNote) != nullptr;
+    if (layout.hasAdminNote) {
+        // 管理员提示单独占一行，放在内容文本框上方
+        const int noteTop = layout.dividerY + ScaleUi(10);
+        layout.adminNote = { margin, noteTop, rc.right - margin,
+                             noteTop + ScaleUi(20) };
+        editTop = layout.adminNote.bottom + ScaleUi(10);
+    }
+    const int editH = buttonTop - gap - editTop;
+    layout.edit = { margin, editTop, rc.right - margin,
+                    editTop + (editH > 0 ? editH : 0) };
+    layout.cancel = { rc.right - margin - buttonW, buttonTop,
+                      rc.right - margin, buttonTop + buttonH };
+    layout.ok = { rc.right - margin - buttonW * 2 - ScaleUi(8), buttonTop,
+                  rc.right - margin - buttonW - ScaleUi(8), buttonTop + buttonH };
+    return layout;
+}
 
 void ApplyHotkeyConfirmFonts(HWND hwnd) {
     HFONT ui = Fluent::UiFont();
     HFONT header = Fluent::UiFontSemibold();
     if (HWND h = GetDlgItem(hwnd, kConfirmIdHeader))
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(header), TRUE);
+    if (HWND h = GetDlgItem(hwnd, kConfirmIdSubtitle))
+        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(Fluent::SmallFont()), TRUE);
+    if (HWND h = GetDlgItem(hwnd, kConfirmIdAdminNote)) {
+        auto* st = reinterpret_cast<HotkeyConfirmState*>(
+            GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (st && !st->adminNoteFont) {
+            st->adminNoteFont = Fluent::CreateFontAtScale(12, FW_BOLD, GetUiScale());
+        }
+        HFONT font = (st && st->adminNoteFont) ? st->adminNoteFont : Fluent::SmallFont();
+        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
     if (HWND h = GetDlgItem(hwnd, kConfirmIdEdit))
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(ui), TRUE);
     if (HWND h = GetDlgItem(hwnd, IDOK))
@@ -1072,31 +1143,20 @@ void ApplyHotkeyConfirmFonts(HWND hwnd) {
 }
 
 void LayoutHotkeyConfirm(HWND hwnd) {
-    RECT rc = {};
-    GetClientRect(hwnd, &rc);
-    const int margin = ScaleUi(16);
-    const int gap = ScaleUi(10);
-    const int headerH = ScaleUi(26);
-    const int buttonH = ScaleUi(32);
-    const int buttonW = ScaleUi(96);
-
-    HWND header = GetDlgItem(hwnd, kConfirmIdHeader);
-    HWND edit = GetDlgItem(hwnd, kConfirmIdEdit);
-    HWND ok = GetDlgItem(hwnd, IDOK);
-    HWND cancel = GetDlgItem(hwnd, IDCANCEL);
-
-    const int contentW = rc.right - margin * 2;
-    if (header) MoveWindow(header, margin, margin, contentW, headerH, TRUE);
-
-    const int buttonTop = rc.bottom - margin - buttonH;
-    const int editTop = margin + headerH + gap;
-    const int editH = buttonTop - gap - editTop;
-    if (edit) MoveWindow(edit, margin, editTop, contentW, editH > 0 ? editH : 0, TRUE);
-    if (cancel)
-        MoveWindow(cancel, rc.right - margin - buttonW, buttonTop, buttonW, buttonH, TRUE);
-    if (ok)
-        MoveWindow(ok, rc.right - margin - buttonW * 2 - ScaleUi(8), buttonTop,
-                   buttonW, buttonH, TRUE);
+    const HotkeyConfirmLayout layout = ComputeHotkeyConfirmLayout(hwnd);
+    auto move = [](HWND h, const RECT& r) {
+        if (h) {
+            MoveWindow(h, r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
+        }
+    };
+    move(GetDlgItem(hwnd, kConfirmIdHeader), layout.header);
+    move(GetDlgItem(hwnd, kConfirmIdSubtitle), layout.subtitle);
+    if (layout.hasAdminNote) {
+        move(GetDlgItem(hwnd, kConfirmIdAdminNote), layout.adminNote);
+    }
+    move(GetDlgItem(hwnd, kConfirmIdEdit), layout.edit);
+    move(GetDlgItem(hwnd, IDOK), layout.ok);
+    move(GetDlgItem(hwnd, IDCANCEL), layout.cancel);
 }
 
 LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1117,6 +1177,21 @@ LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kConfirmIdHeader)),
             g_hInst, nullptr);
+        HWND subtitle = CreateWindowExW(
+            0, L"STATIC", Tr(L"请核对命令、参数与工作目录，确认无误后再执行。"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kConfirmIdSubtitle)),
+            g_hInst, nullptr);
+        HWND adminNote = nullptr;
+        if (!st->adminNote.empty()) {
+            adminNote = CreateWindowExW(
+                0, L"STATIC", st->adminNote.c_str(),
+                WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kConfirmIdAdminNote)),
+                g_hInst, nullptr);
+        }
         HWND edit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", st->body.c_str(),
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
@@ -1136,10 +1211,14 @@ LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)),
             g_hInst, nullptr);
-        if (!header || !edit || !ok || !cancel) return -1;
+        if (!header || !subtitle || !edit || !ok || !cancel) return -1;
+        if (!st->adminNote.empty() && !adminNote) return -1;
 
         // 多行编辑框默认有长度上限：确认内容最长可达数万字符，必须放开
         SendMessageW(edit, EM_SETLIMITTEXT, 0, 0);
+        // 左右留出内边距，文本不贴着边框
+        SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELONG(ScaleUi(10), ScaleUi(10)));
         SendMessageW(edit, EM_SETSEL, 0, 0);
         Fluent::DecorateDialog(hwnd);
         ApplyHotkeyConfirmFonts(hwnd);
@@ -1160,12 +1239,42 @@ LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             FillRect(reinterpret_cast<HDC>(wp), &rc, Fluent::SurfaceBrush());
         }
         return 1;
+    case WM_PAINT: {
+        // 高对比度下交给系统绘制，不使用主题色
+        if (Fluent::IsHighContrast()) break;
+        PAINTSTRUCT ps = {};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, Fluent::SurfaceBrush());
+
+        const HotkeyConfirmLayout layout = ComputeHotkeyConfirmLayout(hwnd);
+        HICON icon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APP));
+        if (icon) {
+            DrawIconEx(hdc, layout.icon.left, layout.icon.top, icon,
+                       layout.icon.right - layout.icon.left,
+                       layout.icon.bottom - layout.icon.top, 0, nullptr, DI_NORMAL);
+        }
+
+        // 标题与内容之间的细分隔线，弱化层次但保持轻量
+        HGDIOBJ oldPen = SelectObject(hdc, Fluent::GridPen());
+        MoveToEx(hdc, layout.dividerLeft, layout.dividerY, nullptr);
+        LineTo(hdc, layout.dividerRight, layout.dividerY);
+        SelectObject(hdc, oldPen);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
     case WM_CTLCOLORSTATIC:
         if (Fluent::IsHighContrast()) break;
         {
             HDC hdc = reinterpret_cast<HDC>(wp);
+            HWND ctl = reinterpret_cast<HWND>(lp);
+            const int ctlId = ctl ? GetDlgCtrlID(ctl) : 0;
+            COLORREF color = Fluent::TextColor();
+            if (ctlId == kConfirmIdSubtitle) color = Fluent::TextDisabledColor();
+            else if (ctlId == kConfirmIdAdminNote) color = Fluent::LinkColor();
             SetBkColor(hdc, Fluent::SurfaceColor());
-            SetTextColor(hdc, Fluent::TextColor());
+            SetTextColor(hdc, color);
         }
         return reinterpret_cast<LRESULT>(Fluent::SurfaceBrush());
     case WM_COMMAND:
@@ -1191,6 +1300,10 @@ LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DpiUtils::GetWorkAreaForWindow(hwnd, &work);
         UiScaleOverrideStorage() = DpiUtils::ScaleForDpi(dpi, &work);
         Fluent::RebuildFontsForDpi();
+        if (st && st->adminNoteFont) {
+            DeleteObject(st->adminNoteFont);
+            st->adminNoteFont = nullptr;
+        }
         ApplyHotkeyConfirmFonts(hwnd);
         const RECT* suggested = reinterpret_cast<const RECT*>(lp);
         if (suggested) {
@@ -1203,6 +1316,12 @@ LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     }
+    case WM_NCDESTROY:
+        if (st && st->adminNoteFont) {
+            DeleteObject(st->adminNoteFont);
+            st->adminNoteFont = nullptr;
+        }
+        break;
     default:
         break;
     }
@@ -1210,7 +1329,8 @@ LRESULT CALLBACK HotkeyConfirmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // 返回 false 表示对话框无法创建：调用方必须按拒绝执行处理
-bool ShowHotkeyConfirmDialog(HWND owner, const std::wstring& body) {
+bool ShowHotkeyConfirmDialog(HWND owner, const std::wstring& body,
+                             const std::wstring& adminNote) {
     static bool classRegistered = false;
     if (!classRegistered) {
         WNDCLASSEXW wc = {};
@@ -1234,8 +1354,8 @@ bool ShowHotkeyConfirmDialog(HWND owner, const std::wstring& body) {
                            : DpiUtils::GetSystemDpi();
     ScopedUiScale scopedScale(DpiUtils::ScaleForDpi(dpi, &work));
 
-    int width = ScaleUi(680);
-    int height = ScaleUi(520);
+    int width = ScaleUi(560);
+    int height = ScaleUi(380);
     const int maxW = work.right - work.left - ScaleUi(40);
     const int maxH = work.bottom - work.top - ScaleUi(40);
     if (maxW > 0) width = std::min(width, maxW);
@@ -1245,6 +1365,7 @@ bool ShowHotkeyConfirmDialog(HWND owner, const std::wstring& body) {
 
     HotkeyConfirmState st;
     st.body = body;
+    st.adminNote = adminNote;
     const int x = work.left + (work.right - work.left - width) / 2;
     const int y = work.top + (work.bottom - work.top - height) / 2;
 
@@ -1307,7 +1428,8 @@ bool ShowHotkeyConfirmDialog(HWND owner, const std::wstring& body) {
 // ===== 执行前确认 =====
 // 功能：弹出自定义热键的执行前确认框，返回用户是否确认
 // 说明：弹框期间抑制其他热键/鼠标触发，避免嵌套确认框或窗口被隐藏
-static bool ConfirmCustomHotkey(const std::wstring& body) {
+static bool ConfirmCustomHotkey(const std::wstring& body,
+                                const std::wstring& adminNote) {
     const bool prevSuppress = g_suppressHotkeys;
     g_suppressHotkeys = true;
     g_modalHotkeyConfirm = true;
@@ -1316,7 +1438,7 @@ static bool ConfirmCustomHotkey(const std::wstring& body) {
         owner = g_settingsWnd;
     }
     // 对话框创建失败必须按“取消”处理（fail-closed），不能退化为无确认执行
-    const bool confirmed = ShowHotkeyConfirmDialog(owner, body);
+    const bool confirmed = ShowHotkeyConfirmDialog(owner, body, adminNote);
     g_modalHotkeyConfirm = false;
     g_suppressHotkeys = prevSuppress;
     return confirmed;
@@ -2650,32 +2772,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const CustomHotkey hk = g_config.customHotkeys[idx];
                 // 同一 ID 可能已对应改键后的新条目：旧组合的消息不得执行新命令（R12-M1）
                 if (!HotkeyMatchesConfig(hk.mod, hk.vk, lp)) return 0;
-                // 模拟按键模式：释放修饰键后发送被模拟的按键或组合键
+                // 模拟按键模式：释放修饰键后发送被模拟的按键或组合键。
+                // 该动作没有“确认后执行”配置，按规则不弹任何确认框
                 if (hk.simulateKey && hk.targetVK != 0) {
-                    // 提权运行时配置文件位于用户可写目录：同用户进程可以新增一条
-                    // “模拟按键”热键。模拟按键会向当前前台窗口（可能是提权窗口）
-                    // 注入高完整性输入，执行能力与命令型热键等价，因此同样必须
-                    // 执行前确认，不能绕过提权防护（R8-H2）
-                    if (g_processElevated) {
-                        std::wstring body;
-                        body += Tr(L"触发热键：");
-                        body += SanitizeConfirmField(FormatHKName(hk.mod, hk.vk));
-                        body += L"\n";
-                        body += Tr(L"模拟按键：");
-                        body += SanitizeConfirmField(FormatHKName(hk.targetMod, hk.targetVK));
-                        body += L"\n";
-                        body += Tr(L"注意：模拟按键会发送到当前前台窗口。");
-                        body += L"\n";
-                        if (!ConfirmCustomHotkey(body)) return 0;
-                    }
                     SimulateTargetKeyPress(hk.targetVK, hk.targetMod);
                     return 0;
                 }
                 if (!hk.command.empty()) {
-                    // 执行前确认：自定义热键可指向任意程序，确认框必须展示真实执行内容。
-                    // “以管理员运行”不再强制确认：非提权进程会通过 UAC 征求用户同意；
-                    // 提权进程仍由 g_processElevated 强制确认，防止可写配置静默提权执行
-                    if (hk.confirmBeforeRun || g_processElevated) {
+                    // 执行前确认：仅当用户为该热键勾选“确认后执行”时才弹出，
+                    // 与其他任何状态（主程序是否提权、是否勾选管理员运行）无关
+                    if (hk.confirmBeforeRun) {
                         // 固定标签按当前语言翻译；用户字段只清洗控制字符、原样展示，
                         // 且整段消息不做片段翻译，保证“确认什么就执行什么”（R8-H6）。
                         // 字段不做截断：确认框使用可滚动编辑框完整展示，
@@ -2695,15 +2801,27 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             confirmMsg += Tr(L"工作目录：");
                             confirmMsg += SanitizeConfirmField(hk.workDir) + L"\n";
                         }
+                        // 管理员提示单独传给对话框，在文本框上方单独一行显示，
+                        // 不再混入程序/参数等执行内容
+                        std::wstring adminNote;
                         if (!hk.openPath && hk.runAsAdmin) {
-                            confirmMsg += g_processElevated
-                                ? Tr(L"\n注意：当前已以管理员身份运行，子进程将继承管理员权限。")
-                                : Tr(L"\n注意：将以管理员权限运行，随后会弹出系统 UAC 提示。");
+                            adminNote = g_processElevated
+                                ? Tr(L"注意：当前已以管理员身份运行，子进程将以管理员权限运行。")
+                                : Tr(L"注意：将以管理员权限运行，随后会弹出系统 UAC 提示。");
                         }
                         // 走确认封装：确认框必须置前/置顶，否则从全屏程序里触发时
                         // 会被前台窗口盖住，UI 线程停在看不到的模态循环里，表现为"热键没反应"
-                        if (!ConfirmCustomHotkey(confirmMsg)) return 0;
+                        if (!ConfirmCustomHotkey(confirmMsg, adminNote)) return 0;
                     }
+
+                    // 热键动作失败提示：弹框期间抑制热键，避免再次触发；
+                    // 消息含用户命令/路径时只翻译固定标签，命令原样展示
+                    auto showHotkeyError = [](const std::wstring& msg) {
+                        const bool prevSuppress = g_suppressHotkeys;
+                        g_suppressHotkeys = true;
+                        ShowAppMessageRaw(msg, MB_OK | MB_ICONERROR, Tr(L"错误"));
+                        g_suppressHotkeys = prevSuppress;
+                    };
 
                     // 统一规范化命令（去掉用户误粘贴的首尾引号），
                     // CreateProcess、ShellExecute 与打开路径共用同一份路径
@@ -2714,19 +2832,28 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             command = unquoted;
                     }
 
-                    // 打开文件/目录：交给 Shell 用默认关联程序打开，不经过 CreateProcess。
-                    // 提权会话中该操作同样以管理员权限执行，因此确认条件与命令型一致
+                    // 打开文件/目录：交给 Shell 用默认关联程序打开。
+                    // 主程序已提权时用标准用户令牌启动 explorer，避免继承管理员权限
                     if (hk.openPath) {
                         if (command.empty()) return 0;
-                        INT_PTR result = (INT_PTR)ShellExecuteW(nullptr, L"open", command.c_str(),
-                                                               nullptr, nullptr, SW_SHOWNORMAL);
-                        if (result <= 32) {
-                            std::wstring errMsg = std::wstring(Tr(L"打开失败: ")) +
-                                                  SanitizeConfirmField(command);
-                            const bool prevSuppress = g_suppressHotkeys;
-                            g_suppressHotkeys = true;
-                            ShowAppMessageRaw(errMsg, MB_OK | MB_ICONERROR, Tr(L"错误"));
-                            g_suppressHotkeys = prevSuppress;
+                        bool opened = false;
+                        if (g_processElevated) {
+                            wchar_t winDir[MAX_PATH] = {};
+                            GetWindowsDirectoryW(winDir, MAX_PATH);
+                            const std::wstring explorer =
+                                std::wstring(winDir) + L"\\explorer.exe";
+                            std::wstring explorerLine =
+                                QuoteCommandLineArg(explorer) + L" " + QuoteCommandLineArg(command);
+                            DWORD openError = ERROR_SUCCESS;
+                            opened = ProcessUtils::CreateProcessAsStandardUser(
+                                explorer.c_str(), explorerLine, nullptr, SW_SHOWNORMAL, &openError);
+                        } else {
+                            opened = (INT_PTR)ShellExecuteW(nullptr, L"open", command.c_str(),
+                                                            nullptr, nullptr, SW_SHOWNORMAL) > 32;
+                        }
+                        if (!opened) {
+                            showHotkeyError(std::wstring(Tr(L"打开失败: ")) +
+                                            SanitizeConfirmField(command));
                         }
                         return 0;
                     }
@@ -2737,17 +2864,83 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     else if (hk.windowState == HotkeyWindowState::Maximized) showCmd = SW_SHOWMAXIMIZED;
                     else if (hk.windowState == HotkeyWindowState::Hidden) showCmd = SW_HIDE;
 
-                    bool launched = false;
+                    const wchar_t* workDir = hk.workDir.empty() ? nullptr : hk.workDir.c_str();
 
-                    // 非管理员模式：尝试使用 CreateProcess 启动（更精确的控制）
-                    if (!hk.runAsAdmin) {
-                        STARTUPINFOW si = {};
-                        si.cb = sizeof(si);
-                        si.dwFlags = STARTF_USESHOWWINDOW;
-                        si.wShowWindow = (WORD)showCmd;
-                        PROCESS_INFORMATION pi = {};
+                    if (hk.runAsAdmin) {
+                        // 管理员启动：走 Shell 的 runas 动词。SEE_MASK_FLAG_NO_UI
+                        // 抑制 Shell 自己的错误框，除用户取消 UAC 外由本程序统一提示
+                        auto runAsDirect = [&]() {
+                            SHELLEXECUTEINFOW sei = {};
+                            sei.cbSize = sizeof(sei);
+                            sei.fMask = SEE_MASK_FLAG_NO_UI;
+                            sei.lpVerb = L"runas";
+                            sei.lpFile = command.c_str();
+                            sei.lpParameters = hk.parameters.empty()
+                                ? nullptr : hk.parameters.c_str();
+                            sei.lpDirectory = workDir;
+                            sei.nShow = showCmd;
+                            if (!ShellExecuteExW(&sei)) {
+                                const DWORD err = GetLastError();
+                                if (err != ERROR_CANCELLED) {  // 用户取消 UAC 不算失败
+                                    showHotkeyError(std::wstring(Tr(L"执行失败: ")) +
+                                                    SanitizeConfirmField(command));
+                                }
+                            }
+                        };
 
-                        const wchar_t* workDir = hk.workDir.empty() ? nullptr : hk.workDir.c_str();
+                        if (g_processElevated) {
+                            // 已提权的主程序直接调用 runas 不会弹 UAC。
+                            // 先用标准用户令牌启动自身作为提权代理，
+                            // 由代理在标准权限下调用 runas，确保仍出现 UAC
+                            wchar_t exePath[32768] = {};
+                            GetModuleFileNameW(nullptr, exePath, 32768);
+                            std::wstring helperLine = QuoteCommandLineArg(exePath);
+                            helperLine += L" --elevate-helper ";
+                            helperLine += QuoteCommandLineArg(command);
+                            helperLine += L" ";
+                            helperLine += QuoteCommandLineArg(hk.parameters.empty()
+                                ? std::wstring(L"--ks-empty--") : hk.parameters);
+                            helperLine += L" ";
+                            helperLine += QuoteCommandLineArg(hk.workDir.empty()
+                                ? std::wstring(L"--ks-empty--") : hk.workDir);
+                            helperLine += L" ";
+                            helperLine += std::to_wstring(showCmd);
+
+                            DWORD helperError = ERROR_SUCCESS;
+                            if (!ProcessUtils::CreateProcessAsStandardUser(
+                                    exePath, helperLine, nullptr, SW_HIDE, &helperError)) {
+                                // 极少数没有可用标准用户令牌的会话（如无 shell）：
+                                // 退回直接 runas，至少保证热键功能可用
+                                runAsDirect();
+                            }
+                        } else {
+                            runAsDirect();
+                        }
+                    } else {
+                        // 标准权限启动：绝不继承主程序的管理员权限。
+                        // 主程序未提权时普通 CreateProcess 已是标准权限；
+                        // 主程序已提权时改用当前用户的标准令牌创建进程
+                        DWORD launchError = ERROR_SUCCESS;
+                        auto startProcess = [&](const wchar_t* application,
+                                                std::wstring& cmdLine) -> bool {
+                            if (g_processElevated) {
+                                return ProcessUtils::CreateProcessAsStandardUser(
+                                    application, cmdLine, workDir, (WORD)showCmd, &launchError);
+                            }
+                            STARTUPINFOW si = {};
+                            si.cb = sizeof(si);
+                            si.dwFlags = STARTF_USESHOWWINDOW;
+                            si.wShowWindow = (WORD)showCmd;
+                            PROCESS_INFORMATION pi = {};
+                            if (!CreateProcessW(application, cmdLine.data(), nullptr, nullptr,
+                                                FALSE, 0, nullptr, workDir, &si, &pi)) {
+                                launchError = GetLastError();
+                                return false;
+                            }
+                            CloseHandle(pi.hProcess);
+                            CloseHandle(pi.hThread);
+                            return true;
+                        };
 
                         // 构建命令行：优先用 lpApplicationName 明确指定可执行文件，
                         // 避免整串加引号导致参数错位，以及无引号重试命中
@@ -2757,53 +2950,96 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                !(cmdAttrs & FILE_ATTRIBUTE_DIRECTORY);
                         const bool cmdLooksLikePath =
                             command.find_first_of(L"\\/") != std::wstring::npos;
+                        bool launched = false;
 
+                        std::wstring ext;
                         if (cmdIsFile) {
+                            const size_t dot = command.find_last_of(L'.');
+                            if (dot != std::wstring::npos) {
+                                ext = command.substr(dot);
+                                CharLowerBuffW(ext.data(), (DWORD)ext.size());
+                            }
+                        }
+
+                        if (cmdIsFile && (ext == L".bat" || ext == L".cmd")) {
+                            // 批处理必须经 cmd.exe 执行，同样使用标准权限令牌
+                            wchar_t sysDir[MAX_PATH] = {};
+                            GetSystemDirectoryW(sysDir, MAX_PATH);
+                            const std::wstring cmdExe = std::wstring(sysDir) + L"\\cmd.exe";
+                            std::wstring cmdLine = L"cmd.exe /c \"" + command + L"\"";
+                            if (!hk.parameters.empty()) cmdLine += L" " + hk.parameters;
+                            launched = startProcess(cmdExe.c_str(), cmdLine);
+                        } else if (cmdIsFile) {
                             // 可执行文件路径 + 参数：argv[0] 按 Windows 规则引用
                             std::wstring cmdLine = QuoteCommandLineArg(command);
                             if (!hk.parameters.empty()) cmdLine += L" " + hk.parameters;
-                            if (CreateProcessW(command.c_str(), cmdLine.data(), nullptr, nullptr,
-                                               FALSE, 0, nullptr, workDir, &si, &pi)) {
-                                CloseHandle(pi.hProcess);
-                                CloseHandle(pi.hThread);
-                                launched = true;
+                            launched = startProcess(command.c_str(), cmdLine);
+                            // 非 PE 文件（快捷方式/文档）：CreateProcess 会报格式错误，
+                            // 交给资源管理器按默认关联打开。已提权时仍用标准令牌，
+                            // 由已运行的标准权限 explorer 处理，不会继承管理员权限
+                            if (!launched && (launchError == ERROR_BAD_EXE_FORMAT ||
+                                              launchError == ERROR_NOT_SUPPORTED)) {
+                                if (g_processElevated) {
+                                    wchar_t winDir[MAX_PATH] = {};
+                                    GetWindowsDirectoryW(winDir, MAX_PATH);
+                                    const std::wstring explorer =
+                                        std::wstring(winDir) + L"\\explorer.exe";
+                                    std::wstring explorerLine =
+                                        QuoteCommandLineArg(explorer) + L" " +
+                                        QuoteCommandLineArg(command);
+                                    launchError = ERROR_SUCCESS;
+                                    launched = ProcessUtils::CreateProcessAsStandardUser(
+                                        explorer.c_str(), explorerLine, nullptr,
+                                        (WORD)showCmd, &launchError);
+                                } else {
+                                    launched = (INT_PTR)ShellExecuteW(
+                                        nullptr, L"open", command.c_str(),
+                                        hk.parameters.empty() ? nullptr : hk.parameters.c_str(),
+                                        workDir, showCmd) > 32;
+                                    if (!launched) launchError = GetLastError();
+                                }
                             }
                         } else if (!cmdLooksLikePath) {
                             // 兼容“命令框里写成完整命令行”（如 cmd.exe /c foo）与
                             // PATH 中的裸程序名：没有可校验的文件路径，只按原样执行一次
                             std::wstring rawLine = command;
                             if (!hk.parameters.empty()) rawLine += L" " + hk.parameters;
-                            if (CreateProcessW(nullptr, rawLine.data(), nullptr, nullptr,
-                                               FALSE, 0, nullptr, workDir, &si, &pi)) {
-                                CloseHandle(pi.hProcess);
-                                CloseHandle(pi.hThread);
+                            launched = startProcess(nullptr, rawLine);
+                        }
+
+                        // 非提权主程序：CreateProcess 无法处理的 shell 协议
+                        // （如 ms-settings:、https://）交给 Shell。错误 UI 被抑制，
+                        // 失败仍由下面的统一提示展示，不产生额外弹窗。
+                        // 主程序已提权时不做该回退，避免子进程继承管理员权限
+                        if (!launched && !g_processElevated &&
+                            launchError != ERROR_ELEVATION_REQUIRED) {
+                            SHELLEXECUTEINFOW sei = {};
+                            sei.cbSize = sizeof(sei);
+                            sei.fMask = SEE_MASK_FLAG_NO_UI;
+                            sei.lpVerb = L"open";
+                            sei.lpFile = command.c_str();
+                            sei.lpParameters = hk.parameters.empty()
+                                ? nullptr : hk.parameters.c_str();
+                            sei.lpDirectory = workDir;
+                            sei.nShow = showCmd;
+                            if (ShellExecuteExW(&sei)) {
                                 launched = true;
+                                launchError = ERROR_SUCCESS;
+                            } else {
+                                launchError = GetLastError();
                             }
                         }
-                        // 含路径分隔符但文件不存在：不再用无引号裸串重试，
-                        // 直接交给下面的 ShellExecute 兜底（失败会给出明确错误）
-                    }
 
-                    // CreateProcess 失败或需要管理员权限：使用 ShellExecute 启动
-                    if (!launched) {
-                        INT_PTR result = (INT_PTR)ShellExecuteW(
-                            nullptr,
-                            hk.runAsAdmin ? L"runas" : L"open",  // runas 触发 UAC 提权
-                            command.c_str(),
-                            hk.parameters.c_str(),
-                            hk.workDir.empty() ? nullptr : hk.workDir.c_str(),
-                            showCmd);
-                        if (result <= 32) {
-                            // ShellExecute 返回值 <= 32 表示执行失败。
-                            // 消息含用户命令/路径：只翻译固定标签，命令原样展示，
-                            // 避免片段替换把路径里的中文词改掉（R8-A2）
-                            std::wstring errMsg = std::wstring(Tr(L"执行失败: ")) +
-                                                  SanitizeConfirmField(command);
-                            // 错误框同样抑制热键，避免弹框期间再次触发热键动作
-                            const bool prevSuppress = g_suppressHotkeys;
-                            g_suppressHotkeys = true;
-                            ShowAppMessageRaw(errMsg, MB_OK | MB_ICONERROR, Tr(L"错误"));
-                            g_suppressHotkeys = prevSuppress;
+                        if (!launched) {
+                            if (launchError == ERROR_ELEVATION_REQUIRED) {
+                                // 目标程序清单要求管理员权限：不能为了“无 UAC”
+                                // 继续用 ShellExecute 触发提权，明确提示用户改配置
+                                showHotkeyError(Tr(L"该程序要求管理员权限，无法以标准权限启动。\n"
+                                                   L"请编辑该热键并勾选「以管理员运行（UAC）」。"));
+                            } else {
+                                showHotkeyError(std::wstring(Tr(L"执行失败: ")) +
+                                                SanitizeConfirmField(command));
+                            }
                         }
                     }
                 }
@@ -2988,6 +3224,40 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ===== RunElevationHelperIfRequested =====
+// 提权代理模式：主程序已提权时，直接调用 runas 不会弹 UAC。
+// 主实例会先用标准用户令牌启动本进程并传入该参数，由标准权限进程
+// 发起 runas，从而在“主程序管理员 + 热键勾选管理员”时仍弹出 UAC。
+// 返回 true 表示本次进程只作为代理运行，调用方应立即退出。
+static bool RunElevationHelperIfRequested() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return false;
+
+    bool handled = false;
+    if (argc >= 2 && _wcsicmp(argv[1], L"--elevate-helper") == 0) {
+        handled = true;
+        // 参数：<目标程序> <参数> <工作目录> <显示方式>
+        // 空参数/空目录用固定占位符，避免命令行解析器丢弃空参数
+        const wchar_t* const kEmpty = L"--ks-empty--";
+        if (argc >= 6) {
+            const std::wstring parameters = (wcscmp(argv[3], kEmpty) == 0) ? L"" : argv[3];
+            const std::wstring workDir = (wcscmp(argv[4], kEmpty) == 0) ? L"" : argv[4];
+            SHELLEXECUTEINFOW sei = {};
+            sei.cbSize = sizeof(sei);
+            sei.fMask = SEE_MASK_FLAG_NO_UI;
+            sei.lpVerb = L"runas";
+            sei.lpFile = argv[2];
+            sei.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
+            sei.lpDirectory = workDir.empty() ? nullptr : workDir.c_str();
+            sei.nShow = ConfigUtils::SafeParseInt(argv[5], SW_SHOWNORMAL);
+            ShellExecuteExW(&sei);
+        }
+    }
+    LocalFree(argv);
+    return handled;
+}
+
 // ===== wWinMain =====
 // 功能：应用程序入口点
 // 流程：
@@ -3003,6 +3273,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 //  10. 进入消息循环
 //  11. 退出时保存配置、释放互斥体
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // 提权代理模式：只负责从标准权限发起 UAC，不初始化界面、互斥体或钩子
+    if (RunElevationHelperIfRequested()) return 0;
 
     // 先初始化 UI 缩放系数（基于系统 DPI），保证后续字体与窗口尺寸一致
     InitUiScale();
@@ -3114,21 +3386,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_iniPath = GetIniPath();       // 获取配置文件路径
     g_config.Load(g_iniPath);       // 加载配置
     RefreshConfigStamp();           // 记录载入时的文件时间，退出时用于检测外部编辑
-    // 提权运行时配置文件仍位于用户可写目录：同用户的中完整性进程可以直接
-    // 改写 CustomHotkeys 并关闭“执行前确认”。执行阶段会按 g_processElevated
-    // 强制确认，但不再回写 confirmBeforeRun —— 否则用户取消勾选后会被
-    // 提权会话永久改回勾选并落盘，非提权运行时就再也取消不掉（R16）
+    // 提权状态用于决定启动子进程时是否需要降权为标准用户令牌；
+    // 启动确认只由热键自身的“确认后执行”配置决定
     g_processElevated = ProcessUtils::IsElevated();
-    if (g_processElevated) {
-        for (const auto& hk : g_config.customHotkeys) {
-            // 模拟按键没有“确认”配置，提权时同样会强制确认；
-            // 命令型只在原本未勾选确认时提示，避免重复打扰
-            if (hk.simulateKey || !hk.confirmBeforeRun) {
-                g_elevatedHotkeyGuard = true;
-                break;
-            }
-        }
-    }
     // 应用外观主题与界面语言（须在创建任何窗口前完成，字体/画刷按主题生成）
     Fluent::SetThemeMode((Fluent::ThemeMode)g_config.appTheme);
     SetAppLanguage((AppLanguage)g_config.appLanguage);
@@ -3200,9 +3460,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 记录该状态，让启动提示让位于告警（只保留一条）
     const bool hadPendingNotice = !g_pendingTrayText.empty();
     AddTrayIcon(g_mainWnd);
-    if (g_elevatedHotkeyGuard) {
-        ShowTrayNotification(L"检测到以管理员身份运行：已为全部自定义热键强制启用执行前确认，防止用户可写配置被直接篡改后静默提权执行。", true);
-    }
     // 配置文件存在但读不出来：按具体原因提示（编码问题会给出另存为指引），
     // 明确本次以默认值运行且不会覆盖原文件（R11-M3）
     if (g_config.LoadFailed()) {
@@ -3211,7 +3468,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     // --- 显示启动通知气泡 ---
     // 同一时刻只发一条：优先级 缓存告警（已由 AddTrayIcon 补发）> 崩溃恢复提示 > 常规启动提示
-    if (!hadPendingNotice && !g_elevatedHotkeyGuard && !g_config.LoadFailed() &&
+    if (!hadPendingNotice && !g_config.LoadFailed() &&
         (recoveredWindows > 0 || !g_config.disableStartupNotification)) {
         g_nid.uFlags = NIF_INFO;
         wcsncpy_s(g_nid.szInfoTitle, Tr(APP_NAME), _TRUNCATE);
