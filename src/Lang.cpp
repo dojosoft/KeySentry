@@ -43,8 +43,8 @@ const Entry kEntries[] = {
     { L"\n\n是否继续？", L"\n\nContinue?" },
     { L"\n\n是否用当前设置覆盖外部修改？\n", L"\n\nOverwrite the external changes with the current settings?\n" },
     { L"\n是否仍要应用设置？", L"\nApply the settings anyway?" },
-    { L"注意：将以管理员权限运行，随后会弹出系统 UAC 提示。",
-      L"Note: It will run with administrator privileges and trigger a UAC prompt." },
+    { L"注意：将以管理员权限运行",
+      L"Note: It will run with administrator privileges." },
     { L"注意：当前已以管理员身份运行，子进程将以管理员权限运行。",
       L"Note: KeySentry is already elevated; the child process will run as administrator." },
     { L"」将被映射为组合键「", L"\" will be mapped to the shortcut \"" },
@@ -132,6 +132,12 @@ const Entry kEntries[] = {
     { L"程序：", L"Program:" },
     { L"触发动作:", L"Action:" },
     { L"窗口", L"Window" },
+    { L"窗口绑定内容总长过长，无法安全写入配置文件。\n"
+      L"请减少绑定数量或缩短窗口标题/进程路径后重试。\n"
+      L"（每组绑定建议不超过 30000 字符）",
+      L"The total window binding content is too long to write safely to the configuration file.\n"
+      L"Reduce the number of bindings or shorten window titles/process paths and try again.\n"
+      L"(Recommended length per binding group: no more than 30000 characters)" },
     { L"窗口绑定内容总长过长，无法安全写入配置文件。\n",
       L"The total window binding content is too long to write safely to the configuration file.\n" },
     { L"窗口标题至少需要 2 个字符，避免匹配过多窗口",
@@ -224,8 +230,6 @@ const Entry kEntries[] = {
       L"Failed to install the keyboard hook; some features may be unavailable.\nCheck whether security software is blocking it." },
     { L"键盘钩子安装失败，无法捕获按键。\n请稍后重试或检查安全软件拦截。",
       L"Failed to install the keyboard hook; keys cannot be captured.\nTry again later or check security software." },
-    { L"键盘钩子被系统移除后已自动恢复，按键功能继续可用。",
-      L"The keyboard hook was removed by the system and has been restored automatically. Key features remain available." },
     { L"键盘热键", L"Keyboard hotkey" },
     { L"将互换「", L"Swap \"" },
     { L"仅在主屏显示", L"Show on primary monitor only" },
@@ -347,6 +351,10 @@ const Entry kEntries[] = {
       L"Note: Folder options are reset at startup and after Apply; write failures are reported." },
     { L"搜索", L"Search" },
     { L"缩进", L"Indent" },
+    { L"请确认", L"Please confirm" },
+    { L"是否强制结束这些程序？", L"Force-end these programs?" },
+    { L"以下程序未在超时内退出，强制结束可能导致未保存的数据丢失：\n\n",
+      L"The following programs did not exit in time. Force-ending them may cause unsaved data to be lost:\n\n" },
     { L"提示", L"Notice" },
     { L"提示窗口创建失败", L"Failed to create the notification window" },
     { L"添加", L"Add" },
@@ -479,6 +487,12 @@ const Entry kEntries[] = {
     { L"注意：启用后单独按下「", L"Note: After enabling, pressing \"" },
     { L"状态提示", L"Status notifications" },
     { L"自定义热键被其他程序占用: ", L"Custom hotkey is occupied by another program: " },
+    { L"自定义热键的总内容过长，无法安全写入配置文件。\n"
+      L"请缩短命令/参数，或减少自定义热键数量后重试。\n"
+      L"（建议序列化总长度不超过 30000 字符）",
+      L"The total custom hotkey content is too long to write safely to the configuration file.\n"
+      L"Shorten the command/arguments or reduce the number of custom hotkeys and try again.\n"
+      L"(Recommended total serialized length: no more than 30000 characters)" },
     { L"自定义热键的总内容过长，无法安全写入配置文件。\n",
       L"The total custom hotkey content is too long to write safely to the configuration file.\n" },
     { L"自定义热键互相冲突: ", L"Custom hotkeys conflict with each other: " },

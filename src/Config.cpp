@@ -895,7 +895,19 @@ bool AppConfig::Save(const std::wstring& iniPath) const {
             return false;
         }
     }
-    const BOOL moved = MoveFileExW(tmpPath.c_str(), iniPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+    // 落盘刷新：MoveFileEx 只保证重命名元数据，不保证临时文件数据已经写入磁盘。
+    // 断电/蓝屏时可能出现“新文件名 + 旧/空内容”，这里在替换前显式刷盘
+    {
+        HANDLE hFlush = CreateFileW(tmpPath.c_str(), GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFlush != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(hFlush);
+            CloseHandle(hFlush);
+        }
+    }
+    const BOOL moved = MoveFileExW(tmpPath.c_str(), iniPath.c_str(),
+                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     if (!moved) {
         DeleteFileW(tmpPath.c_str());
         return false;  // 目录只读/磁盘满/权限不足：由调用方提示，避免"已应用"却未落盘

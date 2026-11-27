@@ -6,6 +6,7 @@
 #include <ShellAPI.h>
 #include <ShlObj.h>
 #include <CommCtrl.h>
+#include <Sddl.h>
 #include <algorithm>
 #include <set>
 
@@ -26,10 +27,34 @@ static const wchar_t* APP_NAME = L"键客";                    // 应用显示�
 // 开机自启注册表值名：使用稳定的英文名，应用改名/多语言后不会残留旧条目
 static const wchar_t* AUTO_START_VALUE_NAME = L"KeySentry";
 static const wchar_t* MAIN_WND_CLASS = L"KeySentryMainWnd";  // 主窗口类名
-static const wchar_t* MUTEX_NAME = L"Global\\KeySentrySingleInstance";  // 单实例互斥体名称，防止多开
+// 单实例命名对象前缀。实际名称会追加当前用户 SID：
+// 固定名称的 Global 对象可能被其他用户抢先创建并持有，导致本程序被拒绝启动（拒绝服务）；
+// 按用户隔离后，不同用户之间不会互相影响。
+static const wchar_t* MUTEX_PREFIX = L"Global\\KeySentrySingleInstance";
 // 回退用：标准用户可能没有创建 Global 命名对象的权限，
 // 完全放弃单实例保护会导致双开（双开会误恢复对方隐藏的窗口与窗口样式）
-static const wchar_t* LOCAL_MUTEX_NAME = L"Local\\KeySentrySingleInstance";
+static const wchar_t* LOCAL_MUTEX_PREFIX = L"Local\\KeySentrySingleInstance";
+
+// 生成带当前用户 SID 的命名对象名。同一用户仍可抢占（同一用户本就能终止进程，
+// 不属于安全边界）；此修复针对跨用户预创建 Global 对象导致的启动拒绝。
+static std::wstring BuildUserScopedMutexName(const wchar_t* prefix) {
+    std::wstring sidText = L"unknown";
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        BYTE buffer[256] = {};
+        DWORD needed = 0;
+        if (GetTokenInformation(token, TokenUser, buffer, sizeof(buffer), &needed)) {
+            auto* user = reinterpret_cast<TOKEN_USER*>(buffer);
+            LPWSTR sid = nullptr;
+            if (ConvertSidToStringSidW(user->User.Sid, &sid)) {
+                sidText = sid;
+                LocalFree(sid);
+            }
+        }
+        CloseHandle(token);
+    }
+    return std::wstring(prefix) + L"_" + sidText;
+}
 
 // ===== 热键 ID 常量 =====
 static constexpr int BOSS_HOTKEY_ID = 100;          // 老板键（窗口隐藏/恢复）热键 ID
@@ -44,7 +69,7 @@ static constexpr UINT TIMER_NUMLOCK_DELAY_MS = 2000;  // 启动后延迟开启 N
 // 静音键按下后，键盘钩子早于系统完成静音切换，故轮询等待系统真正生效后再显示浮层，
 // 保证浮层显示的静音状态与系统实际状态一致（约 500ms 上限后强制按真实状态显示）
 static constexpr UINT TIMER_MUTE_REFRESH_MS = 50;     // 静音状态轮询间隔（毫秒）
-static constexpr UINT TIMER_HOOK_WATCH_MS = 5000;     // 键盘钩子探活间隔（毫秒）
+static constexpr UINT TIMER_HOOK_WATCH_MS = 1000;     // 键盘钩子探活/待释放按键重试间隔（毫秒）
 // 启动时音频服务/默认端点可能尚未就绪，静音恢复失败后按此间隔静默重试
 static constexpr UINT TIMER_MUTE_RESTORE_RETRY_MS = 5000;
 static constexpr int MUTE_RESTORE_RETRY_MAX = 24;     // 最多重试约 2 分钟，仍失败则留待下次启动
@@ -298,6 +323,10 @@ static void SimulateTargetKeyPress(UINT vk, UINT mods) {
         return false;
     };
 
+    // 先原子地进入模拟态并复位物理修饰键跟踪：从此刻起钩子会记录用户是否
+    // 中途松开 Ctrl/Shift。顺序必须在读取 heldAgg 之前，缩小竞态窗口
+    g_hook.BeginSimulationTracking();
+
     // 记录热键触发瞬间的物理修饰键状态（注入按键前检查才准确）
     const UINT aggMods[3] = { VK_CONTROL, VK_SHIFT, VK_MENU }; // 聚合修饰键（不区分左右）
     bool heldAgg[3] = {};
@@ -306,8 +335,6 @@ static void SimulateTargetKeyPress(UINT vk, UINT mods) {
     }
     bool heldLWin = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0;
     bool heldRWin = (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
-
-    SetHookSimulating(true);
 
     // 第一步：释放按住的修饰键
     INPUT rel[5] = {};
@@ -369,11 +396,21 @@ static void SimulateTargetKeyPress(UINT vk, UINT mods) {
         }
     }
 
-    // 第三步：恢复 Ctrl/Shift（仅限仍需保持的聚合修饰键，Alt/Win 见函数头注释）
+    // 第三步：恢复 Ctrl/Shift（仅限仍需保持的聚合修饰键，Alt/Win 见函数头注释）。
+    // 若钩子在模拟期间观察到对应物理键已抬起，则不再补发 keydown：
+    // 否则用户先松开、我们再注入按下，会让修饰键停留在按下状态
     INPUT re[2] = {};
     int m = 0;
-    if (heldAgg[0]) { re[m].type = INPUT_KEYBOARD; re[m].ki.wVk = VK_CONTROL; m++; }
-    if (heldAgg[1]) { re[m].type = INPUT_KEYBOARD; re[m].ki.wVk = VK_SHIFT; m++; }
+    if (heldAgg[0] && !g_hook.WasControlReleasedDuringSimulation()) {
+        re[m].type = INPUT_KEYBOARD;
+        re[m].ki.wVk = VK_CONTROL;
+        m++;
+    }
+    if (heldAgg[1] && !g_hook.WasShiftReleasedDuringSimulation()) {
+        re[m].type = INPUT_KEYBOARD;
+        re[m].ki.wVk = VK_SHIFT;
+        m++;
+    }
     // 仅在确实需要恢复修饰键时才等待：无修饰键场景无需阻塞 UI 线程
     if (m > 0) {
         Sleep(10);
@@ -1625,6 +1662,60 @@ std::wstring PreCheckHotkeyConflicts(const AppConfig& newConfig, bool occupancyO
 
     // --- 第三阶段：热键注册占用检测 ---
 
+    if (occupancyOnly) {
+        // 打开设置时的占用检测必须是非破坏性的：不注销任何已生效热键，
+        // 否则用户关闭设置但未点“应用”时，热键会一直失效，直到再次应用。
+        // 已由当前配置注册的组合直接视为可用；其余组合用临时 ID 试注册。
+        auto isActive = [&](UINT mod, UINT vk) {
+            if (g_config.bossKeyEnabled && g_config.bossKeyMod == mod &&
+                g_config.bossKeyVK == vk) return true;
+            if (g_config.bossKeyCloseMod == mod && g_config.bossKeyCloseVK == vk) return true;
+            if (g_config.customHotkeysEnabled) {
+                for (const auto& hk : g_config.customHotkeys) {
+                    if (hk.mod == mod && hk.vk == vk) return true;
+                }
+            }
+            return false;
+        };
+        int nextTempId = 0x9000;
+        auto occupied = [&](UINT mod, UINT vk) -> bool {
+            if (mod == 0 || vk == 0 || isActive(mod, vk)) return false;
+            const int id = nextTempId++;
+            if (RegisterHotKey(g_mainWnd, id, mod | MOD_NOREPEAT, vk) ||
+                RegisterHotKey(g_mainWnd, id, mod, vk)) {
+                UnregisterHotKey(g_mainWnd, id);
+                return false;
+            }
+            return true;
+        };
+
+        if (newConfig.bossKeyEnabled && newConfig.bossKeyMod != 0 &&
+            newConfig.bossKeyVK != 0 &&
+            occupied(newConfig.bossKeyMod, newConfig.bossKeyVK)) {
+            AddHotkeyConflict(conflicts, L"窗口隐藏被其他程序占用: ",
+                              newConfig.bossKeyMod, newConfig.bossKeyVK, L"");
+        }
+        if (newConfig.bossKeyCloseMod != 0 && newConfig.bossKeyCloseVK != 0 &&
+            occupied(newConfig.bossKeyCloseMod, newConfig.bossKeyCloseVK)) {
+            AddHotkeyConflict(conflicts, L"一键关闭热键被其他程序占用: ",
+                              newConfig.bossKeyCloseMod, newConfig.bossKeyCloseVK, L"");
+        }
+        if (newConfig.customHotkeysEnabled) {
+            for (const auto& hk : newConfig.customHotkeys) {
+                if (hk.mod == 0 || hk.vk == 0 || !occupied(hk.mod, hk.vk)) continue;
+                std::wstring name;
+                if (!hk.DisplayName().empty())
+                    name = L" [" + ShortenForMessage(hk.DisplayName()) + L"]";
+                AddHotkeyConflict(conflicts, L"自定义热键被其他程序占用: ",
+                                  hk.mod, hk.vk, name);
+            }
+        }
+        if (s_conflictLinesTruncated) {
+            conflicts += std::wstring(Tr(L"（仅显示前 20 条冲突）")) + L"\n";
+        }
+        return conflicts;
+    }
+
     // 先注销当前所有热键，以便尝试注册新配置的热键
     g_bossKey.Unregister();
     UnregisterHotKey(g_mainWnd, BOSS_CLOSE_HOTKEY_ID);
@@ -2643,11 +2734,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
-    // --- 键盘钩子自动恢复通知 ---
-    case WM_KEY_HOOK_RESTORED:
-        ShowTrayNotification(L"键盘钩子被系统移除后已自动恢复，按键功能继续可用。", true);
-        return 0;
-
     // --- 映射按键抬起补发失败通知 ---
     case WM_KEY_REMAP_RELEASE_FAILED:
         ShowTrayNotification(L"按键映射的抬起事件发送失败，可能有按键保持按下；请检查目标窗口权限或安全软件拦截。", true);
@@ -2780,7 +2866,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (!hk.command.empty()) {
                     // 执行前确认：仅当用户为该热键勾选“确认后执行”时才弹出，
-                    // 与其他任何状态（主程序是否提权、是否勾选管理员运行）无关
+                    // 与其他任何状态无关
                     if (hk.confirmBeforeRun) {
                         // 固定标签按当前语言翻译；用户字段只清洗控制字符、原样展示，
                         // 且整段消息不做片段翻译，保证“确认什么就执行什么”（R8-H6）。
@@ -2807,7 +2893,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (!hk.openPath && hk.runAsAdmin) {
                             adminNote = g_processElevated
                                 ? Tr(L"注意：当前已以管理员身份运行，子进程将以管理员权限运行。")
-                                : Tr(L"注意：将以管理员权限运行，随后会弹出系统 UAC 提示。");
+                                : Tr(L"注意：将以管理员权限运行");
                         }
                         // 走确认封装：确认框必须置前/置顶，否则从全屏程序里触发时
                         // 会被前台窗口盖住，UI 线程停在看不到的模态循环里，表现为"热键没反应"
@@ -2832,25 +2918,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             command = unquoted;
                     }
 
-                    // 打开文件/目录：交给 Shell 用默认关联程序打开。
-                    // 主程序已提权时用标准用户令牌启动 explorer，避免继承管理员权限
+                    // 打开文件/目录：交给 Shell 用默认关联程序打开
                     if (hk.openPath) {
                         if (command.empty()) return 0;
-                        bool opened = false;
-                        if (g_processElevated) {
-                            wchar_t winDir[MAX_PATH] = {};
-                            GetWindowsDirectoryW(winDir, MAX_PATH);
-                            const std::wstring explorer =
-                                std::wstring(winDir) + L"\\explorer.exe";
-                            std::wstring explorerLine =
-                                QuoteCommandLineArg(explorer) + L" " + QuoteCommandLineArg(command);
-                            DWORD openError = ERROR_SUCCESS;
-                            opened = ProcessUtils::CreateProcessAsStandardUser(
-                                explorer.c_str(), explorerLine, nullptr, SW_SHOWNORMAL, &openError);
-                        } else {
-                            opened = (INT_PTR)ShellExecuteW(nullptr, L"open", command.c_str(),
-                                                            nullptr, nullptr, SW_SHOWNORMAL) > 32;
-                        }
+                        const bool opened = (INT_PTR)ShellExecuteW(
+                            nullptr, L"open", command.c_str(), nullptr, nullptr,
+                            SW_SHOWNORMAL) > 32;
                         if (!opened) {
                             showHotkeyError(std::wstring(Tr(L"打开失败: ")) +
                                             SanitizeConfirmField(command));
@@ -2867,66 +2940,56 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const wchar_t* workDir = hk.workDir.empty() ? nullptr : hk.workDir.c_str();
 
                     if (hk.runAsAdmin) {
-                        // 管理员启动：走 Shell 的 runas 动词。SEE_MASK_FLAG_NO_UI
-                        // 抑制 Shell 自己的错误框，除用户取消 UAC 外由本程序统一提示
-                        auto runAsDirect = [&]() {
-                            SHELLEXECUTEINFOW sei = {};
-                            sei.cbSize = sizeof(sei);
-                            sei.fMask = SEE_MASK_FLAG_NO_UI;
-                            sei.lpVerb = L"runas";
-                            sei.lpFile = command.c_str();
-                            sei.lpParameters = hk.parameters.empty()
-                                ? nullptr : hk.parameters.c_str();
-                            sei.lpDirectory = workDir;
-                            sei.nShow = showCmd;
-                            if (!ShellExecuteExW(&sei)) {
-                                const DWORD err = GetLastError();
-                                if (err != ERROR_CANCELLED) {  // 用户取消 UAC 不算失败
-                                    showHotkeyError(std::wstring(Tr(L"执行失败: ")) +
-                                                    SanitizeConfirmField(command));
+                        // 勾选管理员：交给 Shell 的 runas 动词，由系统弹出 UAC。
+                        // ShellExecuteEx 要求可执行文件与参数分开，而命令框允许
+                        // 直接写完整命令行（与未勾选管理员时一致），这里按
+                        // Windows 解析规则拆分第一个参数，避免整串被当成文件名
+                        std::wstring file = command;
+                        std::wstring params = hk.parameters;
+                        const DWORD cmdAttrs = GetFileAttributesW(command.c_str());
+                        const bool cmdIsFile = (cmdAttrs != INVALID_FILE_ATTRIBUTES) &&
+                                               !(cmdAttrs & FILE_ATTRIBUTE_DIRECTORY);
+                        if (!cmdIsFile) {
+                            int argc = 0;
+                            LPWSTR* argv = CommandLineToArgvW(command.c_str(), &argc);
+                            if (argv && argc > 0) {
+                                file = argv[0];
+                                std::wstring rest;
+                                for (int i = 1; i < argc; ++i) {
+                                    if (!rest.empty()) rest += L" ";
+                                    rest += QuoteCommandLineArg(argv[i]);
                                 }
+                                if (!hk.parameters.empty()) {
+                                    if (!rest.empty()) rest += L" ";
+                                    rest += hk.parameters;
+                                }
+                                params = rest;
                             }
-                        };
-
-                        if (g_processElevated) {
-                            // 已提权的主程序直接调用 runas 不会弹 UAC。
-                            // 先用标准用户令牌启动自身作为提权代理，
-                            // 由代理在标准权限下调用 runas，确保仍出现 UAC
-                            wchar_t exePath[32768] = {};
-                            GetModuleFileNameW(nullptr, exePath, 32768);
-                            std::wstring helperLine = QuoteCommandLineArg(exePath);
-                            helperLine += L" --elevate-helper ";
-                            helperLine += QuoteCommandLineArg(command);
-                            helperLine += L" ";
-                            helperLine += QuoteCommandLineArg(hk.parameters.empty()
-                                ? std::wstring(L"--ks-empty--") : hk.parameters);
-                            helperLine += L" ";
-                            helperLine += QuoteCommandLineArg(hk.workDir.empty()
-                                ? std::wstring(L"--ks-empty--") : hk.workDir);
-                            helperLine += L" ";
-                            helperLine += std::to_wstring(showCmd);
-
-                            DWORD helperError = ERROR_SUCCESS;
-                            if (!ProcessUtils::CreateProcessAsStandardUser(
-                                    exePath, helperLine, nullptr, SW_HIDE, &helperError)) {
-                                // 极少数没有可用标准用户令牌的会话（如无 shell）：
-                                // 退回直接 runas，至少保证热键功能可用
-                                runAsDirect();
+                            if (argv) LocalFree(argv);
+                        }
+                        // SEE_MASK_FLAG_NO_UI 抑制 Shell 自己的错误框，
+                        // 除用户取消 UAC 外由本程序统一提示
+                        SHELLEXECUTEINFOW sei = {};
+                        sei.cbSize = sizeof(sei);
+                        sei.fMask = SEE_MASK_FLAG_NO_UI;
+                        sei.lpVerb = L"runas";
+                        sei.lpFile = file.c_str();
+                        sei.lpParameters = params.empty() ? nullptr : params.c_str();
+                        sei.lpDirectory = workDir;
+                        sei.nShow = showCmd;
+                        if (!ShellExecuteExW(&sei)) {
+                            const DWORD err = GetLastError();
+                            if (err != ERROR_CANCELLED) {  // 用户取消 UAC 不算失败
+                                showHotkeyError(std::wstring(Tr(L"执行失败: ")) +
+                                                SanitizeConfirmField(command));
                             }
-                        } else {
-                            runAsDirect();
                         }
                     } else {
-                        // 标准权限启动：绝不继承主程序的管理员权限。
-                        // 主程序未提权时普通 CreateProcess 已是标准权限；
-                        // 主程序已提权时改用当前用户的标准令牌创建进程
+                        // 正常启动：批处理/可执行文件走 CreateProcess，
+                        // 文档/快捷方式等交给 Shell 按默认关联打开
                         DWORD launchError = ERROR_SUCCESS;
                         auto startProcess = [&](const wchar_t* application,
                                                 std::wstring& cmdLine) -> bool {
-                            if (g_processElevated) {
-                                return ProcessUtils::CreateProcessAsStandardUser(
-                                    application, cmdLine, workDir, (WORD)showCmd, &launchError);
-                            }
                             STARTUPINFOW si = {};
                             si.cb = sizeof(si);
                             si.dwFlags = STARTF_USESHOWWINDOW;
@@ -2962,7 +3025,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
 
                         if (cmdIsFile && (ext == L".bat" || ext == L".cmd")) {
-                            // 批处理必须经 cmd.exe 执行，同样使用标准权限令牌
+                            // 批处理必须经 cmd.exe 执行
                             wchar_t sysDir[MAX_PATH] = {};
                             GetSystemDirectoryW(sysDir, MAX_PATH);
                             const std::wstring cmdExe = std::wstring(sysDir) + L"\\cmd.exe";
@@ -2975,44 +3038,30 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             if (!hk.parameters.empty()) cmdLine += L" " + hk.parameters;
                             launched = startProcess(command.c_str(), cmdLine);
                             // 非 PE 文件（快捷方式/文档）：CreateProcess 会报格式错误，
-                            // 交给资源管理器按默认关联打开。已提权时仍用标准令牌，
-                            // 由已运行的标准权限 explorer 处理，不会继承管理员权限
+                            // 交给 Shell 按默认关联打开
                             if (!launched && (launchError == ERROR_BAD_EXE_FORMAT ||
                                               launchError == ERROR_NOT_SUPPORTED)) {
-                                if (g_processElevated) {
-                                    wchar_t winDir[MAX_PATH] = {};
-                                    GetWindowsDirectoryW(winDir, MAX_PATH);
-                                    const std::wstring explorer =
-                                        std::wstring(winDir) + L"\\explorer.exe";
-                                    std::wstring explorerLine =
-                                        QuoteCommandLineArg(explorer) + L" " +
-                                        QuoteCommandLineArg(command);
-                                    launchError = ERROR_SUCCESS;
-                                    launched = ProcessUtils::CreateProcessAsStandardUser(
-                                        explorer.c_str(), explorerLine, nullptr,
-                                        (WORD)showCmd, &launchError);
-                                } else {
-                                    launched = (INT_PTR)ShellExecuteW(
-                                        nullptr, L"open", command.c_str(),
-                                        hk.parameters.empty() ? nullptr : hk.parameters.c_str(),
-                                        workDir, showCmd) > 32;
-                                    if (!launched) launchError = GetLastError();
-                                }
+                                launched = (INT_PTR)ShellExecuteW(
+                                    nullptr, L"open", command.c_str(),
+                                    hk.parameters.empty() ? nullptr : hk.parameters.c_str(),
+                                    workDir, showCmd) > 32;
+                                if (!launched) launchError = GetLastError();
                             }
-                        } else if (!cmdLooksLikePath) {
-                            // 兼容“命令框里写成完整命令行”（如 cmd.exe /c foo）与
-                            // PATH 中的裸程序名：没有可校验的文件路径，只按原样执行一次
+                        } else if (!cmdLooksLikePath ||
+                                   command.find_first_of(L" \t") != std::wstring::npos) {
+                            // 兼容“命令框里写成完整命令行”（如 cmd.exe /c foo，
+                            // 或命令行中直接带输出文件路径）与 PATH 中的裸程序名：
+                            // 没有可校验的文件路径时按原样执行一次。
+                            // 不能仅用“含路径分隔符”排除：完整命令行里的参数
+                            // 常常就是绝对路径，否则这类配置会被静默跳过
                             std::wstring rawLine = command;
                             if (!hk.parameters.empty()) rawLine += L" " + hk.parameters;
                             launched = startProcess(nullptr, rawLine);
                         }
 
-                        // 非提权主程序：CreateProcess 无法处理的 shell 协议
-                        // （如 ms-settings:、https://）交给 Shell。错误 UI 被抑制，
-                        // 失败仍由下面的统一提示展示，不产生额外弹窗。
-                        // 主程序已提权时不做该回退，避免子进程继承管理员权限
-                        if (!launched && !g_processElevated &&
-                            launchError != ERROR_ELEVATION_REQUIRED) {
+                        // CreateProcess 无法处理的 shell 协议（如 ms-settings:、https://）
+                        // 交给 Shell。错误 UI 被抑制，失败仍由统一提示展示
+                        if (!launched && launchError != ERROR_ELEVATION_REQUIRED) {
                             SHELLEXECUTEINFOW sei = {};
                             sei.cbSize = sizeof(sei);
                             sei.fMask = SEE_MASK_FLAG_NO_UI;
@@ -3032,8 +3081,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
                         if (!launched) {
                             if (launchError == ERROR_ELEVATION_REQUIRED) {
-                                // 目标程序清单要求管理员权限：不能为了“无 UAC”
-                                // 继续用 ShellExecute 触发提权，明确提示用户改配置
+                                // 目标程序清单要求管理员权限：提示用户勾选管理员选项
                                 showHotkeyError(Tr(L"该程序要求管理员权限，无法以标准权限启动。\n"
                                                    L"请编辑该热键并勾选「以管理员运行（UAC）」。"));
                             } else {
@@ -3139,8 +3187,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_bossKey.VerifyPendingHide();
             if (g_bossKey.IsActive()) {
                 if (g_config.bossKeyCloseOnExit) {
-                    // 关机路径用短超时（500ms），避免阻塞系统关机
-                    g_bossKey.CloseBoundProcesses(500);
+                    // 关机路径用短超时（500ms），且禁止强制终止，避免阻塞关机或丢失数据
+                    g_bossKey.CloseBoundProcesses(500, false);
                 } else {
                     // Deactivate() 内部会调用 ShowWindows() 完成窗口恢复并清除恢复文件
                     g_bossKey.Deactivate();
@@ -3224,40 +3272,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ===== RunElevationHelperIfRequested =====
-// 提权代理模式：主程序已提权时，直接调用 runas 不会弹 UAC。
-// 主实例会先用标准用户令牌启动本进程并传入该参数，由标准权限进程
-// 发起 runas，从而在“主程序管理员 + 热键勾选管理员”时仍弹出 UAC。
-// 返回 true 表示本次进程只作为代理运行，调用方应立即退出。
-static bool RunElevationHelperIfRequested() {
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return false;
-
-    bool handled = false;
-    if (argc >= 2 && _wcsicmp(argv[1], L"--elevate-helper") == 0) {
-        handled = true;
-        // 参数：<目标程序> <参数> <工作目录> <显示方式>
-        // 空参数/空目录用固定占位符，避免命令行解析器丢弃空参数
-        const wchar_t* const kEmpty = L"--ks-empty--";
-        if (argc >= 6) {
-            const std::wstring parameters = (wcscmp(argv[3], kEmpty) == 0) ? L"" : argv[3];
-            const std::wstring workDir = (wcscmp(argv[4], kEmpty) == 0) ? L"" : argv[4];
-            SHELLEXECUTEINFOW sei = {};
-            sei.cbSize = sizeof(sei);
-            sei.fMask = SEE_MASK_FLAG_NO_UI;
-            sei.lpVerb = L"runas";
-            sei.lpFile = argv[2];
-            sei.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
-            sei.lpDirectory = workDir.empty() ? nullptr : workDir.c_str();
-            sei.nShow = ConfigUtils::SafeParseInt(argv[5], SW_SHOWNORMAL);
-            ShellExecuteExW(&sei);
-        }
-    }
-    LocalFree(argv);
-    return handled;
-}
-
 // ===== wWinMain =====
 // 功能：应用程序入口点
 // 流程：
@@ -3273,9 +3287,6 @@ static bool RunElevationHelperIfRequested() {
 //  10. 进入消息循环
 //  11. 退出时保存配置、释放互斥体
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
-    // 提权代理模式：只负责从标准权限发起 UAC，不初始化界面、互斥体或钩子
-    if (RunElevationHelperIfRequested()) return 0;
-
     // 先初始化 UI 缩放系数（基于系统 DPI），保证后续字体与窗口尺寸一致
     InitUiScale();
 
@@ -3285,9 +3296,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // --- 单实例检测 ---
     // 统一以 Local（当前会话）命名互斥体为主判定：Global 命名需要额外权限，
     // 普通实例创建失败会退回 Local，而提权实例只建 Global，两者互不可见导致可双开。
-    // 本地创建成功后再额外探测 Global，兼容旧版本/已提权运行中的实例
+    // 本地创建成功后再额外探测 Global，兼容旧版本/已提权运行中的实例。
+    // 名称追加当前用户 SID：避免其他用户预创建 Global 对象造成启动拒绝
+    const std::wstring localMutexName = BuildUserScopedMutexName(LOCAL_MUTEX_PREFIX);
+    const std::wstring globalMutexName = BuildUserScopedMutexName(MUTEX_PREFIX);
     SetLastError(0);
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, LOCAL_MUTEX_NAME);
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, localMutexName.c_str());
     const DWORD localMutexErr = GetLastError();
     const bool localExists = (hMutex && localMutexErr == ERROR_ALREADY_EXISTS);
     // ACCESS_DENIED 说明同名对象已存在但无法打开（例如由其他账户的提权实例创建）
@@ -3306,11 +3320,25 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     bool globalDenied = false;
     if (!alreadyRunning) {
         SetLastError(0);
-        hGlobalMutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
+        hGlobalMutex = CreateMutexW(nullptr, TRUE, globalMutexName.c_str());
         const DWORD globalMutexErr = GetLastError();
         globalExists = (hGlobalMutex && globalMutexErr == ERROR_ALREADY_EXISTS);
         globalDenied = (!hGlobalMutex && globalMutexErr == ERROR_ACCESS_DENIED);
         alreadyRunning = globalExists || globalDenied;
+    }
+    if (!alreadyRunning) {
+        // 兼容升级前的旧版本：旧实例使用不含 SID 的互斥体名，新名称不会与它冲突。
+        // 以主窗口作为补充判定，避免升级期间短暂双开并互相覆盖配置/恢复文件。
+        HWND legacyInstance = FindSameProductMainWindow();
+        if (legacyInstance) {
+            if (hMutex) CloseHandle(hMutex);
+            if (hGlobalMutex) CloseHandle(hGlobalMutex);
+            if (IsOwnProcessWindow(legacyInstance)) {
+                SendMessageTimeoutW(legacyInstance, WM_TRAYICON, 0, WM_LBUTTONDBLCLK,
+                                    SMTO_ABORTIFHUNG, 1000, nullptr);
+            }
+            return 0;
+        }
     }
     if (alreadyRunning) {
         // 不能只凭命名互斥体就退出：同用户进程可以先创建同名互斥体并持有，
@@ -3367,7 +3395,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         if (hGlobalMutex) CloseHandle(hGlobalMutex);
         hGlobalMutex = nullptr;
         SetLastError(0);
-        hMutex = CreateMutexW(nullptr, TRUE, LOCAL_MUTEX_NAME);
+        hMutex = CreateMutexW(nullptr, TRUE, localMutexName.c_str());
         if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
             // 释放与重建之间可能有其他实例抢先启动：按已有实例处理
             const DWORD err = GetLastError();

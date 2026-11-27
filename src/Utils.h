@@ -34,6 +34,10 @@ namespace WindowUtils {
     //       等待期间线程仍可继续派发钩子回调。
     inline std::wstring GetTextSafe(HWND hwnd, UINT timeoutMs = 50) {
         if (!IsWindow(hwnd)) return L"";
+        // 无响应窗口在 SendMessageTimeout 上会完整等待 timeoutMs；老板键/守护
+        // 定时器会枚举大量窗口，几十个无响应窗口即可累计数秒并拖慢 UI 与热键响应。
+        // 这类窗口本来也无法可靠匹配标题，直接跳过
+        if (IsHungAppWindow(hwnd)) return L"";
         // 先用栈缓冲尝试；返回值达到缓冲上限说明可能被截断，再按实际长度重读一次。
         // 固定 512 字符会让超长标题被截断，导致按标题绑定/恢复文件精确匹配失败
         const int kInitialChars = 512;
@@ -656,94 +660,6 @@ namespace ProcessUtils {
         return ok && elevation.TokenIsElevated != 0;
     }
 
-    // 获取当前登录用户的标准（非管理员）主令牌，用于从提权进程降权启动子进程。
-    // 提权令牌的链接令牌（TokenLinkedToken）在此环境下复制会返回
-    // ERROR_BAD_IMPERSONATION_LEVEL；Safer API 也只去掉特权、保留高完整性，
-    // 都不能真正降权。可靠做法是复制桌面 shell（explorer.exe）的令牌：
-    // 它运行在用户的标准完整性级别，且与当前会话一致。
-    // 返回的句柄需要 CloseHandle；失败返回 nullptr。
-    inline HANDLE CreateStandardUserToken(DWORD* errorCode = nullptr) {
-        if (errorCode) *errorCode = ERROR_SUCCESS;
-        auto fail = [errorCode](DWORD err) -> HANDLE {
-            if (errorCode) *errorCode = err;
-            return nullptr;
-        };
-
-        HWND shellWnd = GetShellWindow();
-        DWORD shellPid = 0;
-        if (shellWnd) GetWindowThreadProcessId(shellWnd, &shellPid);
-        if (!shellPid) return fail(ERROR_NOT_FOUND);
-
-        HANDLE shellProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                          FALSE, shellPid);
-        if (!shellProcess) return fail(GetLastError());
-
-        HANDLE shellToken = nullptr;
-        if (!OpenProcessToken(shellProcess,
-                              TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY,
-                              &shellToken)) {
-            const DWORD err = GetLastError();
-            CloseHandle(shellProcess);
-            return fail(err);
-        }
-        CloseHandle(shellProcess);
-
-        // 主令牌复制不需要模拟能力，使用最低的 SecurityAnonymous
-        const DWORD processTokenAccess = TOKEN_QUERY | TOKEN_DUPLICATE |
-                                         TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT |
-                                         TOKEN_ADJUST_SESSIONID;
-        HANDLE primaryToken = nullptr;
-        if (!DuplicateTokenEx(shellToken, processTokenAccess, nullptr,
-                              SecurityAnonymous, TokenPrimary, &primaryToken)) {
-            const DWORD err = GetLastError();
-            CloseHandle(shellToken);
-            return fail(err);
-        }
-        CloseHandle(shellToken);
-
-        // shell 本身若也在管理员级别（极少数情况），复制出的仍是高权限令牌，
-        // 不应把它当作“标准用户”使用
-        TOKEN_ELEVATION elevation = {};
-        DWORD returned = 0;
-        if (GetTokenInformation(primaryToken, TokenElevation, &elevation,
-                                sizeof(elevation), &returned) &&
-            elevation.TokenIsElevated) {
-            CloseHandle(primaryToken);
-            return fail(ERROR_ACCESS_DENIED);
-        }
-        return primaryToken;
-    }
-
-    // 以当前用户的标准权限启动进程（不继承调用方的管理员令牌）。
-    // applicationName 为空时按命令行解析；commandLine 需要可写缓冲。
-    inline bool CreateProcessAsStandardUser(const wchar_t* applicationName,
-                                            std::wstring& commandLine,
-                                            const wchar_t* workDir,
-                                            WORD showCmd,
-                                            DWORD* errorCode) {
-        if (errorCode) *errorCode = ERROR_SUCCESS;
-        HANDLE token = CreateStandardUserToken();
-        if (!token) {
-            if (errorCode) *errorCode = GetLastError();
-            return false;
-        }
-
-        STARTUPINFOW si = {};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = showCmd;
-        PROCESS_INFORMATION pi = {};
-        const BOOL ok = CreateProcessWithTokenW(token, LOGON_WITH_PROFILE,
-                                                applicationName, commandLine.data(),
-                                                0, nullptr, workDir, &si, &pi);
-        if (errorCode) *errorCode = ok ? ERROR_SUCCESS : GetLastError();
-        if (ok) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-        }
-        CloseHandle(token);
-        return ok != FALSE;
-    }
 }
 
 // 关闭进程的超时时间（毫秒），超时后强制终止

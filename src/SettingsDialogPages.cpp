@@ -827,7 +827,8 @@ void SettingsPageContext::BuildWindPage() {
         {
             bool enabled = config.winDGuardEnabled;
             static const int windCtrlIds[] = {
-                IDC_LST_WINDWINS, IDC_BTN_ADD_WIND_BINDING, IDC_BTN_DELWIND
+                IDC_LST_WINDWINS, IDC_BTN_ADD_WIND_BINDING, IDC_BTN_DELWIND,
+                IDC_BTN_FIX_ZORDER
             };
             for (int id : windCtrlIds) {
                 HWND h = GetDlgItem(hwnd, id);

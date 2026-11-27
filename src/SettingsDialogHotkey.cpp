@@ -64,6 +64,16 @@ static void UpdateAddHotkeyMode(HWND hwnd, HotkeyAction action) {
         HWND h = GetDlgItem(hwnd, id);
         if (h) EnableWindow(h, action == HotkeyAction::Command);
     }
+    // 非命令模式保存时会丢弃确认/管理员/窗口状态；同步清空勾选与下拉，
+    // 避免切回命令模式后仍显示为已勾选但实际不会生效
+    if (action != HotkeyAction::Command) {
+        if (HWND chk = GetDlgItem(hwnd, IDC_CHK_HK_CONFIRM))
+            SendMessageW(chk, BM_SETCHECK, BST_UNCHECKED, 0);
+        if (HWND chk = GetDlgItem(hwnd, IDC_CHK_HK_ADMIN))
+            SendMessageW(chk, BM_SETCHECK, BST_UNCHECKED, 0);
+        if (HWND cbo = GetDlgItem(hwnd, IDC_CBO_HK_WINSTATE))
+            SendMessageW(cbo, CB_SETCURSEL, 0, 0);
+    }
 }
 
 // ===== 结束自定义热键对话框的捕获态 =====
@@ -449,7 +459,8 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         ahd.simMods = existing.targetMod;
     }
 
-    RECT rc = { 0, 0, ScaleUi(480), ScaleUi(440) };
+    const int kLogicalHeight = 440;
+    RECT rc = { 0, 0, ScaleUi(480), ScaleUi(kLogicalHeight) };
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
@@ -655,8 +666,8 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
         SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_ADMIN), BM_SETCHECK, config.customHotkeys[editIndex].runAsAdmin ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
-    // 按钮固定在窗口底部（距底边 14px），符合 Windows 常规对话框的底部留白
-    const int bottomBtnY = 440 - 30 - 14;
+    // 按钮固定在窗口底部（距底边 14px），与上方窗口高度常量保持一致
+    const int bottomBtnY = kLogicalHeight - 30 - 14;
     dlgButton(IDOK, L"确定", cx + cw - 180, bottomBtnY, 80, 30);
     dlgButton(IDCANCEL, L"取消", cx + cw - 90, bottomBtnY, 80, 30);
 

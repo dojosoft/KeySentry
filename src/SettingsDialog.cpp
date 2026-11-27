@@ -1066,10 +1066,10 @@ bool SettingsDialog::ApplySettings(HWND hwnd, AppConfig& config) {
         }
         if (totalChars > MAX_CUSTOM_ENTRIES_CHARS) {
             Fluent::ShowMessageBox(hwnd,
-                        L"自定义热键的总内容过长，无法安全写入配置文件。\n"
-                        L"请缩短命令/参数，或减少自定义热键数量后重试。\n"
-                        L"（建议序列化总长度不超过 30000 字符）",
-                        L"提示", MB_OK | MB_ICONWARNING);
+                        Tr(L"自定义热键的总内容过长，无法安全写入配置文件。\n"
+                           L"请缩短命令/参数，或减少自定义热键数量后重试。\n"
+                           L"（建议序列化总长度不超过 30000 字符）"),
+                        Tr(L"提示"), MB_OK | MB_ICONWARNING);
             return false;
         }
     }
@@ -1088,10 +1088,10 @@ bool SettingsDialog::ApplySettings(HWND hwnd, AppConfig& config) {
         if (clampAndMeasure(data->workingCopy.bossKeyWindows) > MAX_BOUND_WINDOWS_CHARS ||
             clampAndMeasure(data->workingCopy.winDGuardWindows) > MAX_BOUND_WINDOWS_CHARS) {
             Fluent::ShowMessageBox(hwnd,
-                        L"窗口绑定内容总长过长，无法安全写入配置文件。\n"
-                        L"请减少绑定数量或缩短窗口标题/进程路径后重试。\n"
-                        L"（每组绑定建议不超过 30000 字符）",
-                        L"提示", MB_OK | MB_ICONWARNING);
+                        Tr(L"窗口绑定内容总长过长，无法安全写入配置文件。\n"
+                           L"请减少绑定数量或缩短窗口标题/进程路径后重试。\n"
+                           L"（每组绑定建议不超过 30000 字符）"),
+                        Tr(L"提示"), MB_OK | MB_ICONWARNING);
             return false;
         }
     }

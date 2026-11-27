@@ -1,6 +1,7 @@
 #include "BossKey.h"
 #include "Resource.h"
 #include "Utils.h"
+#include "Lang.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -1121,10 +1122,10 @@ void BossKey::Toggle() {
 //   2. 打开进程句柄
 //   3. 发送 WM_CLOSE 优雅关闭
 //   4. 等待进程退出（超时 PROCESS_CLOSE_TIMEOUT_MS）
-//   5. 超时后强制终止（TerminateProcess）
+//   5. allowForce 时，用户确认后才强制终止（避免静默丢失未保存数据）
 // 注意：从未隐藏的绑定程序不在处理范围内（R9-H1）
 // ============================================================
-void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
+void BossKey::CloseBoundProcesses(DWORD timeoutMs, bool allowForce) {
     std::unordered_set<DWORD> closedPids;
     // 进程路径缓存：本函数会多次判断同一 PID 是否为关键进程，缓存可避免重复 OpenProcess
     ProcessUtils::PathCache cache;
@@ -1201,9 +1202,41 @@ void BossKey::CloseBoundProcesses(DWORD timeoutMs) {
         }
     }
 
-    // 超时后强制终止未退出的进程
+    // 超时后是否强制终止未退出的进程：
+    // - 关机路径 allowForce=false，绝不静默强杀；
+    // - 正常退出 allowForce=true，但必须经用户确认，避免丢失未保存数据
+    bool forceAllowed = false;
+    if (allowForce) {
+        std::wstring names;
+        int shown = 0;
+        for (auto& ph : procHandles) {
+            if (WaitForSingleObject(ph.handle, 0) == WAIT_OBJECT_0) continue;
+            if (shown < 8) {
+                std::wstring name = ProcessUtils::PathFileName(ph.imagePath);
+                if (name.empty()) name = L"PID " + std::to_wstring(ph.pid);
+                if (!names.empty()) names += L"\n";
+                names += name;
+                ++shown;
+            }
+        }
+        if (names.empty()) {
+            forceAllowed = true;   // 没有未退出的进程
+        } else {
+            std::wstring msg = Tr(L"以下程序未在超时内退出，强制结束可能导致未保存的数据丢失：\n\n") +
+                               names;
+            if (procHandles.size() > 8) msg += L"\n...";
+            msg += L"\n\n";
+            msg += Tr(L"是否强制结束这些程序？");
+            if (MessageBoxW(nullptr, msg.c_str(), Tr(L"请确认"),
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST) == IDYES) {
+                forceAllowed = true;
+            }
+        }
+    }
+
+    // 超时后强制终止未退出的进程（仅用户确认后）
     for (auto& ph : procHandles) {
-        if (WaitForSingleObject(ph.handle, 0) != WAIT_OBJECT_0) {
+        if (forceAllowed && WaitForSingleObject(ph.handle, 0) != WAIT_OBJECT_0) {
             // PID 可能在收集与强杀之间被复用：镜像路径变化或无法确认时不终止，
             // 宁可保留进程也不能误杀无关程序
             const std::wstring nowPath = ProcessUtils::GetProcessPath(ph.pid);

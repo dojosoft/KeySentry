@@ -134,9 +134,9 @@ bool KeyboardHook::HandleSimulatedRemapKeyUpLocked(SharedState& s, int vk) {
         s.activeRemaps.erase(s.activeRemaps.begin() +
                              static_cast<std::ptrdiff_t>(plan.index));
     } else {
-        // 释放失败：保留记录，由探活定时器或后续按键回调按节流间隔重试
-        s.pendingRemapRelease = true;
-        s.lastRemapRetryTick = GetTickCount64();
+        // 释放失败：转入待发送队列，由锁外的探活定时器按退避间隔重试。
+        // 不能在钩子回调内同步 SendInput，避免回调阻塞被系统移除
+        ReleaseRemappedKeysLocked(s);
     }
     // 但该 keyup 仍要消费，否则源键会以未映射状态泄漏给前台程序
     return true;
@@ -200,10 +200,12 @@ void KeyboardHook::Uninstall() {
     }
 }
 
-// 钩子探活：Windows 在回调超过 LowLevelHooksTimeout 后会静默移除钩子，
-// 此时 m_installed 仍为 true，Install() 也不会重装。
+// 钩子探活：Windows 在回调超过 LowLevelHooksTimeout 后，或在 UAC 安全桌面、
+// 锁屏、睡眠唤醒等场景下，会静默移除钩子；此时 m_installed 仍为 true，
+// Install() 也不会重装。
 // 若心跳超时且系统确有输入，先注入一个无副作用的 F24 keyup 作为探针；
-// 探针发出后下一轮仍无心跳，说明钩子已被移除，自动重装并通知用户。
+// 探针发出后下一轮仍无新的回调序号，说明钩子已被移除，自动重装。
+// 自动恢复成功后不再弹托盘提示：功能已恢复，提示只会打扰用户。
 bool KeyboardHook::EnsureAlive() {
     // 待补发的按键释放不能只依赖“下一次按键”：卡键时用户可能已经停止输入。
     // 由探活动作定时驱动，并用 try_lock 保证 UI 线程有界（R15-H03）
@@ -221,10 +223,6 @@ bool KeyboardHook::EnsureAlive() {
         const bool restored = Install(notifyWnd);
         if (restored) {
             m_nextHookReinstallTick = 0;
-            if (!m_hookLostWarned) {
-                m_hookLostWarned = true;
-                if (notifyWnd) PostMessageW(notifyWnd, WM_KEY_HOOK_RESTORED, 0, 0);
-            }
         } else {
             m_nextHookReinstallTick = now + 60000;
         }
@@ -248,7 +246,11 @@ bool KeyboardHook::EnsureAlive() {
     if (inputAge >= heartbeatAge) return true;
 
     if (m_probePending) {
-        if (last > m_probeStartTick) {
+        // 用回调序号而不是时间戳判断：GetTickCount64 的最小步进约为 15.6ms，
+        // 探针与其回调落在同一 tick 时时间戳相等，会被误判为未收到，
+        // 于是无谓地重装钩子并弹出“已自动恢复”提示
+        const ULONGLONG seq = m_state->callbackSeq.load(std::memory_order_acquire);
+        if (seq != m_probeStartSeq) {
             // 探针已被钩子回调接收，说明钩子仍存活
             m_probePending = false;
             m_state->lastHookTick.store(GetTickCount64(), std::memory_order_release);
@@ -268,10 +270,6 @@ bool KeyboardHook::EnsureAlive() {
         const bool restored = Install(notifyWnd);
         if (restored) {
             m_nextHookReinstallTick = 0;
-            if (!m_hookLostWarned) {
-                m_hookLostWarned = true;
-                if (notifyWnd) PostMessageW(notifyWnd, WM_KEY_HOOK_RESTORED, 0, 0);
-            }
         } else {
             // 钩子线程可能已卡死：冷却后再试，避免每 5 秒阻塞 UI 线程
             m_nextHookReinstallTick = now + 60000;
@@ -285,6 +283,9 @@ bool KeyboardHook::EnsureAlive() {
 
     // 发送无副作用的探针：F24 keyup 不改变按键状态，正常程序会忽略。
     // 注入被 UIPI 拒绝时无法用探针判断钩子状态，本轮直接放弃，避免误重装。
+    // 必须先记录回调序号再注入：注入触发的回调可能在 SendInput 返回前执行，
+    // 事后记录会把已递增的序号当作初始值，反而误判钩子丢失
+    m_probeStartSeq = m_state->callbackSeq.load(std::memory_order_acquire);
     INPUT probe = {};
     probe.type = INPUT_KEYBOARD;
     probe.ki.wVk = VK_F24;
@@ -295,63 +296,105 @@ bool KeyboardHook::EnsureAlive() {
         return true;
     }
     m_probePending = true;
-    m_probeStartTick = now;
     m_lastProbeTick = now;
     return true;
 }
 
-// 为所有仍处于按下状态的重映射目标键与注入的修饰键补发 keyup，并清空记录。
-// 调用方必须已持有 state.mutex
+// 把仍处于按下状态的重映射目标键与注入的修饰键加入待释放队列，并清空活动映射。
+// 调用方必须已持有 state.mutex；本函数不执行 SendInput——UI 线程持锁注入会
+// 拖住钩子回调（回调需要同一把锁），超过 LowLevelHooksTimeout 后系统会移除钩子。
 void KeyboardHook::ReleaseRemappedKeysLocked(SharedState& s) {
-    if (s.activeRemaps.empty()) {
-        s.pendingRemapRelease = false;
-        return;
+    if (!s.activeRemaps.empty()) {
+        // 释放序列由 HookLogic 的纯函数生成：去重目标键、按固定逆序释放修饰键
+        const std::vector<int> keys = BuildRemapReleaseKeys(s.activeRemaps);
+        for (int key : keys) {
+            if (std::find(s.pendingReleaseKeys.begin(), s.pendingReleaseKeys.end(), key) ==
+                s.pendingReleaseKeys.end()) {
+                s.pendingReleaseKeys.push_back(key);
+            }
+        }
+        s.activeRemaps.clear();
+        ++s.releaseSeq;
+    }
+    s.pendingRemapRelease = !s.pendingReleaseKeys.empty();
+}
+
+// 在锁外发送待释放队列。发送成功后若队列版本未变化则清空；
+// 期间若有新的释放请求入队，保留待下一轮补发（重复 keyup 幂等）。
+void KeyboardHook::SendPendingRemapReleaseInState(SharedState& s) {
+    std::vector<int> keys;
+    ULONGLONG seq = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(s.mutex);
+        if (!s.pendingRemapRelease || s.pendingReleaseKeys.empty()) {
+            s.pendingRemapRelease = false;
+            return;
+        }
+        keys = s.pendingReleaseKeys;
+        seq = s.releaseSeq;
     }
 
-    // 释放序列由 HookLogic 的纯函数生成：去重目标键、按固定逆序释放修饰键
-    const std::vector<int> keys = BuildRemapReleaseKeys(s.activeRemaps);
     std::vector<INPUT> inputs;
     inputs.reserve(keys.size());
     for (int key : keys) {
         inputs.push_back(MakeKeyInput(key, true));
     }
+    const UINT sent = inputs.empty()
+        ? 0
+        : SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+    const bool ok = inputs.empty() || sent == inputs.size();
 
-    if (!inputs.empty()) {
-        const UINT sent = SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-        // 释放失败（如前台为提权窗口被 UIPI 拦截）时保留记录：
-        // 探活定时器与后续按键回调会按退避间隔继续重试
-        if (sent != inputs.size()) {
+    std::lock_guard<std::recursive_mutex> lk(s.mutex);
+    if (ok) {
+        if (s.releaseSeq == seq) {
+            s.pendingReleaseKeys.clear();
+            s.pendingRemapRelease = false;
+        } else {
+            // 发送期间又有新的键加入：保留队列，下一轮补发（多发的 keyup 无害）
             s.pendingRemapRelease = true;
-            s.lastRemapRetryTick = GetTickCount64();
-            return;
         }
+    } else {
+        // 释放失败（如前台为提权窗口被 UIPI 拦截）：保留队列，由探活定时器重试
+        s.pendingRemapRelease = true;
+        s.lastRemapRetryTick = GetTickCount64();
     }
-    s.pendingRemapRelease = false;
-    s.activeRemaps.clear();
+}
+
+void KeyboardHook::SendPendingRemapRelease() {
+    SendPendingRemapReleaseInState(*m_state);
 }
 
 void KeyboardHook::ReleaseRemappedKeysInState(SharedState& s) {
-    std::lock_guard<std::recursive_mutex> lk(s.mutex);
-    ReleaseRemappedKeysLocked(s);
+    {
+        std::lock_guard<std::recursive_mutex> lk(s.mutex);
+        ReleaseRemappedKeysLocked(s);
+    }
+    // 卸载/放弃路径不在按键回调内，但仍统一在锁外发送，保持调用约定一致
+    SendPendingRemapReleaseInState(s);
 }
 
 // 待补发按键释放的独立重试源：由探活定时器周期调用。
-// 使用 try_lock：回调正在处理按键时直接跳过，保证 UI 线程不会被卡住（R15-H03）
+// 使用 try_lock 快速探测状态；实际 SendInput 在锁外执行（R15-H03 / M3）
 void KeyboardHook::RetryPendingRemapRelease() {
-    std::unique_lock<std::recursive_mutex> lk(m_state->mutex, std::try_to_lock);
-    if (!lk.owns_lock()) return;
-    SharedState& s = *m_state;
-    if (!s.pendingRemapRelease) {
-        m_remapRetryBackoffMs = 0;
-        m_remapReleaseWarned = false;
-        return;
+    {
+        std::unique_lock<std::recursive_mutex> lk(m_state->mutex, std::try_to_lock);
+        if (!lk.owns_lock()) return;
+        SharedState& s = *m_state;
+        if (!s.pendingRemapRelease) {
+            m_remapRetryBackoffMs = 0;
+            m_remapReleaseWarned = false;
+            return;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG interval = m_remapRetryBackoffMs ? m_remapRetryBackoffMs : 1000;
+        if (now - s.lastRemapRetryTick < interval) return;
     }
 
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG interval = m_remapRetryBackoffMs ? m_remapRetryBackoffMs : 1000;
-    if (now - s.lastRemapRetryTick < interval) return;
-
-    ReleaseRemappedKeysLocked(s);
+    // 先释放锁，再注入：钩子回调只会在状态锁定期间短暂等待
+    SendPendingRemapRelease();
+    std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
+    SharedState& s = *m_state;
     if (!s.pendingRemapRelease) {
         m_remapRetryBackoffMs = 0;
         m_remapReleaseWarned = false;
@@ -414,39 +457,47 @@ void KeyboardHook::SetShowMuteOverlay(bool show) {
 }
 
 void KeyboardHook::SetKeyRemapEnabled(bool enabled) {
-    std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
-    SharedState& s = *m_state;
-    // 关闭映射前先释放已注入的目标键，避免按住映射键时关闭功能造成卡键
-    if (s.keyRemapEnabled && !enabled) ReleaseRemappedKeysLocked(s);
-    s.keyRemapEnabled = enabled;
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
+        SharedState& s = *m_state;
+        // 关闭映射前先释放已注入的目标键，避免按住映射键时关闭功能造成卡键
+        if (s.keyRemapEnabled && !enabled) ReleaseRemappedKeysLocked(s);
+        s.keyRemapEnabled = enabled;
+    }
+    // 锁外补发 keyup：UI 线程持锁注入会拖住钩子回调
+    SendPendingRemapRelease();
 }
 
 void KeyboardHook::SetKeyRemappings(const std::vector<KeyRemapEntry>& remappings) {
-    std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
-    SharedState& s = *m_state;
-    // 映射表变更前先释放旧映射产生的按键，避免按住映射键修改配置后卡键
-    ReleaseRemappedKeysLocked(s);
-    // 过滤非法键码（0/>=255 无法被 SendInput 识别）：源键被吞掉却模拟不出目标键
-    // 会让该键彻底失效，且用户没有任何提示
-    s.remappings.clear();
-    for (const auto& r : remappings) {
-        if (!ConfigUtils::IsValidVK(r.sourceVK) || !ConfigUtils::IsValidVK(r.targetVK)) continue;
-        // 修饰键作源键会导致整个 Ctrl/Shift/Alt/Win 被拦截，普通映射直接丢弃；
-        // 「按键互换」组（swapGroup > 0）明确允许互换修饰键
-        if (ConfigUtils::IsModifierKey(r.sourceVK) && r.swapGroup == 0) continue;
-        UINT mods = ConfigUtils::SanitizeMods((int)r.mods);
-        if (mods == 0 && r.sourceVK == r.targetVK) continue;  // 无意义的自映射
-        // 同一源键只保留第一条，避免行为不确定
-        bool exists = false;
-        for (const auto& existing : s.remappings) {
-            if (existing.sourceVK == r.sourceVK) { exists = true; break; }
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
+        SharedState& s = *m_state;
+        // 映射表变更前先释放旧映射产生的按键，避免按住映射键修改配置后卡键
+        ReleaseRemappedKeysLocked(s);
+        // 过滤非法键码（0/>=255 无法被 SendInput 识别）：源键被吞掉却模拟不出目标键
+        // 会让该键彻底失效，且用户没有任何提示
+        s.remappings.clear();
+        for (const auto& r : remappings) {
+            if (!ConfigUtils::IsValidVK(r.sourceVK) || !ConfigUtils::IsValidVK(r.targetVK)) continue;
+            // 修饰键作源键会导致整个 Ctrl/Shift/Alt/Win 被拦截，普通映射直接丢弃；
+            // 「按键互换」组（swapGroup > 0）明确允许互换修饰键
+            if (ConfigUtils::IsModifierKey(r.sourceVK) && r.swapGroup == 0) continue;
+            UINT mods = ConfigUtils::SanitizeMods((int)r.mods);
+            if (mods == 0 && r.sourceVK == r.targetVK) continue;  // 无意义的自映射
+            // 同一源键只保留第一条，避免行为不确定
+            bool exists = false;
+            for (const auto& existing : s.remappings) {
+                if (existing.sourceVK == r.sourceVK) { exists = true; break; }
+            }
+            if (exists) continue;
+            s.remappings.push_back({ r.sourceVK, mods, r.targetVK, r.swapGroup });
         }
-        if (exists) continue;
-        s.remappings.push_back({ r.sourceVK, mods, r.targetVK, r.swapGroup });
+        // 构建源键哈希表：钩子回调每次按键只查一次，避免线性扫描
+        s.remapBySource.clear();
+        for (const auto& r : s.remappings) s.remapBySource.emplace(r.sourceVK, r);
     }
-    // 构建源键哈希表：钩子回调每次按键只查一次，避免线性扫描
-    s.remapBySource.clear();
-    for (const auto& r : s.remappings) s.remapBySource.emplace(r.sourceVK, r);
+    // 锁外补发旧映射的 keyup
+    SendPendingRemapRelease();
 }
 
 void KeyboardHook::SetSimulatingInput(bool sim) {
@@ -454,17 +505,38 @@ void KeyboardHook::SetSimulatingInput(bool sim) {
     m_state->simulatingInput = sim;
 }
 
-void KeyboardHook::SetCaptureMode(bool enabled) {
+void KeyboardHook::BeginSimulationTracking() {
+    // 与钩子回调共用状态锁：进入模拟态和清空跟踪标志必须原子完成，
+    // 否则用户在这两步之间松开修饰键时不会被记录
     std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
-    SharedState& s = *m_state;
-    s.captureMode = enabled;
-    // 进入捕获模式时复位连发标志：捕获期间钩子放行所有按键（不更新标志），
-    // 若不复位，退出捕获后可能沿用捕获前的旧标志而漏发一次通知
-    if (enabled) {
-        ResetHeldInputState();
-        // 捕获期间不再重映射，需先释放已注入的目标键，避免目标键卡住
-        ReleaseRemappedKeysLocked(s);
+    m_state->simulatingInput = true;
+    m_state->simCtrlPhysUp.store(false, std::memory_order_release);
+    m_state->simShiftPhysUp.store(false, std::memory_order_release);
+}
+
+bool KeyboardHook::WasControlReleasedDuringSimulation() const {
+    return m_state->simCtrlPhysUp.load(std::memory_order_acquire);
+}
+
+bool KeyboardHook::WasShiftReleasedDuringSimulation() const {
+    return m_state->simShiftPhysUp.load(std::memory_order_acquire);
+}
+
+void KeyboardHook::SetCaptureMode(bool enabled) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_state->mutex);
+        SharedState& s = *m_state;
+        s.captureMode = enabled;
+        // 进入捕获模式时复位连发标志：捕获期间钩子放行所有按键（不更新标志），
+        // 若不复位，退出捕获后可能沿用捕获前的旧标志而漏发一次通知
+        if (enabled) {
+            ResetHeldInputState();
+            // 捕获期间不再重映射，需先释放已注入的目标键，避免目标键卡住
+            ReleaseRemappedKeysLocked(s);
+        }
     }
+    // 锁外补发 keyup
+    SendPendingRemapRelease();
 }
 
 // ============================================================
@@ -499,21 +571,31 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
         SharedState& s = *state;
         // 心跳：UI 定时器据此判断钩子是否仍被系统接受
         s.lastHookTick.store(GetTickCount64(), std::memory_order_release);
+        // 回调序号：探针存活判断只认序号，不受系统 tick 精度影响
+        s.callbackSeq.fetch_add(1, std::memory_order_acq_rel);
         // 钩子在专用线程运行后，配置/状态与 UI 线程共享：整个回调持锁，
-        // 保证读到的禁用键/映射表/标志始终一致（UI 侧只做短赋值，不会长时间持有）
+        // 保证读到的禁用键/映射表/标志始终一致。UI 侧已改为锁外注入按键，
+        // 回调不再等待 UI 线程的 SendInput，显著降低 LowLevelHooksTimeout 风险。
         std::lock_guard<std::recursive_mutex> stateLock(s.mutex);
-        // 上次抬起补发被 UIPI/安全桌面拒绝时，在后续按键回调中按 1 秒节流重试，
-        // 避免目标键或修饰键长期停留在按下状态
-        if (s.pendingRemapRelease) {
-            const ULONGLONG now = GetTickCount64();
-            if (now - s.lastRemapRetryTick >= 1000) {
-                ReleaseRemappedKeysLocked(s);
-            }
-        }
         auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
         // 模拟输入期间仍需收尾物理源键的 keyup：否则映射注入的目标键/修饰键
         // 会一直保持按下（老板键 Toggle 等操作可能持续数百毫秒）
         if (s.simulatingInput) {
+            // 记录模拟期间物理 Ctrl/Shift 是否被用户松开：模拟结束恢复修饰键时，
+            // 已松开的键不再补发 keydown，避免卡键
+            if (kb && !(kb->flags & LLKHF_INJECTED) &&
+                (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)) {
+                switch (kb->vkCode) {
+                case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+                    s.simCtrlPhysUp.store(true, std::memory_order_release);
+                    break;
+                case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+                    s.simShiftPhysUp.store(true, std::memory_order_release);
+                    break;
+                default:
+                    break;
+                }
+            }
             if (kb && !(kb->flags & LLKHF_INJECTED) &&
                 (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) &&
                 HandleSimulatedRemapKeyUpLocked(s, (int)kb->vkCode)) {
@@ -619,10 +701,9 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                     if (injected) {
                         s.activeRemaps.erase(it);
                     } else {
-                        // keyup 注入失败时保留记录，并交给钩子回调按节流间隔重试；
-                        // 退出程序或修改映射时 ReleaseRemappedKeys 仍会兜底补发
-                        s.pendingRemapRelease = true;
-                        s.lastRemapRetryTick = GetTickCount64();
+                        // keyup 注入失败：转入待释放队列，由锁外的探活定时器重试；
+                        // 不在按键回调内同步重试，避免回调阻塞超时
+                        ReleaseRemappedKeysLocked(s);
                     }
                     return 1;
                 }
@@ -648,12 +729,13 @@ LRESULT CALLBACK KeyboardHook::LowLevelProc(int nCode, WPARAM wParam, LPARAM lPa
                     if (firstPress) {
                         s.lockKeyHeld[idx] = true;
                         s.lockKeyHeldTick[idx] = now;
-                        // 发送两次切换：Windows ON→OFF→ON，键盘固件收到 ON 指示
-                        BYTE scanCode = (BYTE)MapVirtualKeyW(VK_NUMLOCK, MAPVK_VK_TO_VSC);
-                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);
-                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY, 0);
-                        keybd_event(VK_NUMLOCK, scanCode, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+                        // 一次 SendInput 发送两次切换（ON→OFF→ON），
+                        // 键盘固件收到 ON 指示；合并调用减少回调耗时
+                        INPUT inputs[4] = {
+                            MakeKeyInput(VK_NUMLOCK, false), MakeKeyInput(VK_NUMLOCK, true),
+                            MakeKeyInput(VK_NUMLOCK, false), MakeKeyInput(VK_NUMLOCK, true)
+                        };
+                        SendInput(4, inputs, sizeof(INPUT));
                         // 显示 NumLock 已锁定的浮层提示（lp=3 表示已锁定且开启）
                         if (s.showOverlay) {
                             PostMessageW(s.notifyWnd.load(std::memory_order_acquire), WM_LOCKKEY_NOTIFY,

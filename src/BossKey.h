@@ -51,9 +51,12 @@ public:
     ULONGLONG GetLastDeactivateTick() const { return m_lastDeactivateTick; }
     // 切换激活/停用状态
     void Toggle();
-    // 关闭所有绑定的进程（优雅关闭 -> 超时强制终止）
+    // 关闭所有绑定的进程（优雅关闭 -> 超时后按 allowForce 决定是否强制终止）
     // timeoutMs：等待进程退出的超时时间，关机路径可传较小值避免阻塞
-    void CloseBoundProcesses(DWORD timeoutMs = PROCESS_CLOSE_TIMEOUT_MS);
+    // allowForce：超时后是否允许在用户确认后强制终止；关机路径传 false，
+    //             避免静默强杀造成未保存数据丢失
+    void CloseBoundProcesses(DWORD timeoutMs = PROCESS_CLOSE_TIMEOUT_MS,
+                             bool allowForce = true);
     // 恢复上次异常退出时被隐藏的窗口（启动时调用），返回恢复的窗口数
     int RecoverOrphanedWindows();
     // 启动时静音恢复是否仍未完成（音频服务/端点可能尚未就绪）
