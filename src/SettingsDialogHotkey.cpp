@@ -659,7 +659,7 @@ void SettingsDialog::ShowHotkeyDialog(HWND hwnd, AppConfig& config, int editInde
     // 与窗口状态下拉框挤在同一行会被截断或超出对话框边界（R8-M5）
     y += btnH + 6;
     dlgChk(IDC_CHK_HK_CONFIRM, L"确认后执行", cx, y, 165);
-    dlgChk(IDC_CHK_HK_ADMIN, L"以管理员运行（UAC）", cx + 170, y, 220);
+    dlgChk(IDC_CHK_HK_ADMIN, L"以管理员运行", cx + 170, y, 220);
 
     if (isEdit) {
         SendMessageW(GetDlgItem(dlg, IDC_CHK_HK_CONFIRM), BM_SETCHECK, config.customHotkeys[editIndex].confirmBeforeRun ? BST_CHECKED : BST_UNCHECKED, 0);

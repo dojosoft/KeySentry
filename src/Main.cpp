@@ -3083,7 +3083,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             if (launchError == ERROR_ELEVATION_REQUIRED) {
                                 // 目标程序清单要求管理员权限：提示用户勾选管理员选项
                                 showHotkeyError(Tr(L"该程序要求管理员权限，无法以标准权限启动。\n"
-                                                   L"请编辑该热键并勾选「以管理员运行（UAC）」。"));
+                                                   L"请编辑该热键并勾选「以管理员运行」。"));
                             } else {
                                 showHotkeyError(std::wstring(Tr(L"执行失败: ")) +
                                                 SanitizeConfirmField(command));
